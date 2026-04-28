@@ -116,3 +116,78 @@ def body_sma(candles: list[dict], period: int) -> float:
     """SMA der Kerzenkörper (|close - open|) über `period` Candles."""
     bodies = [abs(c["close"] - c["open"]) for c in candles]
     return sma(bodies, period)
+
+
+def rsi(candles: list[dict], period: int = 14) -> float:
+    """
+    Wilder's RSI. Braucht mindestens period+1 Candles.
+    Gibt 50.0 zurück wenn zu wenige Daten vorhanden.
+    """
+    closes = [c["close"] for c in candles]
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+# ── Market-Regime-Detection ──────────────────────────────────────────────────
+#
+# Dual-Filter — identisch zur Lab-Logik (auto_lab_daemon.py):
+#   1. EMA(50)-Slope über 10 Bars: (EMA_now - EMA_10ago) / EMA_10ago
+#      > +0.3% → bullisch / < -0.3% → bearisch
+#   2. Volatilitäts-Ratio: ATR(14) / SMA(Close, 50) > 1.5% → Markt bewegt sich
+#
+# Kombination:
+#   slope > thresh  AND  vol_ratio > 0.015  → TREND_UP
+#   slope < -thresh AND  vol_ratio > 0.015  → TREND_DOWN
+#   sonst                                   → SIDEWAYS
+
+REGIME_EMA_PERIOD   = 50
+REGIME_SLOPE_PCT    = 0.003   # ±0.3%
+REGIME_VOL_RATIO    = 0.015   # ATR/SMA > 1.5% = Trend gültig
+_MIN_CANDLES        = REGIME_EMA_PERIOD + 15
+
+
+def detect_regime(candles: list[dict]) -> str:
+    """
+    Berechnet das Markt-Regime aus 1h-Candles.
+    Gibt 'TREND_UP', 'TREND_DOWN' oder 'SIDEWAYS' zurück.
+    Mindestens 65 Candles erforderlich (EMA_50 + 15 Puffer).
+    """
+    if len(candles) < _MIN_CANDLES:
+        return "UNKNOWN"
+
+    closes    = [c["close"] for c in candles]
+    ema_now   = ema(closes, REGIME_EMA_PERIOD)
+    ema_10ago = ema(closes[:-10], REGIME_EMA_PERIOD)
+
+    if ema_10ago == 0:
+        return "UNKNOWN"
+
+    slope     = (ema_now - ema_10ago) / ema_10ago
+    atr_val   = atr_wilder(candles[-28:], 14)
+    sma_close = sma(closes[-50:], 50)
+    vol_ratio = atr_val / sma_close if sma_close > 0 else 0.0
+    trending  = vol_ratio > REGIME_VOL_RATIO
+
+    if slope > REGIME_SLOPE_PCT and trending:
+        return "TREND_UP"
+    if slope < -REGIME_SLOPE_PCT and trending:
+        return "TREND_DOWN"
+    return "SIDEWAYS"

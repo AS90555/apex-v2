@@ -12,20 +12,125 @@ Shadow-Mode:
   - Order wird in DB simuliert (trades-Eintrag mit order_id='SHADOW-...')
   - BitgetClient wird NICHT instanziiert, kein Netzwerk-Call
 
-Live-Mode:
-  - BitgetClient.place_market_order() + SL/TP-Orders
-  - Erst nach Erfolg → Signal 'executed', Trade geschrieben
+Live/Dry-Run-Mode:
+  - Position Sizing via _calc_sizing() (RISK_USDT / SL-Distanz)
+  - Dynamischer Hebel: falls Notional < MIN_NOTIONAL → Hebel erhöhen
+  - Hartes Limit: MAX_LEVERAGE → Trade abgelehnt wenn Hebel nicht reicht
+  - set_leverage() API-Call vor place_market_order()
+  - Rate-Limit-Schutz: _request_with_retry() im BitgetClient (429 → Backoff)
 """
 
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from config.settings import (
+    RISK_USDT, MIN_NOTIONAL, TARGET_NOTIONAL, MAX_LEVERAGE,
+    SIZE_DECIMALS,
+)
 from core.db import get_connection
 from core.models import Signal, Trade
 from core.utils import log, now_iso
 
+
+# ── Position Sizing & Leverage-Berechnung ────────────────────────────────────
+
+def _get_min_size(asset: str) -> float:
+    """Liest minTradeNum vom Bitget-Kontrakt (gecacht, kein Auth nötig)."""
+    try:
+        from execution.bitget_client import BitgetClient
+        client = BitgetClient(dry_run=True)   # kein Auth für Marktdaten
+        info = client.get_contract_info(asset)
+        return info.get("min_size", 0.0)
+    except Exception as e:
+        log(f"[SIZING] get_min_size {asset} fehlgeschlagen: {e}")
+        return 0.0
+
+
+def _calc_sizing(signal: Signal, current_price: float) -> dict | None:
+    """
+    Berechnet Positionsgröße und nötigen Hebel für ein Signal.
+
+    Logik:
+      1. SL-Distanz = |entry - stop_loss|
+      2. Position_Size = RISK_USDT / SL_Distanz        (Coins, ohne Hebel)
+      3. Notional = Position_Size * entry_price
+      4. Wenn Notional >= MIN_NOTIONAL → Hebel = 1 (oder minimal nötig)
+      5. Wenn Notional < MIN_NOTIONAL → Hebel = ceil(TARGET_NOTIONAL / Notional)
+      6. Wenn Hebel > MAX_LEVERAGE → Trade abgelehnt
+
+    Rückgabe: {"size": float, "leverage": int, "notional": float}
+              oder None wenn abgelehnt.
+    """
+    entry = signal.entry_price or current_price
+    sl    = signal.stop_loss
+
+    if not sl or sl <= 0 or not entry or entry <= 0:
+        log(f"[SIZING] Signal #{signal.id}: ungültige Entry/SL-Werte ({entry}/{sl})")
+        return None
+
+    sl_distance = abs(entry - sl)
+    if sl_distance < 1e-8:
+        log(f"[SIZING] Signal #{signal.id}: SL-Distanz = 0 → abgelehnt")
+        return None
+
+    # Schritt 1 + 2: reine Coin-Menge bei Hebel = 1
+    raw_size    = RISK_USDT / sl_distance          # Coins
+    notional_1x = raw_size * entry                 # USDT ohne Hebel
+
+    # Schritt 3: Hebel bestimmen
+    if notional_1x >= MIN_NOTIONAL:
+        leverage = 1
+    else:
+        # Minimaler Hebel um TARGET_NOTIONAL zu erreichen
+        leverage = math.ceil(TARGET_NOTIONAL / notional_1x)
+
+    # Schritt 4: hartes Limit prüfen
+    if leverage > MAX_LEVERAGE:
+        log(
+            f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
+            f"Hebel-Limit überschritten ({leverage}x > {MAX_LEVERAGE}x). "
+            f"SL-Distanz={sl_distance:.4f}, Notional@1x=${notional_1x:.3f}"
+        )
+        return None
+
+    # Effektive Positionsgröße mit Hebel (Coins)
+    effective_size    = raw_size * leverage
+    effective_notional = effective_size * entry
+
+    s_dec = SIZE_DECIMALS.get(signal.asset, 2)
+    effective_size = round(effective_size, s_dec)
+
+    # ── Exchange-Mindestgröße prüfen ──────────────────────────────────────────
+    min_size = _get_min_size(signal.asset)
+    if min_size > 0 and effective_size < min_size:
+        log(
+            f"[SIZING] ⛔ Trade Skipped: Calculated position size is below exchange minimum "
+            f"({signal.asset}: {effective_size} < {min_size} Kontrakte). "
+            f"SL-Distanz={sl_distance:.4f} — SL zu weit für ${RISK_USDT:.2f} Risiko."
+        )
+        return None
+
+    log(
+        f"[SIZING] Signal #{signal.id} {signal.asset}: "
+        f"SL-Dist={sl_distance:.4f} | "
+        f"Size={effective_size} | "
+        f"Leverage={leverage}x | "
+        f"Notional=${effective_notional:.2f} | "
+        f"Risiko=${RISK_USDT:.2f}"
+        + (f" | minSize={min_size}" if min_size > 0 else "")
+    )
+
+    return {
+        "size":     effective_size,
+        "leverage": leverage,
+        "notional": effective_notional,
+    }
+
+
+# ── Executor ─────────────────────────────────────────────────────────────────
 
 class Executor:
 
@@ -44,13 +149,13 @@ class Executor:
         conn.commit()
 
         if cur.rowcount == 0:
-            # anderer Prozess oder falscher Zustand → überspringen
-            log(f"[EXECUTOR] Signal #{signal.id}: Status-Lock fehlgeschlagen (nicht mehr 'approved') → Skip")
+            log(f"[EXECUTOR] Signal #{signal.id}: Status-Lock fehlgeschlagen "
+                f"(nicht mehr 'approved') → Skip")
             conn.close()
             return None
 
-        log(f"[EXECUTOR] Signal #{signal.id} {signal.strategy}/{signal.asset} {signal.direction.upper()} "
-            f"— Modus: {signal.mode} — Lock gesetzt (processing)")
+        log(f"[EXECUTOR] Signal #{signal.id} {signal.strategy}/{signal.asset} "
+            f"{signal.direction.upper()} — Modus: {signal.mode} — Lock (processing)")
 
         # ── Schritt 2: Execution je nach Modus ───────────────────────────────
         try:
@@ -62,14 +167,16 @@ class Executor:
                 raise ValueError(f"Unbekannter Modus: {signal.mode}")
         except Exception as e:
             log(f"[EXECUTOR] Signal #{signal.id}: FEHLER bei Execution — {e}")
-            log(f"[EXECUTOR] Signal #{signal.id} bleibt auf 'processing' (manuelles Aufräumen erforderlich)")
+            log(f"[EXECUTOR] Signal #{signal.id} bleibt auf 'processing' "
+                f"(manuelles Aufräumen erforderlich)")
             conn.close()
             return None
 
         if trade is None:
             log(f"[EXECUTOR] Signal #{signal.id}: Execution abgebrochen (kein Trade)")
             conn.execute(
-                "UPDATE signals SET status='failed', reject_reason='execution_aborted' WHERE id=?",
+                "UPDATE signals SET status='failed', reject_reason='execution_aborted' "
+                "WHERE id=?",
                 (signal.id,),
             )
             conn.commit()
@@ -87,7 +194,8 @@ class Executor:
              trade.entry_price, ts_now,
              trade.size, trade.stop_loss, trade.take_profit_1, trade.take_profit_2,
              signal.mode, signal.session,
-             json.dumps({"order_id": trade.order_id, "mode": signal.mode})),
+             json.dumps({"order_id": trade.order_id, "mode": signal.mode,
+                         "leverage": getattr(trade, "_leverage", None)})),
         )
         trade.id = cur2.lastrowid
 
@@ -122,18 +230,56 @@ class Executor:
     # ── Live/Dry-Run-Execution ────────────────────────────────────────────────
 
     def _execute_live(self, signal: Signal, dry_run: bool) -> Optional[Trade]:
-        """Echter API-Call (dry_run=True → BitgetClient simuliert intern)."""
+        """
+        Echter API-Call mit dynamischer Positionsgröße und Hebel-Berechnung.
+
+          1. Aktuellen Preis holen (für Notional-Berechnung)
+          2. _calc_sizing(): Coins, Hebel, Notional
+          3. set_leverage() API-Call (beide Seiten bei isolated)
+          4. place_market_order() mit berechneter Size
+        """
         from execution.bitget_client import BitgetClient
         client = BitgetClient(dry_run=dry_run)
 
-        if not client.is_ready() and not dry_run:
+        if not client.is_ready and not dry_run:
             log(f"[EXECUTOR] BitgetClient nicht bereit (fehlende Credentials) → abbrechen")
             return None
 
+        # Schritt 1: aktuellen Preis für Notional-Schätzung
+        current_price = client.get_price(signal.asset)
+        if current_price <= 0 and not dry_run:
+            log(f"[EXECUTOR] Kein gültiger Preis für {signal.asset} → abbrechen")
+            return None
+        if current_price <= 0:
+            current_price = signal.entry_price or 1.0   # Dry-Run Fallback
+
+        # Schritt 2: Positionsgröße und Hebel berechnen
+        sizing = _calc_sizing(signal, current_price)
+        if sizing is None:
+            # _calc_sizing hat bereits den Grund geloggt (Hebel-Limit etc.)
+            return None
+
+        size     = sizing["size"]
+        leverage = sizing["leverage"]
+
+        # Schritt 3: Hebel setzen (beide Seiten, isolated margin)
+        hold_side = "long" if signal.direction == "long" else "short"
+        for side in (hold_side,):   # nur aktive Seite setzen
+            ok = client.set_leverage(signal.asset, leverage, hold_side=side)
+            if not ok and not dry_run:
+                log(f"[EXECUTOR] set_leverage {signal.asset}×{leverage} fehlgeschlagen → abbrechen")
+                return None
+
+        log(f"[EXECUTOR] {'DRY' if dry_run else 'LIVE'}: {signal.asset} "
+            f"{signal.direction.upper()} | "
+            f"size={size} | leverage={leverage}x | "
+            f"notional=${sizing['notional']:.2f}")
+
+        # Schritt 4: Market Order platzieren
         result = client.place_market_order(
             coin=signal.asset,
             is_buy=(signal.direction == "long"),
-            size=signal.size,
+            size=size,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit_2,
         )
@@ -145,14 +291,13 @@ class Executor:
         entry_price = result.avg_price if result.avg_price > 0 else signal.entry_price
         order_id    = result.order_id or f"{'DRY' if dry_run else 'LIVE'}-{int(time.time())}"
 
-        log(f"[EXECUTOR] {'DRY_RUN' if dry_run else 'LIVE'}: {signal.asset} {signal.direction.upper()} "
-            f"@ {entry_price:.4f} | order_id={order_id}")
-
-        return Trade(
+        t = Trade(
             signal_id=signal.id,
             strategy=signal.strategy, asset=signal.asset, direction=signal.direction,
-            entry_price=entry_price, size=result.filled_size or signal.size,
+            entry_price=entry_price, size=result.filled_size or size,
             stop_loss=signal.stop_loss,
             take_profit_1=signal.take_profit_1, take_profit_2=signal.take_profit_2,
             mode=signal.mode, order_id=order_id,
         )
+        t._leverage = leverage   # für context_json
+        return t

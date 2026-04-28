@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS candles (
     ts         INTEGER NOT NULL,
     open       REAL, high REAL, low REAL, close REAL, volume REAL,
     fetched_at TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'bitget',
     UNIQUE(asset, interval, ts)
 );
 
@@ -106,6 +107,39 @@ CREATE TABLE IF NOT EXISTS system_state (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS research_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    lab_session   TEXT NOT NULL,
+    strategy      TEXT NOT NULL,
+    asset         TEXT NOT NULL,
+    params_json   TEXT NOT NULL,
+    n_train       INTEGER, total_r_train REAL, avg_r_train REAL, pf_train REAL, wr_train REAL,
+    n_test        INTEGER, total_r_test  REAL, avg_r_test  REAL, pf_test  REAL, wr_test  REAL,
+    fitness_score REAL,
+    passed        INTEGER NOT NULL DEFAULT 0,
+    reject_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_session ON research_runs(lab_session, passed);
+CREATE INDEX IF NOT EXISTS idx_research_fitness ON research_runs(strategy, asset, fitness_score DESC);
+
+CREATE TABLE IF NOT EXISTS active_deployments (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    discovery_id       INTEGER NOT NULL,
+    strategy_key       TEXT NOT NULL UNIQUE,   -- z.B. "squeeze_42"
+    base_strategy      TEXT NOT NULL,          -- "squeeze"
+    asset              TEXT NOT NULL,
+    market_regime      TEXT,
+    params_json        TEXT NOT NULL,
+    mode               TEXT NOT NULL DEFAULT 'dry_run',
+    deployed_at        TEXT NOT NULL,
+    active             INTEGER NOT NULL DEFAULT 1,
+    target_trades      INTEGER NOT NULL DEFAULT 50,
+    go_live_notified   INTEGER NOT NULL DEFAULT 0,
+    note               TEXT
+);
 """
 
 
@@ -128,6 +162,14 @@ def run_migrations():
         conn.execute("ALTER TABLE trades ADD COLUMN session TEXT")
     if "order_id" not in existing_cols:
         conn.execute("ALTER TABLE trades ADD COLUMN order_id TEXT")
+    candle_cols = {row[1] for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
+    if "source" not in candle_cols:
+        conn.execute("ALTER TABLE candles ADD COLUMN source TEXT NOT NULL DEFAULT 'bitget'")
+    dep_cols = {row[1] for row in conn.execute("PRAGMA table_info(active_deployments)").fetchall()}
+    if "target_trades" not in dep_cols:
+        conn.execute("ALTER TABLE active_deployments ADD COLUMN target_trades INTEGER NOT NULL DEFAULT 50")
+    if "go_live_notified" not in dep_cols:
+        conn.execute("ALTER TABLE active_deployments ADD COLUMN go_live_notified INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 

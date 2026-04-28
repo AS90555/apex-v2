@@ -26,6 +26,12 @@ DRAWDOWN_KILL_PCT = 0.50
 MIN_BALANCE_USD   = 10.0
 MAX_SL_DISTANCE_PCT = 0.10
 
+# ── Micro-Account Position Sizing ────────────────────────────────────────────
+RISK_USDT          = 1.50    # Festes Risiko pro Trade in USDT
+MIN_NOTIONAL       = 5.0     # Bitget Mindest-Order-Volumen in USDT
+TARGET_NOTIONAL    = 6.0     # Zielbetrag wenn unter MIN_NOTIONAL (etwas Puffer)
+MAX_LEVERAGE       = 20      # Hartes Leverage-Limit — darüber: Trade abgelehnt
+
 # ── Tages-DD Circuit Breaker ─────────────────────────────────────────────────
 DAILY_DD_HALF_R = -1.5
 DAILY_DD_KILL_R = -2.0
@@ -34,22 +40,25 @@ DAILY_DD_KILL_R = -2.0
 LEVERAGE     = 5
 MARGIN_MODE  = "isolated"
 
-SIZE_DECIMALS = {"BTC": 4, "ETH": 2, "SOL": 1, "AVAX": 1, "XRP": 0,
-                 "DOGE": 0, "ADA": 0, "SUI": 1, "AAVE": 2}
-PRICE_DECIMALS = {"BTC": 1, "ETH": 2, "SOL": 3, "AVAX": 3, "XRP": 4,
-                  "DOGE": 5, "ADA": 4, "SUI": 4, "AAVE": 2}
+SIZE_DECIMALS = {"BTC": 4, "ETH": 2, "SOL": 1, "XRP": 0, "ADA": 0,
+                 "LINK": 2, "AVAX": 1, "DOGE": 0, "SUI": 1, "AAVE": 2}
+PRICE_DECIMALS = {"BTC": 1, "ETH": 2, "SOL": 3, "XRP": 4, "ADA": 4,
+                  "LINK": 3, "AVAX": 3, "DOGE": 5, "SUI": 4, "AAVE": 2}
+
+# ── Asset-Universum (Live-Trading) ───────────────────────────────────────────
+# Liquide Assets mit ausreichend Volumen für Micro-Account (enge Spreads, echte Fills)
+LIVE_ASSETS = ["BTC", "ETH", "SOL", "XRP", "ADA", "LINK", "AVAX"]
 
 # ── Data Intake Matrix ───────────────────────────────────────────────────────
 # Welche (asset, interval)-Kombinationen der Intake-Agent vorhalten soll.
 INTAKE_MATRIX = {
+    "BTC":  ["5m", "15m", "1h"],
     "ETH":  ["5m", "15m", "1h", "4h"],
     "SOL":  ["5m", "15m", "1h"],
+    "XRP":  ["5m", "15m", "1h"],
+    "ADA":  ["5m", "15m", "1h"],
+    "LINK": ["5m", "15m", "1h"],
     "AVAX": ["5m", "15m", "1h"],
-    "XRP":  ["5m", "15m"],
-    "DOGE": ["1h"],
-    "ADA":  ["1h"],
-    "SUI":  ["1h"],
-    "AAVE": ["1h"],
 }
 
 # Kerzen-TTL: nach N Tagen aus DB löschen (täglich bereinigt)
@@ -65,6 +74,11 @@ SIGNAL_EXPIRY_MINUTES = 30
 # 'dry_run' → Execution simuliert Order lokal, kein API-Call
 # 'live'    → Execution sendet echte Order an Bitget
 STRATEGY_MODES = {
+    "squeeze": {
+        "ETH": "dry_run",   # Champion: OOS n=1924 PF=1.14 AvgR=+0.095
+        "BTC": "dry_run",   # Lab: n=418 PF=1.10 AvgR=+0.068
+        "SOL": "dry_run",   # Lab: n=1527 PF=1.07 AvgR=+0.053
+    },
     "orb": {
         "ETH": "shadow", "SOL": "shadow", "AVAX": "shadow", "XRP": "shadow",
     },
@@ -97,7 +111,7 @@ H015_REGIME_RISK_MODIFIER_ENABLED = True
 
 # ── VAA Strategie ────────────────────────────────────────────────────────────
 VAA_ENABLED      = True
-VAA_ASSETS       = ["SOL", "AVAX", "DOGE", "ADA", "SUI", "AAVE"]
+VAA_ASSETS       = ["ETH"]   # Backtest: nur ETH hat positiven Edge (PF 2.17)
 VAA_VOL_MULT     = 2.5
 VAA_BODY_MULT    = 0.6
 VAA_ATR_EXPAND   = 1.2
@@ -111,7 +125,7 @@ VAA_CANDLE_LIMIT    = 120
 VAA_MAX_RISK_PCT    = 0.02
 
 # ── KDT Strategie ────────────────────────────────────────────────────────────
-KDT_ENABLED      = True
+KDT_ENABLED      = False  # Deaktiviert: 2J-Backtest -34R, PF 0.39, kein Edge
 KDT_ASSET        = "ETH"
 KDT_EMA_PERIOD   = 50
 KDT_ENTRY_WINDOW = 2
@@ -119,6 +133,26 @@ KDT_TP_R         = 3.0
 KDT_SL_ATR_MULT  = 1.0
 KDT_CANDLE_LIMIT = 120
 KDT_MAX_RISK_PCT = 0.02
+
+# ── Asian Fade ───────────────────────────────────────────────────────────────
+# Hypothese: Asien-Pump (00:00–08:00 UTC) wird von London abverkauft.
+ASIAN_FADE_ENABLED        = False  # 2026-04-27 archiviert: Grid-Test (4 Varianten) → kein Edge
+ASIAN_FADE_ASSET          = "ETH"
+ASIAN_FADE_PUMP_THRESHOLD = 0.015   # +1.5% overnight pump required
+ASIAN_FADE_RSI_OB         = 70      # RSI(14) > 70 = overbought
+ASIAN_FADE_SL_ATR_MULT    = 1.0     # SL = 1× ATR(14)
+ASIAN_FADE_TP_MULT        = 1.5     # TP = 1.5R (relative zum SL)
+ASIAN_FADE_MAX_RISK_PCT   = 0.02
+
+# ── Squeeze Breakout ────────────────────────────────────────────────────────
+# Champion-Parameter (Auto-Lab 2026-04-27): OOS n=1924, PF=1.14, AvgR=+0.095
+SQUEEZE_ENABLED      = True
+SQUEEZE_ASSETS       = ["ETH", "BTC", "SOL"]
+SQUEEZE_PERIOD       = 20      # TTM Squeeze BB/KC Periode
+SQUEEZE_EMA_PERIOD   = 25      # EMA Richtungs-Filter (Champion: EMA_PERIOD=25)
+SQUEEZE_SL_ATR_MULT  = 1.5     # SL = entry ± ATR(14) × 1.5 (Champion)
+SQUEEZE_TP_R         = 3.0     # TP = SL_dist × 3.0R (Champion)
+SQUEEZE_MAX_RISK_PCT = 0.02
 
 # ── Weekend Momentum ─────────────────────────────────────────────────────────
 WEEKEND_ASSET         = "AVAX"

@@ -12,10 +12,47 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timezone
-from core.db import get_connection, run_migrations
+from core.db import get_connection, run_migrations, set_state
 from core.utils import log
 from config.settings import INTAKE_MATRIX
 from features.feature_agent import run_all_features
+from features.indicators import detect_regime
+from core.autopilot import check_regime_change
+
+
+# Assets für Regime-Detection: nur jene mit 1h-Daten
+REGIME_ASSETS = [a for a, intervals in INTAKE_MATRIX.items() if "1h" in intervals]
+REGIME_MIN_CANDLES = 70   # EMA(50) + 15 Puffer + 5 Reserve
+
+
+def _compute_and_store_regimes():
+    """Berechnet das aktuelle Markt-Regime für alle Assets und speichert in system_state."""
+    conn = get_connection()
+    updated = []
+    for asset in REGIME_ASSETS:
+        rows = conn.execute(
+            """SELECT open, high, low, close, volume FROM candles
+               WHERE asset=? AND interval='1h'
+               ORDER BY ts DESC LIMIT ?""",
+            (asset, REGIME_MIN_CANDLES),
+        ).fetchall()
+
+        if len(rows) < REGIME_MIN_CANDLES:
+            log(f"[run_features] Regime {asset}: zu wenig Candles ({len(rows)}<{REGIME_MIN_CANDLES})")
+            continue
+
+        # Umkehren: DESC → ASC für Indikator-Berechnung
+        candles = [{"open": r[0], "high": r[1], "low": r[2],
+                    "close": r[3], "volume": r[4]} for r in reversed(rows)]
+        regime  = detect_regime(candles)
+        set_state(f"regime_{asset}", regime)
+        updated.append(f"{asset}={regime}")
+
+        # Auto-Pilot: Regime-Wechsel prüfen + ggf. Auto-Deploy auslösen
+        check_regime_change(asset, regime)
+
+    conn.close()
+    return updated
 
 
 def write_heartbeat(status: str, message: str, latency_ms: float):
@@ -36,8 +73,12 @@ def main():
     try:
         summary  = run_all_features(INTAKE_MATRIX)
         computed = sum(v for v in summary.values() if v > 0)
+
+        regimes  = _compute_and_store_regimes()
+        log(f"[run_features] Regimes: {' | '.join(regimes)}")
+
         latency  = (time.monotonic() - t0) * 1000
-        message  = f"features_computed={computed} keys={len(summary)}"
+        message  = f"features_computed={computed} regimes={len(regimes)}"
         write_heartbeat("ok", message, latency)
         log(f"[run_features] Fertig: {message} ({latency:.0f}ms)")
 

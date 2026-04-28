@@ -19,7 +19,7 @@ from typing import Optional
 
 from core.db import get_connection
 from core.utils import log
-from features.indicators import atr_wilder, ema, vol_sma, body_sma
+from features.indicators import atr_wilder, ema, sma, bollinger_bands, vol_sma, body_sma, rsi as calc_rsi, is_squeeze
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
@@ -330,22 +330,528 @@ def _weekend_momo_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional
 
 # ── Haupt-API ─────────────────────────────────────────────────────────────────
 
+def _squeeze_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    # Squeeze-Release Detection auf 1h Basis (beste verfügbare Daten)
+    candles = _candles(conn, asset, "1h", as_of_ts, 22)
+    if len(candles) < 22:
+        return None
+
+    squeeze_period = cfg.get("SQUEEZE_PERIOD", 20)
+    squeeze_last_2 = is_squeeze(candles[-22:-2], squeeze_period)
+    squeeze_last_1 = is_squeeze(candles[-21:],  squeeze_period)
+
+    # Release = war in Squeeze, ist jetzt raus
+    if squeeze_last_2 or not squeeze_last_1:
+        return None
+
+    ema_period = cfg.get("EMA_PERIOD", 20)
+    closes = [c["close"] for c in candles]
+    ema_20 = ema(closes, ema_period)
+    current_close = candles[-1]["close"]
+    direction = "long" if current_close > ema_20 else "short"
+
+    atr = atr_wilder(candles, 14)
+    if atr <= 0:
+        return None
+
+    entry   = current_close
+    sl_mult = cfg.get("SL_ATR_MULT", 1.0)
+    sl_dist = atr * sl_mult
+
+    if direction == "long":
+        sl = entry - sl_dist
+        tp = entry + sl_dist * cfg.get("TP_R", 3.0)
+    else:
+        sl = entry + sl_dist
+        tp = entry - sl_dist * cfg.get("TP_R", 3.0)
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    return BtSignal(
+        ts=as_of_ts, strategy="squeeze", asset=asset, direction=direction,
+        entry_price=round(entry, 4), stop_loss=round(sl, 4),
+        take_profit_1=round(tp, 4), take_profit_2=round(tp, 4),
+        size=round(risk_usd / sl_dist, 4) if sl_dist > 0 else 0.0,
+        risk_usd=round(risk_usd, 4),
+    )
+
+
+def _asian_fade_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    dt = datetime.fromtimestamp(as_of_ts / 1000, tz=timezone.utc)
+    if dt.hour != 8:
+        return None
+
+    candles = _candles(conn, asset, "1h", as_of_ts, 30)
+    if len(candles) < 16:
+        return None
+
+    midnight_ts = as_of_ts - 8 * 3_600_000
+    row = conn.execute(
+        "SELECT close FROM candles WHERE asset=? AND interval='1h' AND ts=?",
+        (asset, midnight_ts),
+    ).fetchone()
+    if not row:
+        return None
+
+    midnight_close = row[0]
+    current_close  = candles[-1]["close"]
+    pump_pct       = (current_close - midnight_close) / midnight_close
+
+    direction  = cfg.get("DIRECTION", "short")
+    dump_mode  = cfg.get("DUMP_MODE", False)
+    threshold  = cfg.get("PUMP_THRESHOLD", 0.015)
+    rsi_ob     = cfg.get("RSI_OB", 70)
+    rsi_os     = cfg.get("RSI_OS", 30)
+
+    if dump_mode:
+        if pump_pct > -threshold:
+            return None
+        rsi_val = calc_rsi(candles, period=14)
+        if rsi_val > rsi_os:
+            return None
+    else:
+        if pump_pct < threshold:
+            return None
+        rsi_val = calc_rsi(candles, period=14)
+        if direction == "short" and rsi_val < rsi_ob:
+            return None
+        if direction == "long" and rsi_val < rsi_ob:
+            return None
+
+    atr = atr_wilder(candles, period=14)
+    if atr <= 0:
+        return None
+
+    entry   = current_close
+    sl_dist = atr * cfg.get("SL_ATR_MULT", 1.0)
+
+    if direction == "short":
+        sl = entry + sl_dist
+        tp = entry - sl_dist * cfg.get("TP_MULT", 1.5)
+    else:
+        sl = entry - sl_dist
+        tp = entry + sl_dist * cfg.get("TP_MULT", 1.5)
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    return BtSignal(
+        ts=as_of_ts, strategy="asian_fade", asset=asset, direction=direction,
+        entry_price=round(entry, 4), stop_loss=round(sl, 4),
+        take_profit_1=round(tp, 4), take_profit_2=round(tp, 4),
+        size=round(risk_usd / sl_dist, 4) if sl_dist > 0 else 0.0,
+        risk_usd=round(risk_usd, 4),
+    )
+
+
+def _mean_reversion_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Mean Reversion auf 1h:
+      Long:  Close < unteres BB UND RSI < RSI_OS (überverkauft)
+      Short: Close > oberes BB  UND RSI > RSI_OB (überkauft)
+    TP = mittleres BB (SMA), SL = ATR-Abstand
+    """
+    bb_period  = int(cfg.get("BB_PERIOD",  20))
+    bb_mult    = cfg.get("BB_MULT",   2.0)
+    rsi_period = int(cfg.get("RSI_PERIOD", 14))
+    rsi_os     = cfg.get("RSI_OS",    35.0)
+    rsi_ob     = 100.0 - rsi_os
+    sl_mult    = cfg.get("SL_ATR_MULT", 1.0)
+    tp_r       = cfg.get("TP_R",       2.0)
+
+    limit = max(bb_period, rsi_period) + 20
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < bb_period + 2:
+        return None
+
+    closes = [c["close"] for c in candles]
+    upper, mid, lower = bollinger_bands(closes, bb_period, bb_mult)
+    rsi_val = calc_rsi(candles, rsi_period)
+    atr     = atr_wilder(candles, 14)
+
+    if upper <= lower or atr <= 0:
+        return None
+
+    c   = candles[-1]
+    ts  = c["time"]
+    cls = c["close"]
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cls < lower and rsi_val < rsi_os:
+        # Long: Preis unter unterem BB, überverkauft
+        sl_dist = atr * sl_mult
+        sl      = cls - sl_dist
+        tp1     = mid                         # zurück zur Mitte
+        tp2     = cls + sl_dist * tp_r
+        if sl_dist <= 0 or sl <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="mean_reversion", asset=asset, direction="long",
+            entry_price=round(cls, 6), stop_loss=round(sl, 6),
+            take_profit_1=round(tp1, 6), take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cls > upper and rsi_val > rsi_ob:
+        # Short: Preis über oberem BB, überkauft
+        sl_dist = atr * sl_mult
+        sl      = cls + sl_dist
+        tp1     = mid
+        tp2     = cls - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="mean_reversion", asset=asset, direction="short",
+            entry_price=round(cls, 6), stop_loss=round(sl, 6),
+            take_profit_1=round(tp1, 6), take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _vwap_bounce_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    VWAP Bounce auf 1h:
+      VWAP = rollender typischer Preis × Volumen über VWAP_PERIOD Bars.
+      Long:  Preis zieht auf VWAP zurück (innerhalb VWAP_BAND × ATR)
+             UND Trend aufwärts (Close > EMA) UND RSI > RSI_MIN
+      Short: Preis steigt auf VWAP zurück (innerhalb VWAP_BAND × ATR)
+             UND Trend abwärts (Close < EMA) UND RSI < (100 - RSI_MIN)
+    """
+    vwap_period = int(cfg.get("VWAP_PERIOD",  24))
+    vwap_band   = cfg.get("VWAP_BAND",    0.25)
+    ema_period  = int(cfg.get("EMA_PERIOD",   50))
+    rsi_min     = cfg.get("RSI_MIN",      50.0)
+    sl_mult     = cfg.get("SL_ATR_MULT",  1.0)
+    tp_r        = cfg.get("TP_R",         2.5)
+
+    limit = max(vwap_period, ema_period) + 20
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < vwap_period + 2:
+        return None
+
+    # Rollender VWAP über die letzten vwap_period Bars
+    window = candles[-vwap_period:]
+    cum_tp_vol = sum(((c["high"] + c["low"] + c["close"]) / 3) * c["volume"] for c in window)
+    cum_vol    = sum(c["volume"] for c in window)
+    if cum_vol <= 0:
+        return None
+    vwap = cum_tp_vol / cum_vol
+
+    closes  = [c["close"] for c in candles]
+    ema_val = ema(closes, ema_period)
+    rsi_val = calc_rsi(candles, 14)
+    atr     = atr_wilder(candles, 14)
+
+    if ema_val <= 0 or atr <= 0:
+        return None
+
+    c   = candles[-1]
+    ts  = c["time"]
+    cls = c["close"]
+
+    dist_to_vwap = abs(cls - vwap)
+    band_width   = atr * vwap_band
+    near_vwap    = dist_to_vwap <= band_width
+
+    if not near_vwap:
+        return None
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cls > ema_val and rsi_val > rsi_min:
+        # Long-Bounce: Aufwärtstrend, Preis nahe VWAP
+        sl_dist = atr * sl_mult
+        sl      = cls - sl_dist
+        tp1     = cls + sl_dist
+        tp2     = cls + sl_dist * tp_r
+        if sl_dist <= 0 or sl <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="vwap_bounce", asset=asset, direction="long",
+            entry_price=round(cls, 6), stop_loss=round(sl, 6),
+            take_profit_1=round(tp1, 6), take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cls < ema_val and rsi_val < (100.0 - rsi_min):
+        # Short-Bounce: Abwärtstrend, Preis nahe VWAP
+        sl_dist = atr * sl_mult
+        sl      = cls + sl_dist
+        tp1     = cls - sl_dist
+        tp2     = cls - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="vwap_bounce", asset=asset, direction="short",
+            entry_price=round(cls, 6), stop_loss=round(sl, 6),
+            take_profit_1=round(tp1, 6), take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _ema_pullback_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    EMA Pullback auf 1h:
+      Long:  Close > EMA_SLOW (Uptrend), vorherige Kerze berührt/unterschreitet EMA_FAST,
+             aktuelle Kerze schließt bullish über EMA_FAST → Pullback-Ende
+      Short: Spiegelbildlich im Downtrend
+    Bestätigung: Körper der aktuellen Kerze > BODY_FACTOR × ATR (kein Doji)
+    """
+    slow_period  = int(cfg.get("EMA_SLOW",    200))
+    fast_period  = int(cfg.get("EMA_FAST",     50))
+    body_factor  = cfg.get("BODY_FACTOR",   0.3)
+    sl_mult      = cfg.get("SL_ATR_MULT",   1.0)
+    tp_r         = cfg.get("TP_R",          2.5)
+
+    limit = slow_period + 10
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < slow_period + 2:
+        return None
+
+    closes   = [c["close"] for c in candles]
+    ema_slow = ema(closes, slow_period)
+    ema_fast = ema(closes, fast_period)
+    atr      = atr_wilder(candles, 14)
+    if ema_slow <= 0 or ema_fast <= 0 or atr <= 0:
+        return None
+
+    cur  = candles[-1]
+    prev = candles[-2]
+    ts   = cur["time"]
+
+    body_cur  = abs(cur["close"]  - cur["open"])
+    body_prev = abs(prev["close"] - prev["open"])
+    min_body  = atr * body_factor
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    # Long: Uptrend, Pullback auf EMA_FAST, bullishe Bestätigungskerze
+    if (cur["close"] > ema_slow and
+            prev["low"] <= ema_fast and            # Vorkerze touchte EMA_FAST
+            cur["close"] > ema_fast and            # Erholung darüber
+            cur["close"] > cur["open"] and         # bullish
+            body_cur >= min_body):
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="ema_pullback", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    # Short: Downtrend, Rally auf EMA_FAST, bearishe Bestätigungskerze
+    if (cur["close"] < ema_slow and
+            prev["high"] >= ema_fast and
+            cur["close"] < ema_fast and
+            cur["close"] < cur["open"] and
+            body_cur >= min_body):
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] + sl_dist
+        tp2     = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="ema_pullback", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _donchian_breakout_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Donchian Channel Breakout auf 1h:
+      Long:  Aktuelle Kerze schließt über dem N-Bar-Hoch der VORHERIGEN Kerzen
+             UND Volumen > VOL_FACTOR × Vol-SMA (Bestätigung kein False Break)
+             UND ATR-Expansion: ATR > ATR_MIN_MULT × ATR-SMA (Momentum vorhanden)
+      Short: Spiegelbildlich
+    TP bewusst eng (1.5–3R) für WR-freundliche Exits.
+    """
+    dc_period   = int(cfg.get("DC_PERIOD",    20))
+    vol_factor  = cfg.get("VOL_FACTOR",    1.5)
+    atr_min     = cfg.get("ATR_MIN_MULT",  1.0)
+    sl_mult     = cfg.get("SL_ATR_MULT",   1.0)
+    tp_r        = cfg.get("TP_R",          2.0)
+
+    limit = dc_period + 30
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < dc_period + 5:
+        return None
+
+    cur    = candles[-1]
+    ts     = cur["time"]
+    # Donchian über die N Kerzen VOR der aktuellen (kein Look-ahead)
+    window = candles[-(dc_period + 1):-1]
+    dc_high = max(c["high"]  for c in window)
+    dc_low  = min(c["low"]   for c in window)
+
+    atr       = atr_wilder(candles, 14)
+    atr_avg   = atr_wilder(candles[:-14], 14) if len(candles) > 28 else atr
+    vol_avg   = vol_sma(candles, 20)
+
+    if atr <= 0 or vol_avg <= 0:
+        return None
+
+    atr_expanding = atr >= atr_min * atr_avg if atr_avg > 0 else True
+    vol_ok        = cur["volume"] >= vol_factor * vol_avg
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cur["close"] > dc_high and vol_ok and atr_expanding:
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="donchian_breakout", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cur["close"] < dc_low and vol_ok and atr_expanding:
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] + sl_dist
+        tp2     = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="donchian_breakout", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _inside_bar_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Inside Bar Breakout auf 1h:
+      Bedingung: Aktuelle Kerze vollständig innerhalb der Mutter-Kerze (High < Mother.High,
+                 Low > Mother.Low) → Kompression.
+      Signal wird NICHT auf der Inside Bar selbst gegeben, sondern auf der Breakout-Kerze:
+        - Nächste Kerze schließt über Mother.High → Long
+        - Nächste Kerze schließt unter Mother.Low  → Short
+      EMA-Trendfilter optional (EMA_PERIOD=0 deaktiviert ihn).
+      Mindest-Range der Mutter-Kerze: MOTHER_ATR_MIN × ATR (filtert Mikro-Bars).
+    """
+    ema_period    = int(cfg.get("EMA_PERIOD",    50))
+    mother_atr    = cfg.get("MOTHER_ATR_MIN",  0.5)
+    sl_mult       = cfg.get("SL_ATR_MULT",     1.0)
+    tp_r          = cfg.get("TP_R",            2.0)
+
+    candles = _candles(conn, asset, "1h", as_of_ts, max(ema_period + 5, 30))
+    if len(candles) < 5:
+        return None
+
+    cur    = candles[-1]   # Breakout-Kerze
+    inside = candles[-2]   # muss Inside Bar gewesen sein
+    mother = candles[-3]   # Mutter-Kerze
+
+    ts = cur["time"]
+
+    # Inside Bar Bedingung prüfen (auf Basis der zwei Kerzen VOR der aktuellen)
+    is_inside = (inside["high"] < mother["high"] and inside["low"] > mother["low"])
+    if not is_inside:
+        return None
+
+    atr = atr_wilder(candles, 14)
+    if atr <= 0:
+        return None
+
+    mother_range = mother["high"] - mother["low"]
+    if mother_range < mother_atr * atr:
+        return None   # Mutter-Kerze zu klein → kein sinnvoller Ausbruch
+
+    closes   = [c["close"] for c in candles]
+    ema_val  = ema(closes, ema_period) if ema_period > 0 else None
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cur["close"] > mother["high"]:
+        # Long-Breakout
+        if ema_val and cur["close"] < ema_val:
+            return None   # Trendfilter: kein Long im Downtrend
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="inside_bar_breakout", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cur["close"] < mother["low"]:
+        # Short-Breakout
+        if ema_val and cur["close"] > ema_val:
+            return None   # Trendfilter: kein Short im Uptrend
+        sl_dist = atr * sl_mult
+        sl      = cur["close"] + sl_dist
+        tp2     = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="inside_bar_breakout", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
 SIGNAL_FNS = {
-    "vaa":          _vaa_signal,
-    "kdt":          _kdt_signal,
-    "weekend_momo": _weekend_momo_signal,
+    "vaa":                _vaa_signal,
+    "kdt":            _kdt_signal,
+    "weekend_momo":   _weekend_momo_signal,
+    "asian_fade":     _asian_fade_signal,
+    "squeeze":        _squeeze_signal,
+    "mean_reversion":     _mean_reversion_signal,
+    "vwap_bounce":        _vwap_bounce_signal,
+    "ema_pullback":       _ema_pullback_signal,
+    "donchian_breakout":  _donchian_breakout_signal,
+    "inside_bar_breakout": _inside_bar_signal,
 }
 
 STRATEGY_INTERVAL = {
-    "vaa":          "1h",
-    "kdt":          "1h",
-    "weekend_momo": "1d",
+    "vaa":                "1h",
+    "kdt":                "1h",
+    "weekend_momo":       "1d",
+    "asian_fade":         "1h",
+    "squeeze":            "1h",
+    "mean_reversion":     "1h",
+    "vwap_bounce":        "1h",
+    "ema_pullback":       "1h",
+    "donchian_breakout":  "1h",
+    "inside_bar_breakout": "1h",
 }
 
 EXIT_INTERVAL = {
-    "vaa":          "1h",
-    "kdt":          "1h",
-    "weekend_momo": "4h",
+    "vaa":                "1h",
+    "kdt":                "1h",
+    "weekend_momo":       "4h",
+    "asian_fade":         "1h",
+    "squeeze":            "1h",
+    "mean_reversion":     "1h",
+    "vwap_bounce":        "1h",
+    "ema_pullback":       "1h",
+    "donchian_breakout":  "1h",
+    "inside_bar_breakout": "1h",
 }
 
 
@@ -443,6 +949,10 @@ def _default_cfg(strategy: str) -> dict:
         MOMENTUM_THRESHOLD, ATR_SL_MULTIPLIER, ATR_TP_MULTIPLIER, MAX_RISK_PCT,
     )
     base = {"CAPITAL": CAPITAL}
+    if strategy == "squeeze":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "SQUEEZE_PERIOD": 20, "EMA_PERIOD": 20,
+                "SL_ATR_MULT": 1.0, "TP_R": 3.0}
     if strategy == "vaa":
         return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
                 "VOL_MULT": VAA_VOL_MULT, "BODY_MULT": VAA_BODY_MULT,
@@ -454,4 +964,33 @@ def _default_cfg(strategy: str) -> dict:
         return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
                 "MOMENTUM_THRESHOLD": MOMENTUM_THRESHOLD,
                 "ATR_SL_MULT": ATR_SL_MULTIPLIER, "ATR_TP_MULT": ATR_TP_MULTIPLIER}
+    if strategy == "ema_pullback":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "EMA_SLOW": 200, "EMA_FAST": 50, "BODY_FACTOR": 0.3,
+                "SL_ATR_MULT": 1.0, "TP_R": 2.5}
+    if strategy == "donchian_breakout":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "DC_PERIOD": 20, "VOL_FACTOR": 1.5, "ATR_MIN_MULT": 1.0,
+                "SL_ATR_MULT": 1.0, "TP_R": 2.0}
+    if strategy == "inside_bar_breakout":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "EMA_PERIOD": 50, "MOTHER_ATR_MIN": 0.5,
+                "SL_ATR_MULT": 1.0, "TP_R": 2.0}
+    if strategy == "mean_reversion":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "BB_PERIOD": 20, "BB_MULT": 2.0, "RSI_PERIOD": 14,
+                "RSI_OS": 35.0, "SL_ATR_MULT": 1.0, "TP_R": 2.0}
+    if strategy == "vwap_bounce":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "VWAP_PERIOD": 24, "VWAP_BAND": 0.25, "EMA_PERIOD": 50,
+                "RSI_MIN": 50.0, "SL_ATR_MULT": 1.0, "TP_R": 2.5}
+    if strategy == "asian_fade":
+        from config.settings import (ASIAN_FADE_PUMP_THRESHOLD, ASIAN_FADE_RSI_OB,
+                                      ASIAN_FADE_SL_ATR_MULT, ASIAN_FADE_TP_MULT,
+                                      ASIAN_FADE_MAX_RISK_PCT)
+        return {**base, "MAX_RISK_PCT": ASIAN_FADE_MAX_RISK_PCT,
+                "PUMP_THRESHOLD": ASIAN_FADE_PUMP_THRESHOLD,
+                "RSI_OB": ASIAN_FADE_RSI_OB,
+                "SL_ATR_MULT": ASIAN_FADE_SL_ATR_MULT,
+                "TP_MULT": ASIAN_FADE_TP_MULT}
     return base

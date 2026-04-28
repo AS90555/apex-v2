@@ -14,6 +14,7 @@ import base64
 import requests
 from typing import Optional, Dict, List
 from dataclasses import dataclass
+from core.utils import log
 
 BASE_URL     = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
@@ -26,6 +27,9 @@ INTERVAL_MAP = {
 }
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config")
+
+SIZE_DECIMALS_FALLBACK = {"BTC": 4, "ETH": 2, "SOL": 1, "AVAX": 1, "XRP": 0,
+                          "DOGE": 0, "ADA": 0, "SUI": 1, "AAVE": 2}
 
 
 @dataclass
@@ -50,6 +54,7 @@ class Position:
 class BitgetClient:
     _MIN_INTERVAL   = 0.2
     _last_request_time: float = 0.0
+    _contract_cache: dict = {}   # {symbol: {"min_size": float, "size_precision": int}}
 
     def __init__(self, dry_run: bool = True):
         self.dry_run    = dry_run
@@ -308,6 +313,57 @@ class BitgetClient:
             return OrderResult(success=True, avg_price=trigger_price)
         except Exception as e:
             return OrderResult(success=False, error=str(e))
+
+    def get_contract_info(self, coin: str) -> dict:
+        """
+        Lädt Kontrakt-Limits für ein Asset (kein Auth nötig).
+        Ergebnis wird für die Laufzeit gecacht — kein wiederholter API-Call.
+        Rückgabe: {"min_size": float, "size_precision": int}
+        """
+        symbol = self._symbol(coin)
+        if symbol in BitgetClient._contract_cache:
+            return BitgetClient._contract_cache[symbol]
+
+        fallback = {"min_size": 0.0, "size_precision": SIZE_DECIMALS_FALLBACK.get(coin, 2)}
+        try:
+            data = self._get("/api/v2/mix/market/contracts", {
+                "productType": PRODUCT_TYPE,
+                "symbol": symbol,
+            })
+            contracts = data if isinstance(data, list) else []
+            for c in contracts:
+                if c.get("symbol") == symbol:
+                    min_size = float(c.get("minTradeNum", 0) or 0)
+                    # volumePlace = Anzahl Nachkommastellen für Size
+                    precision = int(c.get("volumePlace", 2) or 2)
+                    result = {"min_size": min_size, "size_precision": precision}
+                    BitgetClient._contract_cache[symbol] = result
+                    return result
+        except Exception as e:
+            log(f"[BITGET] get_contract_info {coin} fehlgeschlagen: {e}")
+
+        BitgetClient._contract_cache[symbol] = fallback
+        return fallback
+
+    def set_leverage(self, coin: str, leverage: int, hold_side: str = "long") -> bool:
+        """
+        Setzt den Hebel für ein Symbol (isolated margin, je Seite einzeln).
+        Im Dry-Run immer True. Gibt True zurück wenn erfolgreich.
+        """
+        if self.dry_run:
+            return True
+        try:
+            self._post("/api/v2/mix/account/set-leverage", {
+                "symbol":      self._symbol(coin),
+                "productType": PRODUCT_TYPE,
+                "marginCoin":  MARGIN_COIN,
+                "leverage":    str(leverage),
+                "holdSide":    hold_side,
+            })
+            return True
+        except Exception as e:
+            log(f"[BITGET] set_leverage {coin}×{leverage} fehlgeschlagen: {e}")
+            return False
 
     def cancel_tpsl_orders(self, coin: str) -> bool:
         if self.dry_run:

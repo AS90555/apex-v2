@@ -200,7 +200,7 @@ def run_intake(client, intake_matrix: dict) -> list:
 def cleanup_old_candles(ttl_days: int = 30) -> int:
     cutoff_ms = _now_ms() - ttl_days * 86_400_000
     conn = get_connection()
-    cur  = conn.execute("DELETE FROM candles WHERE ts < ?", (cutoff_ms,))
+    cur  = conn.execute("DELETE FROM candles WHERE ts < ? AND source='bitget'", (cutoff_ms,))
     deleted = cur.rowcount
     conn.commit()
     conn.close()
