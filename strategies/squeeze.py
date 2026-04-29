@@ -39,15 +39,22 @@ def _get_candles(conn, asset: str, limit: int) -> list[dict]:
              "close": r[4], "volume": r[5]} for r in reversed(rows)]
 
 
+def _make_signal_key(signal: Signal) -> str:
+    from datetime import datetime, timezone
+    bucket = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"{signal.strategy}__{signal.asset}__{signal.session or 'nosess'}__{signal.mode}__{bucket}"
+
+
 def _save_signal(conn, signal: Signal) -> int:
+    signal_key = _make_signal_key(signal)
     cur = conn.execute(
         """INSERT OR IGNORE INTO signals
            (created_at, strategy, asset, direction, entry_price, stop_loss,
-            take_profit_1, take_profit_2, size, risk_usd, session, status, mode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            take_profit_1, take_profit_2, size, risk_usd, session, status, mode, signal_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (signal.created_at, signal.strategy, signal.asset, signal.direction,
          signal.entry_price, signal.stop_loss, signal.take_profit_1, signal.take_profit_2,
-         signal.size, signal.risk_usd, signal.session, signal.status, signal.mode),
+         signal.size, signal.risk_usd, signal.session, signal.status, signal.mode, signal_key),
     )
     conn.commit()
     return cur.lastrowid

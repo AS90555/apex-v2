@@ -74,14 +74,30 @@ def log(msg: str):
 
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
-TRAIN_FRAC = 0.70
-DAYS       = 730
+DAYS = 730  # Gesamtzeitraum für Backtest-Daten in Tagen
 
-# Strikte Schwellen — nur harte Edges kommen durch
-MIN_TRADES_TEST     = 40
-MIN_PF_TEST         = 1.30
-MIN_AVG_R_TEST      = 0.08
-MIN_WR_TEST         = 48.0   # Micro-Account: unter 48% WR → zu viele Verlusttrades in Serie
+# ── Multi-Window OOS Validation ───────────────────────────────────────────────
+# Ersetzt den früheren 70/30-Single-Split.
+# Ein Setup muss ALLE 3 Fenster bestehen — kein Fenster kompensiert das andere.
+# Offsets in Tagen relativ zu now_ms (negativ = Vergangenheit).
+WF_WINDOWS = [
+    # Fenster 1 (alt): 120 Tage OOS
+    {"train_end": -480, "test_start": -480, "test_end": -360,
+     "min_n": 30, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": False, "weight": 1.0},
+    # Fenster 2 (mittel): 120 Tage OOS
+    {"train_end": -240, "test_start": -240, "test_end": -120,
+     "min_n": 30, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": False, "weight": 1.5},
+    # Fenster 3 (aktuell): 60 Tage OOS — deployment-relevant, Ruin-Filter aktiv
+    {"train_end": -60,  "test_start": -60,  "test_end": 0,
+     "min_n": 20, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": True, "weight": 2.0},
+]
+TOTAL_WEIGHT = sum(w["weight"] for w in WF_WINDOWS)
+
+# Schwellen für Alpha-Library-Aufnahme (alle Fenster müssen bestehen)
+MIN_PF_TEST         = 1.30   # Autopilot-Deploy-Filter (strenger als OOS-Gate)
 MIN_PF_TRAIN        = 1.10
 MAX_TRAIN_TEST_DROP = 0.40
 
@@ -103,6 +119,26 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Regime-Parameter importiert aus features/indicators.py (Single Source of Truth)
+
+# ── Rejection-Kategorien (für Lab-Stats) ─────────────────────────────────────
+# Jeder Rejection-Reason wird auf eine der folgenden Kategorien gemappt,
+# damit /lab_stats eine lesbare Top-Liste ausgeben kann.
+_REJECTION_CATEGORY = {
+    "n_test":        "zu_wenig_trades",
+    "pf_test":       "pf_zu_niedrig",
+    "wr_test":       "wr_zu_niedrig",
+    "avg_r_test":    "avg_r_zu_niedrig",
+    "pf_train":      "train_pf_zu_niedrig",
+    "overfit_drop":  "ueberfit",
+    "ruin_filter":   "ruin_drawdown",
+}
+
+def _rejection_category(reason: str) -> str:
+    """Mappt den rohen _passes()-Reason-String auf eine zählbare Kategorie."""
+    for key, cat in _REJECTION_CATEGORY.items():
+        if key in reason:
+            return cat
+    return "sonstige"
 
 
 # ── Parameter-Räume ──────────────────────────────────────────────────────────
@@ -299,12 +335,22 @@ CREATE TABLE IF NOT EXISTS lab_highscores (
 );
 """
 
+# Lauf-Statistik: Rejection-Counter und Gesamt-Testzähler
+DDL_LAB_STATS = """
+CREATE TABLE IF NOT EXISTS lab_stats (
+    key        TEXT PRIMARY KEY,
+    value      INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+"""
+
 
 def _ensure_schema():
     conn = get_connection()
     # Tabellen anlegen (idempotent, ohne market_regime im DDL → backward-compat)
     conn.executescript(DDL_DISCOVERIES)
     conn.executescript(DDL_HIGHSCORES)
+    conn.executescript(DDL_LAB_STATS)
     # market_regime nachrüsten falls Tabelle bereits ohne sie existiert
     cols = [r[1] for r in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()]
     if "market_regime" not in cols:
@@ -469,10 +515,18 @@ def _metrics(result) -> dict:
     }
 
 
-def _fitness(te: dict) -> float:
+def _fitness_single(te: dict) -> float:
     if te["n"] <= 0 or te["pf"] <= 0:
         return 0.0
-    return round(te["pf"] * min(te["avg_r"], 1.0) * math.log(max(te["n"], 2)), 4)
+    return te["pf"] * min(te["avg_r"], 1.0) * math.log(max(te["n"], 2))
+
+
+def _fitness(window_results: list[dict]) -> float:
+    """Gewichteter Fitness-Durchschnitt über alle OOS-Fenster (Fenster 3 trägt doppelt)."""
+    total = 0.0
+    for wr, wcfg in zip(window_results, WF_WINDOWS):
+        total += _fitness_single(wr["te"]) * wcfg["weight"]
+    return round(total / TOTAL_WEIGHT, 4)
 
 
 def _calc_micro_score(pf: float, max_dd_r: float) -> float:
@@ -488,25 +542,34 @@ def _calc_micro_score(pf: float, max_dd_r: float) -> float:
     return round(pf / dd_ratio, 4)
 
 
-def _passes(tr: dict, te: dict, max_dd_r: float) -> tuple[bool, str]:
-    if te["n"] < MIN_TRADES_TEST:
-        return False, f"n_test={te['n']}<{MIN_TRADES_TEST}"
-    if te["pf"] < MIN_PF_TEST:
-        return False, f"pf_test={te['pf']:.2f}<{MIN_PF_TEST}"
-    if te["wr"] < MIN_WR_TEST:
-        return False, f"wr_test={te['wr']:.1f}%<{MIN_WR_TEST}%"
-    if te["avg_r"] < MIN_AVG_R_TEST:
-        return False, f"avg_r_test={te['avg_r']:.3f}<{MIN_AVG_R_TEST}"
+def _passes_window(tr: dict, te: dict, max_dd_r: float, wcfg: dict) -> tuple[bool, str]:
+    """Prüft ein einzelnes OOS-Fenster gegen die Fenster-spezifischen Schwellen."""
+    if te["n"] < wcfg["min_n"]:
+        return False, f"n_test={te['n']}<{wcfg['min_n']}"
+    if te["pf"] < wcfg["min_pf"]:
+        return False, f"pf_test={te['pf']:.2f}<{wcfg['min_pf']}"
+    if te["wr"] < wcfg["min_wr"]:
+        return False, f"wr_test={te['wr']:.1f}%<{wcfg['min_wr']}%"
+    if te["avg_r"] < wcfg["min_avg_r"]:
+        return False, f"avg_r_test={te['avg_r']:.3f}<{wcfg['min_avg_r']}"
     if tr["pf"] < MIN_PF_TRAIN:
         return False, f"pf_train={tr['pf']:.2f}<{MIN_PF_TRAIN}"
     drop = abs(tr["avg_r"] - te["avg_r"])
     if drop > MAX_TRAIN_TEST_DROP:
         return False, f"overfit_drop={drop:.3f}>{MAX_TRAIN_TEST_DROP}"
-    # ── Ruin-Filter: monetärer Drawdown darf 25% des Startkapitals nicht überschreiten ──
-    max_dd_usdt = max_dd_r * RISK_PER_TRADE
-    ruin_limit  = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT   # 14.0 USDT
-    if max_dd_usdt > ruin_limit:
-        return False, f"ruin_filter: dd={max_dd_usdt:.1f}$>{ruin_limit:.1f}$ ({max_dd_r:.1f}R)"
+    if wcfg["ruin_filter"]:
+        max_dd_usdt = max_dd_r * RISK_PER_TRADE
+        ruin_limit  = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
+        if max_dd_usdt > ruin_limit:
+            return False, f"ruin_filter: dd={max_dd_usdt:.1f}$>{ruin_limit:.1f}$ ({max_dd_r:.1f}R)"
+    return True, ""
+
+
+def _passes(window_results: list[dict]) -> tuple[bool, str]:
+    """Multi-Window OOS Validation: alle Fenster müssen bestehen."""
+    for i, wr in enumerate(window_results):
+        if not wr["passed"]:
+            return False, f"w{i+1}_{wr['reason']}"
     return True, ""
 
 
@@ -537,22 +600,49 @@ def _notify_highscore(strategy: str, asset: str, regime: str, params: dict,
     icon       = _REGIME_ICON.get(regime, "❓")
     dd_usdt    = max_dd_r * RISK_PER_TRADE
     ruin_limit = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
+    param_lines = "\n".join(f"  `{k}` \\= `{v}`" for k, v in sorted(params.items()))
     msg = (
-        f"🏆 *Neuer Micro\\-Score\\-Rekord\\!* \\(Discovery \\#{disc_n}\\)\n\n"
-        f"*Strategie:* `{strategy}/{asset}`\n"
-        f"*Regime:* {icon} `{regime}`\n"
-        f"*Score:* `{prev_micro:.2f}` → *`{micro_score:.2f}`*\n\n"
-        f"*Out\\-of\\-Sample:*\n"
-        f"  Trades: *{te['n']}*  |  PF: *{te['pf']:.2f}*\n"
-        f"  Avg R: *{te['avg_r']:+.3f}R*  |  WR: *{te['wr']:.1f}%*\n"
-        f"  Max DD: *\\-${dd_usdt:.2f}* \\({max_dd_r:.1f}R\\) / Limit ${ruin_limit:.0f}\n"
+        f"🏆 *Neuer Micro\\-Score\\-Rekord\\!* \\(Discovery \\#{disc_n}\\)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 `{strategy}/{asset}`  {icon} `{regime}`\n"
+        f"🎯 Score: `{prev_micro:.2f}` → *`{micro_score:.2f}`*\n\n"
+        f"*Out\\-of\\-Sample \\(OOS\\):*\n"
+        f"  📊 Trades:   *{te['n']}*\n"
+        f"  💰 PF:       *{te['pf']:.2f}*\n"
+        f"  🎰 Win\\-Rate: *{te['wr']:.1f}%*\n"
+        f"  📈 Avg R:    *{te['avg_r']:+.3f}R*\n"
+        f"  📉 Max DD:   *\\-${dd_usdt:.2f}* \\({max_dd_r:.1f}R\\)\n"
+        f"  🏋️ Fitness:  `{fitness:.4f}`\n\n"
         f"*Train \\(Robustheit\\):*\n"
-        f"  PF: {tr['pf']:.2f}  |  Avg R: {tr['avg_r']:+.3f}R\n"
-        f"*Fitness:* `{fitness:.4f}`\n\n"
-        f"*Parameter:*\n"
-        + "\n".join(f"  `{k}` = `{v}`" for k, v in sorted(params.items()))
+        f"  PF: {tr['pf']:.2f}  ·  Avg R: {tr['avg_r']:+.3f}R\n\n"
+        f"*Parameter:*\n{param_lines}"
     )
-    _send_telegram(msg)
+
+    # Glossar-Buttons als Inline-Keyboard (JSON direkt für requests.post)
+    keyboard = {"inline_keyboard": [[
+        {"text": "❓ Score",    "callback_data": "info_score"},
+        {"text": "❓ PF",       "callback_data": "info_pf"},
+        {"text": "❓ Win-Rate", "callback_data": "info_wr"},
+    ], [
+        {"text": "❓ Avg R",   "callback_data": "info_avgr"},
+        {"text": "❓ Fitness", "callback_data": "info_fitness"},
+        {"text": "❓ Max DD",  "callback_data": "info_maxdd"},
+    ]]}
+
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID, "text": msg,
+                "parse_mode": "MarkdownV2",
+                "reply_markup": keyboard,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log(f"[LAB-DAEMON] Telegram-Fehler: {e}")
 
 
 # ── Discovery-Persistenz ─────────────────────────────────────────────────────
@@ -589,19 +679,80 @@ def _count_discoveries(conn) -> int:
     return conn.execute("SELECT COUNT(*) FROM lab_discoveries").fetchone()[0]
 
 
+# ── Lab-Stats Counter ─────────────────────────────────────────────────────────
+
+def _stat_inc(conn, key: str, delta: int = 1) -> None:
+    """Atomar einen Stats-Counter erhöhen (INSERT OR REPLACE)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO lab_stats (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = value + ?, updated_at = ?""",
+        (key, delta, now, delta, now),
+    )
+
+
+def get_lab_stats() -> dict:
+    """Liest alle Lab-Stats aus der DB — wird vom Telegram-Bot genutzt."""
+    conn = get_connection()
+    rows = conn.execute("SELECT key, value FROM lab_stats").fetchall()
+    total_disc = conn.execute("SELECT COUNT(*) FROM lab_discoveries").fetchone()[0]
+
+    # Blind Spots: (asset, regime)-Kombinationen ohne gültiges Setup
+    # Alle LIVE_ASSETS × bekannte Regimes prüfen
+    live_assets = ["BTC", "ETH", "SOL", "XRP", "ADA", "LINK", "AVAX"]
+    regimes     = ["TREND_UP", "TREND_DOWN", "SIDEWAYS"]
+    blind_spots = []
+    for asset in live_assets:
+        for regime in regimes:
+            has = conn.execute(
+                """SELECT 1 FROM lab_discoveries
+                   WHERE asset=? AND market_regime=?
+                     AND micro_score > 0 AND wr_test >= 48.0 AND n_test >= 40
+                   LIMIT 1""",
+                (asset, regime),
+            ).fetchone()
+            if not has:
+                blind_spots.append(f"{asset}/{regime}")
+    conn.close()
+
+    stats = {r[0]: r[1] for r in rows}
+    total_tests = stats.get("total_tests", 0)
+    total_pass  = stats.get("total_pass",  0)
+    hit_rate    = round(total_pass / total_tests * 100, 2) if total_tests > 0 else 0.0
+
+    # Rejection-Kategorien sortiert nach Häufigkeit
+    rejections = {
+        k.replace("reject_", ""): v
+        for k, v in stats.items() if k.startswith("reject_")
+    }
+    top_rejection = sorted(rejections.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "total_tests":   total_tests,
+        "total_pass":    total_pass,
+        "total_disc":    total_disc,
+        "hit_rate":      hit_rate,
+        "top_rejection": top_rejection,
+        "blind_spots":   blind_spots[:5],
+        "updated_at":    stats.get("updated_at_iso", "—"),
+    }
+
+
 # ── Haupt-Loop ───────────────────────────────────────────────────────────────
 
-def _run_one_target(strategy: str, asset: str,
-                    now_ms: int, start_ms: int, split_ms: int,
-                    conn) -> int:
-    # Regime für den Testzeitraum (OOS = split_ms..now_ms) bestimmen
-    regime = _detect_regime(asset, split_ms, now_ms)
+def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
+    """Multi-Window OOS Validation: alle 3 Fenster müssen bestehen."""
+    # Regime anhand des aktuellsten Fensters bestimmen (Fenster 3)
+    w3 = WF_WINDOWS[-1]
+    w3_test_start = now_ms + w3["test_start"] * 86_400_000
+    regime = _detect_regime(asset, w3_test_start, now_ms)
 
     # Bucket-Limit prüfen
     if _bucket_count(conn, asset, regime) >= MAX_DISCOVERIES_PER_BUCKET:
         log(f"[LAB-DAEMON] Bucket {asset}/{regime} voll ({MAX_DISCOVERIES_PER_BUCKET}) — überspringe")
         return 0
 
+    start_ms = now_ms - DAYS * 86_400_000
     batch = _batch(strategy, BATCH_SIZE)
     found = 0
 
@@ -610,34 +761,59 @@ def _run_one_target(strategy: str, asset: str,
         if _already_known(conn, h):
             continue
 
-        try:
-            tr_res = run_backtest(strategy, asset, start_ms, split_ms, cfg=params)
-            te_res = run_backtest(strategy, asset, split_ms,  now_ms,   cfg=params)
-        except Exception as e:
-            log(f"[LAB-DAEMON] Backtest-Fehler {strategy}/{asset}: {e}")
+        # ── 3 Fenster-Backtests ───────────────────────────────────────────────
+        window_results = []
+        backtest_error = False
+        for wcfg in WF_WINDOWS:
+            train_end_ms   = now_ms + wcfg["train_end"]   * 86_400_000
+            test_start_ms  = now_ms + wcfg["test_start"]  * 86_400_000
+            test_end_ms    = now_ms + wcfg["test_end"]    * 86_400_000 if wcfg["test_end"] != 0 else now_ms
+            try:
+                tr_res = run_backtest(strategy, asset, start_ms,     train_end_ms, cfg=params)
+                te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,  cfg=params)
+            except Exception as e:
+                log(f"[LAB-DAEMON] Backtest-Fehler {strategy}/{asset}: {e}")
+                backtest_error = True
+                break
+            tr = _metrics(tr_res)
+            te = _metrics(te_res)
+            max_dd_r = _max_r_drawdown(te_res)
+            passed, reason = _passes_window(tr, te, max_dd_r, wcfg)
+            window_results.append({"tr": tr, "te": te, "max_dd_r": max_dd_r,
+                                   "passed": passed, "reason": reason})
+
+        if backtest_error:
             continue
 
-        tr = _metrics(tr_res)
-        te = _metrics(te_res)
+        # Stats: Gesamt-Testzähler erhöhen
+        _stat_inc(conn, "total_tests")
 
-        # ── Drawdown berechnen (OOS-Fenster, entscheidend für Ruin-Filter) ──
-        max_dd_r = _max_r_drawdown(te_res)
-
-        ok, reason = _passes(tr, te, max_dd_r)
+        ok, reason = _passes(window_results)
         if not ok:
+            cat = _rejection_category(reason.split("_", 1)[-1] if "_" in reason else reason)
+            _stat_inc(conn, f"reject_{cat}")
             if "ruin_filter" in reason:
                 log(f"[LAB-DAEMON] ☠️  Ruin-Filter: {strategy}/{asset} {reason}")
             continue
 
-        micro_score = _calc_micro_score(te["pf"], max_dd_r)
-        fitness     = _fitness(te)
+        # Stats: bestandener Test
+        _stat_inc(conn, "total_pass")
+        conn.commit()
 
-        prev_pf, prev_fit   = _get_highscore(conn, strategy, asset, regime)
-        prev_micro          = _get_best_micro_score(conn, strategy, asset, regime)
-        is_micro_highscore  = micro_score > prev_micro
+        # Metriken aus Fenster 3 für Discovery-Eintrag und Deployment
+        te3      = window_results[-1]["te"]
+        max_dd_r = window_results[-1]["max_dd_r"]
+        tr3      = window_results[-1]["tr"]
+
+        micro_score = _calc_micro_score(te3["pf"], max_dd_r)
+        fitness     = _fitness(window_results)
+
+        prev_pf, prev_fit  = _get_highscore(conn, strategy, asset, regime)
+        prev_micro         = _get_best_micro_score(conn, strategy, asset, regime)
+        is_micro_highscore = micro_score > prev_micro
 
         disc_id = _save_discovery(conn, h, strategy, asset, regime, params,
-                                  tr, te, fitness, max_dd_r, micro_score)
+                                  tr3, te3, fitness, max_dd_r, micro_score)
         disc_n  = _count_discoveries(conn)
 
         dd_usdt     = max_dd_r * RISK_PER_TRADE
@@ -645,15 +821,15 @@ def _run_one_target(strategy: str, asset: str,
         log(
             f"[LAB-DAEMON] {'🏆' if is_micro_highscore else '✅'} Discovery #{disc_n}: "
             f"{strategy}/{asset} [{regime_icon}{regime}] "
-            f"PF={te['pf']:.2f} AvgR={te['avg_r']:+.3f} n={te['n']} "
-            f"MaxDD=${dd_usdt:.1f}({max_dd_r:.1f}R) Score={micro_score:.2f}"
+            f"PF={te3['pf']:.2f} AvgR={te3['avg_r']:+.3f} n={te3['n']} "
+            f"MaxDD=${dd_usdt:.1f}({max_dd_r:.1f}R) Score={micro_score:.2f} [3-Window]"
             + (f" ← NEUER SCORE (war {prev_micro:.2f})" if is_micro_highscore else "")
         )
 
         if is_micro_highscore:
-            _update_highscore(conn, strategy, asset, regime, te["pf"], fitness, disc_id)
+            _update_highscore(conn, strategy, asset, regime, te3["pf"], fitness, disc_id)
             _notify_highscore(strategy, asset, regime, _round_params(params),
-                              tr, te, fitness, prev_pf, disc_n,
+                              tr3, te3, fitness, prev_pf, disc_n,
                               max_dd_r, micro_score, prev_micro)
 
         found += 1
@@ -666,7 +842,8 @@ def main():
     log("[LAB-DAEMON] ════════════════════════════════════════════════")
     log("[LAB-DAEMON] APEX Auto-Lab Daemon v2 gestartet")
     log(f"[LAB-DAEMON] Suchraum: {[f'{s}/{a}' for s,a in SEARCH_SPACE]}")
-    log(f"[LAB-DAEMON] Filter: n≥{MIN_TRADES_TEST} PF≥{MIN_PF_TEST} WR≥{MIN_WR_TEST}% AvgR≥{MIN_AVG_R_TEST}")
+    log(f"[LAB-DAEMON] Multi-Window OOS: {len(WF_WINDOWS)} Fenster — alle müssen bestehen")
+    log(f"[LAB-DAEMON] Deploy-Filter: PF≥{MIN_PF_TEST} (Autopilot)")
     ruin_limit = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
     log(f"[LAB-DAEMON] Ruin-Filter: MaxDD≤${ruin_limit:.0f} ({MAX_DRAWDOWN_PERCENT*100:.0f}% von ${STARTING_CAPITAL:.0f}) | Risiko=${RISK_PER_TRADE}/Trade")
     log(f"[LAB-DAEMON] Regime: EMA({REGIME_EMA_PERIOD}) Slope±{REGIME_SLOPE_PCT*100:.1f}%")
@@ -686,22 +863,17 @@ def main():
 
     while True:
         iteration += 1
-        now_ms   = int(time.time() * 1000)
-        start_ms = now_ms - DAYS * 86_400_000
-        split_ms = start_ms + int((now_ms - start_ms) * TRAIN_FRAC)
+        now_ms = int(time.time() * 1000)
 
         try:
-            conn = get_connection()
-
-            # ── Rundreise-Sortierung ──────────────────────────────────────────
-            # Assets ohne bisherigen Highscore bekommen Vorrang.
-            # Innerhalb jeder Gruppe: zufällige Reihenfolge für Diversität.
+            # Sortierung mit kurzlebiger Verbindung — sofort schließen
             def _sort_key(target):
                 _, asset = target
-                has_disc = conn.execute(
+                c = get_connection()
+                has_disc = c.execute(
                     "SELECT 1 FROM lab_discoveries WHERE asset=? LIMIT 1", (asset,)
                 ).fetchone() is not None
-                # Prio-Assets ohne Discovery zuerst, dann alle anderen
+                c.close()
                 if asset in _PRIORITY_ASSETS and not has_disc:
                     return (0, random.random())
                 if not has_disc:
@@ -714,11 +886,19 @@ def main():
             for strategy, asset in targets:
                 if strategy not in RANGES:
                     continue
-                found = _run_one_target(strategy, asset, now_ms, start_ms, split_ms, conn)
-                found_this_round += found
+                # Jedes Target bekommt eine eigene kurzlebige Verbindung
+                conn = get_connection()
+                try:
+                    found = _run_one_target(strategy, asset, now_ms, conn)
+                    found_this_round += found
+                finally:
+                    conn.close()
+                # Kurze Pause zwischen Targets — gibt anderen Prozessen Luft
+                time.sleep(0.05)
 
-            disc_total = _count_discoveries(conn)
-            conn.close()
+            c2 = get_connection()
+            disc_total = _count_discoveries(c2)
+            c2.close()
 
             log(
                 f"[LAB-DAEMON] Iteration #{iteration} | "
@@ -729,10 +909,6 @@ def main():
 
         except Exception as e:
             log(f"[LAB-DAEMON] Kritischer Fehler in Iteration #{iteration}: {e}")
-            try:
-                conn.close()
-            except Exception:
-                pass
             time.sleep(SLEEP_ON_ERROR)
             continue
 

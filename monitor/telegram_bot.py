@@ -44,7 +44,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from core.db import get_connection
+from core.db import get_connection, DB_PATH
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logging.basicConfig(
@@ -242,26 +242,28 @@ def _db_new_executed_since(since_iso: str) -> list[dict]:
 
 
 def _db_alpha_setups() -> list[dict]:
-    """Bestes Setup pro (asset, market_regime) nach Micro-Score sortiert."""
+    """Bestes Setup pro (asset, market_regime) nach Micro-Score — nur validierte Einträge."""
     conn = get_connection()
     try:
         rows = conn.execute(
             """SELECT d.id, d.strategy, d.asset, d.market_regime,
                       d.pf_test, d.avg_r_test, d.wr_test, d.n_test,
                       d.fitness_score, d.params_json,
-                      COALESCE(d.max_dd_r, 0.0)   AS max_dd_r,
-                      COALESCE(d.micro_score, d.pf_test * 10.0) AS micro_score
+                      COALESCE(d.max_dd_r, 0.0) AS max_dd_r,
+                      d.micro_score
                FROM lab_discoveries d
                INNER JOIN (
-                   SELECT asset, market_regime,
-                          MAX(COALESCE(micro_score, pf_test * 10.0)) AS best_score
+                   SELECT asset, market_regime, MAX(micro_score) AS best_score
                    FROM lab_discoveries
                    WHERE market_regime != 'UNKNOWN'
+                     AND micro_score > 0
+                     AND wr_test >= 48.0
+                     AND n_test  >= 40
                    GROUP BY asset, market_regime
-               ) best ON d.asset = best.asset
+               ) best ON d.asset          = best.asset
                       AND d.market_regime = best.market_regime
-                      AND COALESCE(d.micro_score, d.pf_test * 10.0) = best.best_score
-               ORDER BY micro_score DESC"""
+                      AND d.micro_score   = best.best_score
+               ORDER BY d.micro_score DESC"""
         ).fetchall()
     except Exception:
         rows = []
@@ -291,19 +293,34 @@ RISK_PER_TRADE_CIO = 1.50   # USDT
 def _cio_best_setup(asset: str, regime: str) -> dict | None:
     """
     Findet das Setup mit dem höchsten micro_score für (asset, regime).
-    Fallback auf pf_test wenn micro_score noch nicht berechnet (ältere Einträge).
+    Nur Setups mit micro_score > 0, WR ≥ 48% und n ≥ 40 (selbe Hürden wie Lab).
     """
     conn = get_connection()
     row = conn.execute(
         """SELECT id, strategy, pf_test, avg_r_test, wr_test, n_test,
-                  COALESCE(max_dd_r, 0.0)              AS max_dd_r,
-                  COALESCE(micro_score, pf_test * 10.0) AS micro_score
+                  fitness_score,
+                  COALESCE(max_dd_r, 0.0) AS max_dd_r,
+                  micro_score
            FROM lab_discoveries
            WHERE asset=? AND market_regime=?
              AND market_regime != 'UNKNOWN'
-           ORDER BY COALESCE(micro_score, pf_test * 10.0) DESC
+             AND micro_score > 0
+             AND wr_test >= 48.0
+             AND n_test  >= 40
+           ORDER BY micro_score DESC
            LIMIT 1""",
         (asset, regime),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _active_deployment_for(asset: str) -> dict | None:
+    """Gibt das erste aktive Deployment für ein Asset zurück (mode + strategy_key)."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT strategy_key, mode, discovery_id FROM active_deployments WHERE asset=? AND active=1 LIMIT 1",
+        (asset,),
     ).fetchone()
     conn.close()
     return dict(row) if row else None
@@ -330,67 +347,98 @@ def _cio_portfolio() -> list[dict]:
 
 def _build_portfolio_text(portfolio: list[dict]) -> str:
     """Formatiert die CIO-Empfehlung als Telegram-Markdown-Text."""
-    lines = ["💼 *CIO Portfolio\\-Empfehlung \\(Live\\)*\n"]
+    lines = ["💼 *CIO Portfolio\\-Empfehlung*\n"]
     any_setup = False
 
+    # Einmalig alle aktiven Deployments laden (statt N einzelne DB-Calls)
+    conn = get_connection()
+    dep_map: dict[str, dict] = {}
+    for row in conn.execute(
+        "SELECT asset, mode, strategy_key FROM active_deployments WHERE active=1"
+    ).fetchall():
+        dep_map[row["asset"]] = {"mode": row["mode"], "strategy_key": row["strategy_key"]}
+    conn.close()
+
     for p in portfolio:
-        asset  = p["asset"]
-        regime = p["regime"]
-        setup  = p["setup"]
-        icon   = _REGIME_ICON_CIO.get(regime, "⚪")
+        asset    = p["asset"]
+        regime   = p["regime"]
+        setup    = p["setup"]
+        icon     = _REGIME_ICON_CIO.get(regime, "⚪")
+        deployed = dep_map.get(asset)
 
         if setup:
-            any_setup   = True
-            dd_usdt     = setup["max_dd_r"] * RISK_PER_TRADE_CIO
-            score       = setup["micro_score"]
+            any_setup = True
+            dd_usdt   = setup["max_dd_r"] * RISK_PER_TRADE_CIO
+            score     = setup["micro_score"]
+            fitness   = setup.get("fitness_score") or 0.0
+
+            deploy_badge = ""
+            if deployed:
+                mode_label   = "LIVE" if deployed["mode"] == "live" else "DRY"
+                deploy_badge = f"  ✅ _{mode_label} aktiv_\n"
+
             lines.append(
-                f"*{asset}* \\({icon} {regime}\\)\n"
-                f"  Setup \\#{setup['id']} \\| `{setup['strategy']}`\n"
-                f"  Score: *{score:.1f}*  PF: *{setup['pf_test']:.2f}*  "
-                f"WR: *{setup['wr_test']:.1f}%*\n"
-                f"  Max DD: *\\-${dd_usdt:.2f}*  n={setup['n_test']}\n"
+                f"*{asset}* {icon} `{regime}`\n"
+                f"  \\#{setup['id']} `{setup['strategy']}`  "
+                f"🎯 *{score:.1f}*  💰 PF *{setup['pf_test']:.2f}*\n"
+                f"  🎰 *{setup['wr_test']:.1f}%*  "
+                f"📈 *{setup['avg_r_test']:+.3f}R*  "
+                f"n=*{setup['n_test']}*  "
+                f"📉 *\\-${dd_usdt:.2f}*\n"
+                + deploy_badge
             )
         else:
             reason = "kein Setup im Lab" if regime != "UNKNOWN" else "Regime unbekannt"
-            lines.append(f"*{asset}* \\({icon} {regime}\\)\n  _\\({reason}\\)_\n")
+            lines.append(f"*{asset}* {icon} `{regime}`  _\\({reason}\\)_\n")
 
     if not any_setup:
         lines.append(
             "\n⚠️ _Kein passendes Setup für das aktuelle Markt\\-Regime\\._\n"
             "_Lab\\-Daemon läuft weiter — check später\\._"
         )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # Telegram-Limit: 4096 Zeichen
+    if len(text) > 4000:
+        text = text[:3990] + "\n_\\[\\.\\.\\.\\]_"
+    return text
 
 
 def _portfolio_keyboard(portfolio: list[dict]) -> InlineKeyboardMarkup:
     """
     Granulares Inline-Keyboard unter der CIO-Empfehlung.
-
-    Pro Asset mit vorhandenem Setup eine eigene Zeile:
-      [🚀 BTC Live]  [🧪 BTC Dry-Run]
-
-    Darunter (nur wenn ≥2 Setups vorhanden):
-      [🔥 ALLE LIVE (Risiko!)]
-
-    Callback-Format:
-      cio_single_live:<disc_id>:<asset>
-      cio_single_dry:<disc_id>:<asset>
-      cio_all_live_confirm:<id1,id2,...>
+    Callback-Format: cio_live:<disc_id> | cio_dry:<disc_id>
+    (kurz, asset wird im Handler per discovery_id nachgeschlagen)
     """
+    # Einmalig alle aktiven Deployments laden
+    conn = get_connection()
+    dep_assets: set[str] = {
+        row["asset"] for row in
+        conn.execute("SELECT asset FROM active_deployments WHERE active=1").fetchall()
+    }
+    conn.close()
+
     rows  = []
     valid = [(p["asset"], p["setup"]["id"]) for p in portfolio if p["setup"]]
 
     for asset, disc_id in valid:
-        rows.append([
-            InlineKeyboardButton(
-                f"🚀 {asset} Live",
-                callback_data=f"cio_single_live:{disc_id}:{asset}",
-            ),
-            InlineKeyboardButton(
-                f"🧪 {asset} Dry-Run",
-                callback_data=f"cio_single_dry:{disc_id}:{asset}",
-            ),
-        ])
+        if asset in dep_assets:
+            rows.append([
+                InlineKeyboardButton(
+                    f"✅ {asset} läuft",
+                    callback_data=f"dep_info:{asset}",
+                ),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    f"🚀 {asset} Live",
+                    callback_data=f"cio_live:{disc_id}",
+                ),
+                InlineKeyboardButton(
+                    f"⚙️ {asset} Dry",
+                    callback_data=f"cio_dry:{disc_id}",
+                ),
+            ])
 
     if len(valid) >= 2:
         all_ids = ",".join(str(i) for _, i in valid)
@@ -401,6 +449,17 @@ def _portfolio_keyboard(portfolio: list[dict]) -> InlineKeyboardMarkup:
             ),
         ])
 
+    # Glossar-Buttons
+    rows.append([
+        InlineKeyboardButton("❓ Score",   callback_data="info_score"),
+        InlineKeyboardButton("❓ PF",      callback_data="info_pf"),
+        InlineKeyboardButton("❓ WR",      callback_data="info_wr"),
+        InlineKeyboardButton("❓ Avg R",   callback_data="info_avgr"),
+    ])
+    rows.append([
+        InlineKeyboardButton("❓ Fitness", callback_data="info_fitness"),
+        InlineKeyboardButton("❓ Max DD",  callback_data="info_maxdd"),
+    ])
     rows.append([
         InlineKeyboardButton("🔄 Aktualisieren", callback_data="portfolio"),
         InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
@@ -622,44 +681,77 @@ def build_dashboard_text() -> str:
         remaining = sum(max(0, _canary_target(a) - (can.get(a, {}).get("n") or 0)) for a in LAB_REF)
         lines.append(f"\n⏳ Noch ca\\. *{remaining}* Trades bis Go\\-Live\\-Entscheidung")
 
-    # ── Aktive Deployments ────────────────────────────────────────────────────
+    # ── Aktive Deployments — aufgeteilt in LIVE und DRY-RUN ──────────────────
     deployments = _db_active_deployments()
-    if deployments:
-        lines.append("\n🚀 *Active Deployments:*")
-        _regime_icon = {"TREND_UP": "📈", "TREND_DOWN": "📉", "SIDEWAYS": "↔️"}
-        for dep in deployments:
-            n       = dep["n"]
-            total_r = dep["total_r"]
-            avg_r   = dep["avg_r"]
-            wr      = round(dep["wins"] / n * 100) if n > 0 else 0
-            r_icon  = _regime_icon.get(dep["regime"], "❓")
-            open_s  = dep["open_signals"]
+    _regime_icon = {"TREND_UP": "📈", "TREND_DOWN": "📉", "SIDEWAYS": "↔️"}
 
-            target  = dep["target_trades"]
-            filled  = min(int(n / target * 10), 10) if target else 0
-            prog    = "▓" * filled + "░" * (10 - filled)
-            pct     = min(int(n / target * 100), 100) if target else 0
+    def _dep_block(dep: dict) -> str:
+        n       = dep["n"]
+        wins    = dep["wins"]
+        losses  = n - wins
+        total_r = dep["total_r"]
+        avg_r   = dep["avg_r"]
+        wr      = round(wins / n * 100) if n > 0 else 0
+        r_icon  = _regime_icon.get(dep["regime"], "❓")
+        open_s  = dep["open_signals"]
+        target  = dep["target_trades"]
+        filled  = min(int(n / target * 10), 10) if target else 0
+        prog    = "▓" * filled + "░" * (10 - filled)
+        pct     = min(int(n / target * 100), 100) if target else 0
+        badge   = ("  🟢 *BEREIT*" if total_r > 0 else "  🔴 *FAILED*") if n >= target else ""
 
-            if n == 0:
-                trade_line = f"0/{target} Trades \\[{prog}\\] 0%"
-                if open_s:
-                    trade_line += f"  · {open_s} Signal offen"
-            else:
-                trade_line = (
-                    f"{n}/{target} Trades \\[{prog}\\] {pct}%  "
-                    f"· {_fmt_r(total_r)}  AvgR={_fmt_r(avg_r)}  WR={wr}%"
-                )
-
-            # Go-Live Badge wenn Ziel erreicht
-            badge = ""
-            if n >= target:
-                badge = "  🟢 *BEREIT*" if dep["total_r"] > 0 else "  🔴 *FAILED*"
-
-            lines.append(
-                f"  `{dep['strategy_key']}` \\(`{dep['asset']}`\\) {r_icon}{dep['regime']}{badge}\n"
-                f"  {trade_line}  \\[`{dep['mode']}`\\]"
+        if n == 0:
+            perf = f"0/{target} \\[{prog}\\] 0%" + (f"  · {open_s} Signal offen" if open_s else "")
+        else:
+            win_usd  = round(wins  * 1.50, 2)
+            loss_usd = round(losses * 1.50, 2)
+            perf = (
+                f"{n}/{target} \\[{prog}\\] {pct}%{badge}\n"
+                f"  ✅ {wins} Gewinner \\(\\+${win_usd:.2f}\\)  ·  "
+                f"❌ {losses} Verlierer \\(\\-${loss_usd:.2f}\\)\n"
+                f"  {_fmt_r(total_r)}  AvgR={_fmt_r(avg_r)}  WR={wr}%"
             )
-    else:
+        return (
+            f"  `{dep['strategy_key']}` {r_icon}{dep['regime']}\n"
+            f"  {perf}"
+        )
+
+    live_deps = [d for d in deployments if d["mode"] == "live"]
+    dry_deps  = [d for d in deployments if d["mode"] != "live"]
+
+    def _live_block(dep: dict) -> str:
+        n       = dep["n"]
+        wins    = dep["wins"]
+        losses  = n - wins
+        total_r = dep["total_r"]
+        avg_r   = dep["avg_r"]
+        wr      = round(wins / n * 100) if n > 0 else 0
+        r_icon  = _regime_icon.get(dep["regime"], "❓")
+        open_s  = dep["open_signals"]
+        if n == 0:
+            perf = f"Noch kein Trade{f'  · {open_s} Signal offen' if open_s else ''}"
+        else:
+            pnl_usd = round((wins - losses) * 1.50, 2)
+            pnl_sign = "\\+" if pnl_usd >= 0 else ""
+            perf = (
+                f"✅ {wins} Gewinner  ·  ❌ {losses} Verlierer\n"
+                f"  PnL: *{pnl_sign}${pnl_usd:.2f}*  ·  "
+                f"{_fmt_r(total_r)}  AvgR={_fmt_r(avg_r)}  WR={wr}%"
+            )
+        return (
+            f"  `{dep['strategy_key']}` {r_icon}{dep['regime']}\n"
+            f"  {perf}"
+        )
+
+    if live_deps:
+        lines.append("\n💵 *LIVE TRADING:*")
+        for dep in live_deps:
+            lines.append(_live_block(dep))
+    if dry_deps:
+        lines.append("\n⚙️ *DRY\\-RUNS:*")
+        for dep in dry_deps:
+            lines.append(_dep_block(dep))
+    if not deployments:
         lines.append("\n_Keine aktiven Deployments — nutze `/deploy <ID>` aus dem Alpha\\-Dashboard\\._")
 
     return "\n".join(lines)
@@ -731,9 +823,14 @@ def build_status_text() -> str:
                 icon = "🔴"
                 all_ok = False
 
-            age_str = f"{int(age)}m" if age < 120 else f"{age/60:.1f}h"
-            lat_str = f" {hb['latency_ms']:.0f}ms" if hb["latency_ms"] else ""
-            lines.append(f"  {icon} `{comp:<12}` {age_str} alt{lat_str}")
+            age_s = (now - ts).total_seconds() if age < 999 else 999 * 60
+            if age_s < 60:
+                age_str = f"{int(age_s)}s"
+            elif age_s < 7200:
+                age_str = f"{int(age_s // 60)}m"
+            else:
+                age_str = f"{age_s / 3600:.1f}h"
+            lines.append(f"  {icon} `{comp:<12}` {age_str} alt")
 
         lines.append("")
         lines.append("  ✅ Pipeline OK" if all_ok else "  ⚠️ Mindestens eine Komponente auffällig")
@@ -758,9 +855,10 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
     """Dauerhaftes Tastenfeld — bleibt im Chat-Eingabebereich angedockt."""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 Dashboard"),          KeyboardButton("🏆 Alpha Setups")],
-            [KeyboardButton("💼 Portfolio Empfehlung"), KeyboardButton("⚙️ Status")],
-            [KeyboardButton("🔌 API Test"),             KeyboardButton("📖 Hilfe")],
+            [KeyboardButton("📊 Dashboard"),            KeyboardButton("🏆 Alpha Setups")],
+            [KeyboardButton("💼 Portfolio Empfehlung"), KeyboardButton("🧪 Lab Stats")],
+            [KeyboardButton("⚙️ Status"),               KeyboardButton("🔌 API Test")],
+            [KeyboardButton("📖 Hilfe")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -823,14 +921,26 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Aktualisieren",       callback_data="dashboard"),
+            InlineKeyboardButton("⚙️ Strategien",          callback_data="manage_strategies"),
+        ],
+        [
+            InlineKeyboardButton("❓ Avg R",               callback_data="info_avgr"),
+            InlineKeyboardButton("❓ PnL",                 callback_data="info_pnl"),
+            InlineKeyboardButton("❓ Canary",              callback_data="info_canary"),
+        ],
+        [InlineKeyboardButton("◀️ Menü",                   callback_data="back_menu")],
+    ])
+
+
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = build_dashboard_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Aktualisieren", callback_data="dashboard"),
-            InlineKeyboardButton("◀️ Menü", callback_data="back_menu"),
-        ]]),
+        reply_markup=_dashboard_keyboard(),
     )
 
 
@@ -982,27 +1092,43 @@ def _build_alpha_text() -> str:
             "Der Lab\\-Daemon muss mindestens eine Iteration abgeschlossen haben\\."
         )
 
-    lines = ["🏆 *Top Alpha Setups — Sortiert nach Micro\\-Score*\n"]
     import json as _json
     RISK_PER_TRADE = 1.50
-    for s in setups:
-        icon      = _REGIME_ICON.get(s["market_regime"], "❓")
-        params    = _json.loads(s["params_json"])
-        p_str     = "  ".join(f"`{k}`={v}" for k, v in sorted(params.items()))
-        max_dd_r  = s.get("max_dd_r") or 0.0
-        max_dd_usd = max_dd_r * RISK_PER_TRADE
-        score     = s.get("micro_score") or s["pf_test"] * 10.0
-        lines.append(
-            f"*\\[ID {s['id']}\\]* `{s['asset']}` {icon} {s['market_regime']}\n"
-            f"  PF: *{s['pf_test']:.2f}*  WR: *{s['wr_test']:.1f}%*  "
-            f"Max DD: *\\-${max_dd_usd:.2f}*  Score: *{score:.1f}*\n"
-            f"  {p_str}\n"
-            f"  → `/deploy {s['id']}`"
-        )
+    lines = [f"🏆 *Top Alpha Setups* \\({len(setups)} Funde\\)\n"]
 
-    lines.append("\n_Micro\\-Score = PF / \\(MaxDD\\$/Kapital\\) — höher = besser für Micro\\-Account\\._")
-    lines.append("_Benutze `/deploy <ID>` um ein Setup als parallelen Dry\\-Run zu starten\\._")
+    for i, s in enumerate(setups, 1):
+        icon       = _REGIME_ICON.get(s["market_regime"], "❓")
+        params     = _json.loads(s["params_json"])
+        max_dd_r   = s.get("max_dd_r") or 0.0
+        max_dd_usd = max_dd_r * RISK_PER_TRADE
+        score      = s.get("micro_score") or 0.0
+        p_str      = "  ".join(f"`{k}`\\={v}" for k, v in sorted(params.items()) if k not in ("CAPITAL","MAX_RISK_PCT"))
+
+        lines.append(
+            f"*#{i} — ID {s['id']} \\| `{s['strategy']}/{s['asset']}`*\n"
+            f"  {icon} {s['market_regime']}\n"
+            f"  📊 Trades: *{s['n_test']}*  ·  💰 PF: *{s['pf_test']:.2f}*\n"
+            f"  🎰 WR: *{s['wr_test']:.1f}%*  ·  📈 Avg R: *{s['avg_r_test']:+.3f}R*\n"
+            f"  📉 Max DD: *\\-${max_dd_usd:.2f}*  ·  🎯 Score: *{score:.1f}*\n"
+            f"  ⚙️ {p_str}\n"
+            f"  ▶️ `/deploy {s['id']}`"
+        )
+        if i < len(setups):
+            lines.append("─────────────────────")
+
+    lines.append(
+        "\n_Score \\= PF ÷ \\(MaxDD\\$/Kapital\\) — höher \\= besser\\._\n"
+        "_`/deploy <ID>` startet ein Setup als Dry\\-Run\\._"
+    )
     return "\n".join(lines)
+
+
+async def cmd_lab_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = _build_lab_stats_text()
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_lab_stats_keyboard(),
+    )
 
 
 async def cmd_alpha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1155,7 +1281,7 @@ async def handle_keyboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if text == "📊 Dashboard":
         await update.message.reply_text(
             build_dashboard_text(), parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb,
+            reply_markup=_dashboard_keyboard(),
         )
     elif text == "🏆 Alpha Setups":
         await update.message.reply_text(
@@ -1174,14 +1300,218 @@ async def handle_keyboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
     elif text == "💼 Portfolio Empfehlung":
         await cmd_portfolio(update, ctx)
+    elif text == "🧪 Lab Stats":
+        await update.message.reply_text(
+            _build_lab_stats_text(), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_lab_stats_keyboard(),
+        )
     elif text == "🔌 API Test":
         await cmd_api_test(update, ctx)
 
 
+# ── Glossar-Erklärungen für Pop-up-Alerts ────────────────────────────────────
+_REJECTION_LABELS = {
+    "zu_wenig_trades":    "Zu wenige Trades (n < 40)",
+    "pf_zu_niedrig":      "PF zu niedrig (< 1.30)",
+    "wr_zu_niedrig":      "Win-Rate zu niedrig (< 48%)",
+    "avg_r_zu_niedrig":   "Avg R zu niedrig (< 0.08R)",
+    "train_pf_zu_niedrig":"Train-PF zu niedrig (< 1.10)",
+    "ueberfit":           "Overfitting (Train↔Test Abweichung)",
+    "ruin_drawdown":      "Ruin-Filter (Max DD > $14)",
+    "sonstige":           "Sonstige",
+}
+
+
+def _build_lab_stats_text() -> str:
+    try:
+        from research.auto_lab_daemon import get_lab_stats
+        stats = get_lab_stats()
+    except Exception as e:
+        return f"🧪 *Lab\\-Stats*\n\n❌ Fehler: {e}"
+
+    total   = stats["total_tests"]
+    passed  = stats["total_pass"]
+    disc    = stats["total_disc"]
+    rate    = stats["hit_rate"]
+    blinds  = stats["blind_spots"]
+    rej     = stats["top_rejection"]
+
+    lines = ["🧪 *Lab\\-Diagnose Dashboard*\n"]
+    lines.append(f"🔬 Tests gesamt:   *{total:,}*")
+    lines.append(f"✅ Bestanden:      *{passed:,}*")
+    lines.append(f"🏆 Discoveries:    *{disc}*")
+
+    rate_icon = "🟢" if rate >= 5 else ("🟡" if rate >= 1 else "🔴")
+    lines.append(f"🎯 Hit\\-Rate:      {rate_icon} *{rate:.2f}%*\n")
+
+    if rej:
+        lines.append("🚧 *Top Ablehnungsgründe:*")
+        total_rej = sum(v for _, v in rej)
+        for cat, count in rej[:5]:
+            label = _REJECTION_LABELS.get(cat, cat)
+            pct   = round(count / total_rej * 100) if total_rej else 0
+            bar_w = min(int(pct / 5), 20)
+            bar   = "▓" * bar_w + "·" * (20 - bar_w)
+            lines.append(f"  `{bar}` {pct}%\n  _{label}_  \\({count:,}\\)")
+    else:
+        lines.append("🚧 _Noch keine Rejection\\-Daten — Daemon gerade gestartet\\._")
+
+    lines.append("")
+    if blinds:
+        lines.append(f"🔦 *Blind Spots* \\({len(blinds)} von {7*3} Kombinationen\\):")
+        for b in blinds[:5]:
+            lines.append(f"  ⚪ `{b}`")
+        if len(blinds) > 5:
+            lines.append(f"  _\\.\\.\\. und {len(blinds)-5} weitere_")
+    else:
+        lines.append("🔦 *Blind Spots:* ✅ Alle Kombinationen abgedeckt\\!")
+
+    lines.append(
+        "\n_Hit\\-Rate = Anteil Tests, die alle Filter bestehen\\._\n"
+        "_Blind Spots = Asset/Regime ohne valides Setup in der DB\\._"
+    )
+    return "\n".join(lines)
+
+
+def _lab_stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❓ Hit-Rate",   callback_data="info_hitrate"),
+            InlineKeyboardButton("❓ Rejection",  callback_data="info_rejection"),
+            InlineKeyboardButton("❓ Blind Spots",callback_data="info_blindspots"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Aktualisieren", callback_data="lab_stats"),
+            InlineKeyboardButton("◀️ Menü",           callback_data="back_menu"),
+        ],
+    ])
+
+
+_GLOSSAR = {
+    # Telegram-Limit: max 200 Zeichen pro show_alert-Text
+    "info_score":
+        "🎯 Micro-Score = PF ÷ (MaxDD$ / Kapital)\n"
+        "Belohnt hohen Edge bei kleinem Drawdown.\n"
+        "PF=1.5 / DD=5% schlägt PF=2.0 / DD=40%.\n"
+        "Ideal für Micro-Accounts.",
+
+    "info_pf":
+        "💰 Profit Factor (PF)\n"
+        "= Bruttogewinne ÷ Bruttoverluste\n"
+        "PF > 1.0 = positiver Edge\n"
+        "Lab-Minimum: PF ≥ 1.30\n"
+        "Stark: PF ≥ 1.50",
+
+    "info_wr":
+        "🎰 Win-Rate = Gewinner ÷ alle Trades\n"
+        "Lab-Minimum: 48%\n"
+        "Allein nicht aussagekräftig —\n"
+        "entscheidend ist Avg R × WR = Erwartungswert.",
+
+    "info_avgr":
+        "📈 Avg R = Ø Gewinn/Verlust in R\n"
+        "1R = Risiko pro Trade ($1.50)\n"
+        "Avg R +0.10 → +$0.15 je Trade im Schnitt.\n"
+        "Lab-Minimum: +0.08R",
+
+    "info_fitness":
+        "🏋️ Fitness = PF × min(AvgR,1) × log(n)\n"
+        "Kombiniert Edge + Signifikanz.\n"
+        "Mehr Trades & höherer AvgR = höherer Score.\n"
+        "Für interne Highscore-Vergleiche.",
+
+    "info_maxdd":
+        "📉 Max DD = größter kumulativer Verlust\n"
+        "Berechnet in R (×$1.50 = USDT).\n"
+        "Ruin-Filter: DD > $14 (25% v. $56) → abgelehnt.\n"
+        "Schützt den Micro-Account vor Ruin.",
+
+    "info_hitrate":
+        "🎯 Hit-Rate = bestandene Tests ÷ Gesamt\n"
+        "Filter: n≥40, PF≥1.30, WR≥48%,\n"
+        "AvgR≥0.08R, kein Overfit, DD≤$14.\n"
+        "Typisch: 0.5–3% — das ist normal.",
+
+    "info_rejection":
+        "🚧 Top-Ablehnungsgrund\n"
+        "Häufigste Ursachen:\n"
+        "1. WR < 48% — zu viele Verlust-Trades\n"
+        "2. PF < 1.30 — zu schwacher Edge\n"
+        "3. Ruin-Filter — DD > $14",
+
+    "info_blindspots":
+        "🔦 Blind Spots\n"
+        "= Asset/Regime ohne valides Setup in der DB.\n"
+        "Bsp: SOL/TREND_DOWN → kein Setup gefunden.\n"
+        "Viele = Lab läuft noch. Wenige = gute Abdeckung.",
+
+    "info_pnl":
+        "💵 PnL = Profit & Loss (Gewinn/Verlust)\n"
+        "Live-PnL = (Gewinner − Verlierer) × $1.50\n"
+        "Basiert auf fixem Risiko: 1R = $1.50 pro Trade.\n"
+        "Kein Slippage eingerechnet.",
+
+    "info_canary":
+        "🐦 Canary = Probelauf vor Go-Live\n"
+        "Strategie läuft im Dry-Run (kein echtes Geld).\n"
+        "Ziel: N Trades sammeln und Edge bestätigen.\n"
+        "Bei positivem Ergebnis → Upgrade auf LIVE.",
+}
+
+
+def _build_manage_strategies_text() -> str:
+    deps = _db_active_deployments()
+    if not deps:
+        return "⚙️ *Strategien verwalten*\n\n_Keine aktiven Deployments\\._"
+    lines = ["⚙️ *Strategien verwalten*\n"]
+    for dep in deps:
+        n      = dep["n"]
+        mode   = dep["mode"]
+        mode_i = "🔴" if mode == "live" else "🧪"
+        mode_label = mode.replace("_", "\\_")
+        lines.append(
+            f"{mode_i} `{dep['strategy_key']}`  \\[{mode_label}\\]\n"
+            f"   {dep['asset']}  {n}/{dep['target_trades']} Trades"
+        )
+    lines.append("\nModus wechseln oder stoppen:")
+    return "\n".join(lines)
+
+
+def _manage_strategies_keyboard() -> InlineKeyboardMarkup:
+    deps = _db_active_deployments()
+    rows = []
+    for dep in deps:
+        sk   = dep["strategy_key"]
+        mode = dep["mode"]
+        btn_live = InlineKeyboardButton("🔴 LIVE", callback_data=f"dep_mode:{sk}:live")
+        btn_dry  = InlineKeyboardButton("🧪 DRY",  callback_data=f"dep_mode:{sk}:dry_run")
+        btn_stop = InlineKeyboardButton("🗑️ Stop",  callback_data=f"dep_mode:{sk}:stop")
+        # Aktiver Modus nicht als Button anzeigen
+        if mode == "live":
+            rows.append([btn_dry, btn_stop])
+        else:
+            rows.append([btn_live, btn_stop])
+        rows[-1].insert(0, InlineKeyboardButton(f"📌 {dep['asset']}", callback_data="noop"))
+    rows.append([
+        InlineKeyboardButton("🔄 Aktualisieren", callback_data="manage_strategies"),
+        InlineKeyboardButton("◀️ Dashboard",     callback_data="dashboard"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     action = query.data
+
+    # ── Glossar-Pop-ups (show_alert=True) ────────────────────────────────────
+    if action in _GLOSSAR:
+        await query.answer(text=_GLOSSAR[action], show_alert=True)
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass  # Query abgelaufen — ignorieren, Handler läuft trotzdem weiter
 
     back_btn = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Aktualisieren", callback_data=action),
@@ -1199,7 +1529,7 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             build_dashboard_text(),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=back_btn,
+            reply_markup=_dashboard_keyboard(),
         )
 
     elif action == "signals":
@@ -1235,6 +1565,13 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]]),
         )
 
+    elif action == "lab_stats":
+        await query.edit_message_text(
+            _build_lab_stats_text(),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_lab_stats_keyboard(),
+        )
+
     elif action == "portfolio":
         import asyncio
         portfolio = await asyncio.get_event_loop().run_in_executor(None, _cio_portfolio)
@@ -1244,14 +1581,16 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_portfolio_keyboard(portfolio),
         )
 
-    elif action.startswith("cio_single_dry:") or action.startswith("cio_single_live:"):
-        parts   = action.split(":")
-        mode    = "dry_run" if "dry" in parts[0] else "live"
-        disc_id = int(parts[1])
-        asset   = parts[2]
+    elif action.startswith("cio_dry:") or action.startswith("cio_live:"):
+        disc_id = int(action.split(":")[1])
+        mode    = "dry_run" if action.startswith("cio_dry:") else "live"
+        # Asset aus der DB holen (kein Asset im callback_data)
+        conn = get_connection()
+        row  = conn.execute("SELECT asset FROM lab_discoveries WHERE id=?", (disc_id,)).fetchone()
+        conn.close()
+        asset = row["asset"] if row else "?"
 
         if mode == "live":
-            # Bestätigung für Live-Einzeldeploy
             await query.edit_message_text(
                 f"⚠️ *{asset} live schalten?*\n\n"
                 f"Setup \\#{disc_id} wird mit echtem Kapital gehandelt\\.\n"
@@ -1260,16 +1599,19 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         f"✅ Ja, {asset} LIVE",
-                        callback_data=f"cio_confirmed_live:{disc_id}:{asset}",
+                        callback_data=f"cio_confirmed_live:{disc_id}",
                     )],
                     [InlineKeyboardButton("❌ Abbrechen", callback_data="portfolio")],
                 ]),
             )
         else:
-            r = _db_deploy(disc_id, mode="dry_run", replace_asset=True)
+            import asyncio
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _db_deploy(disc_id, mode="dry_run", replace_asset=True)
+            )
             if r.get("ok"):
                 msg = (
-                    f"🧪 *{asset} Dry\\-Run gestartet*\n\n"
+                    f"⚙️ *{asset} Dry\\-Run gestartet*\n\n"
                     f"Instanz: `{r['strategy_key']}`\n"
                     f"Ziel: {r['target_trades']} Trades\n"
                     f"_Vorherige {asset}\\-Instanzen gestoppt\\._"
@@ -1285,10 +1627,15 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
     elif action.startswith("cio_confirmed_live:"):
-        parts   = action.split(":")
-        disc_id = int(parts[1])
-        asset   = parts[2]
-        r = _db_deploy(disc_id, mode="live", replace_asset=True)
+        disc_id = int(action.split(":")[1])
+        conn = get_connection()
+        row  = conn.execute("SELECT asset FROM lab_discoveries WHERE id=?", (disc_id,)).fetchone()
+        conn.close()
+        asset = row["asset"] if row else "?"
+        import asyncio
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _db_deploy(disc_id, mode="live", replace_asset=True)
+        )
         if r.get("ok"):
             msg = (
                 f"🔴 *{asset} LIVE aktiv*\n\n"
@@ -1324,9 +1671,80 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
 
+    elif action == "manage_strategies":
+        await query.edit_message_text(
+            _build_manage_strategies_text(),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_manage_strategies_keyboard(),
+        )
+
+    elif action.startswith("dep_mode:"):
+        parts = action.split(":")
+        sk    = parts[1]
+        mode  = parts[2]
+
+        def _do_dep_mode():
+            import sqlite3 as _sq, time as _t
+            _db = os.path.abspath(DB_PATH)
+            for attempt in range(60):
+                try:
+                    c = _sq.connect(_db, timeout=5, check_same_thread=False)
+                    c.row_factory = _sq.Row
+                    if mode == "stop":
+                        c.execute("UPDATE active_deployments SET active=0 WHERE strategy_key=?", (sk,))
+                    else:
+                        c.execute("UPDATE active_deployments SET mode=? WHERE strategy_key=? AND active=1", (mode, sk))
+                    c.commit()
+                    c.close()
+                    return
+                except _sq.OperationalError as e:
+                    try: c.close()
+                    except Exception: pass
+                    if "locked" in str(e) and attempt < 59:
+                        _t.sleep(0.05)
+                        continue
+                    raise
+
+        import asyncio
+        await asyncio.get_event_loop().run_in_executor(None, _do_dep_mode)
+
+        if mode == "stop":
+            await query.edit_message_text(
+                f"🗑️ *{sk}* gestoppt\\.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Dashboard", callback_data="dashboard"),
+                ]]),
+            )
+        else:
+            label = "🔴 LIVE" if mode == "live" else "🧪 DRY-RUN"
+            await query.edit_message_text(
+                f"{label} — `{sk}` umgeschaltet auf *{mode}*\\.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_manage_strategies_keyboard(),
+            )
+
+    elif action.startswith("dep_info:"):
+        asset    = action.split(":")[1]
+        deployed = _active_deployment_for(asset)
+        if deployed:
+            mode_label = "LIVE" if deployed["mode"] == "live" else "DRY-RUN"
+            await query.answer(
+                text=f"{asset} läuft bereits als {mode_label}: {deployed['strategy_key']}",
+                show_alert=True,
+            )
+        else:
+            await query.answer(text=f"{asset}: kein aktives Deployment gefunden.")
+
+    elif action == "noop":
+        pass
+
     elif action.startswith("cio_all_live_execute:"):
         ids     = [int(x) for x in action.split(":", 1)[1].split(",") if x]
-        results = [_db_deploy(i, mode="live", replace_asset=True) for i in ids]
+        import asyncio
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: [_db_deploy(i, mode="live", replace_asset=True) for i in ids]
+        )
         ok      = sum(1 for r in results if r.get("ok"))
         lines   = [f"🔴 *CIO All\\-Live Deploy*\n"]
         for r in results:
@@ -1543,7 +1961,8 @@ def main():
     app.add_handler(CommandHandler("lab",    cmd_lab))
     app.add_handler(CommandHandler("fetch",  cmd_fetch))
     app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("alpha",    cmd_alpha))
+    app.add_handler(CommandHandler("alpha",     cmd_alpha))
+    app.add_handler(CommandHandler("lab_stats", cmd_lab_stats))
     app.add_handler(CommandHandler("deploy",   cmd_deploy))
     app.add_handler(CommandHandler("api_test",  cmd_api_test))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
@@ -1552,7 +1971,7 @@ def main():
     # Persistentes ReplyKeyboard — Textnachrichten der Buttons abfangen
     _kb_buttons = {
         "📊 Dashboard", "🏆 Alpha Setups", "💼 Portfolio Empfehlung",
-        "⚙️ Status", "🔌 API Test", "📖 Hilfe",
+        "🧪 Lab Stats", "⚙️ Status", "🔌 API Test", "📖 Hilfe",
     }
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex("^(" + "|".join(_kb_buttons) + ")$"),

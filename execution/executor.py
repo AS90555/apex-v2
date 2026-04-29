@@ -158,13 +158,13 @@ class Executor:
             f"{signal.direction.upper()} — Modus: {signal.mode} — Lock (processing)")
 
         # ── Schritt 2: Execution je nach Modus ───────────────────────────────
+        # Shadow-Signale haben Status 'approved_shadow' und werden nie geladen.
+        # Nur 'approved' (dry_run / live) gelangt hierher.
         try:
-            if signal.mode == "shadow":
-                trade = self._execute_shadow(signal)
-            elif signal.mode in ("dry_run", "live"):
+            if signal.mode in ("dry_run", "live"):
                 trade = self._execute_live(signal, dry_run=(signal.mode == "dry_run"))
             else:
-                raise ValueError(f"Unbekannter Modus: {signal.mode}")
+                raise ValueError(f"Unbekannter Modus im Executor: {signal.mode} — Shadow-Signale dürfen hier nicht ankommen")
         except Exception as e:
             log(f"[EXECUTOR] Signal #{signal.id}: FEHLER bei Execution — {e}")
             log(f"[EXECUTOR] Signal #{signal.id} bleibt auf 'processing' "
@@ -209,23 +209,6 @@ class Executor:
         log(f"[EXECUTOR] Signal #{signal.id} → Trade #{trade.id} geschrieben "
             f"(order_id={trade.order_id}, entry={trade.entry_price})")
         return trade
-
-    # ── Shadow-Execution ──────────────────────────────────────────────────────
-
-    def _execute_shadow(self, signal: Signal) -> Trade:
-        """Simuliert die Order rein in DB. Kein Netzwerk-Call."""
-        order_id = f"SHADOW-{signal.strategy.upper()}-{int(time.time())}"
-        log(f"[EXECUTOR] SHADOW: {signal.asset} {signal.direction.upper()} "
-            f"@ {signal.entry_price} SL={signal.stop_loss} TP2={signal.take_profit_2} "
-            f"size={signal.size} → {order_id}")
-        return Trade(
-            signal_id=signal.id,
-            strategy=signal.strategy, asset=signal.asset, direction=signal.direction,
-            entry_price=signal.entry_price, size=signal.size,
-            stop_loss=signal.stop_loss,
-            take_profit_1=signal.take_profit_1, take_profit_2=signal.take_profit_2,
-            mode=signal.mode, order_id=order_id,
-        )
 
     # ── Live/Dry-Run-Execution ────────────────────────────────────────────────
 

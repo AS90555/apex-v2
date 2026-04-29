@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS signals (
     risk_usd      REAL,
     session       TEXT,
     status        TEXT NOT NULL DEFAULT 'pending',
+    -- status lifecycle: pending → approved_shadow (shadow, Audit only) | approved → processing → executed|failed | rejected | expired
     reject_reason TEXT,
     governance_ts TEXT,
     execution_ts  TEXT,
@@ -145,8 +146,9 @@ CREATE TABLE IF NOT EXISTS active_deployments (
 
 def get_connection() -> sqlite3.Connection:
     db_path = os.path.abspath(DB_PATH)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.row_factory = sqlite3.Row
     return conn
@@ -170,6 +172,13 @@ def run_migrations():
         conn.execute("ALTER TABLE active_deployments ADD COLUMN target_trades INTEGER NOT NULL DEFAULT 50")
     if "go_live_notified" not in dep_cols:
         conn.execute("ALTER TABLE active_deployments ADD COLUMN go_live_notified INTEGER NOT NULL DEFAULT 0")
+    sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+    if "signal_key" not in sig_cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN signal_key TEXT")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_signal_key
+           ON signals(signal_key) WHERE signal_key IS NOT NULL"""
+    )
     conn.commit()
     conn.close()
 

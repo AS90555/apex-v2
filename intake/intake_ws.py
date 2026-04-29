@@ -361,7 +361,8 @@ async def _connect_and_run() -> None:
 
     delay = RECONNECT_DELAY
 
-    while True:
+    while True:  # Äußere Endlosschleife — stirbt nie
+        keepalive_task = None
         try:
             log(f"[WS] Verbinde mit {BITGET_WS_URL} ...")
             async with websockets.connect(
@@ -369,30 +370,36 @@ async def _connect_and_run() -> None:
                 ping_interval=None,      # Eigener Keepalive
                 max_size=2**20,
                 open_timeout=30,
+                close_timeout=10,
             ) as ws:
-                log("[WS] ✅ Verbunden")
+                log("[WS] ✅ Verbunden — Reconnect-Delay zurückgesetzt")
                 delay = RECONNECT_DELAY  # Reset nach erfolgreicher Verbindung
 
-                # Alle Channels auf einmal subscriben
                 await ws.send(json.dumps({"op": "subscribe", "args": subs}))
                 log(f"[WS] Subscribe gesendet ({len(subs)} Channels)")
 
-                # Keepalive parallel starten
                 keepalive_task = asyncio.create_task(_keepalive(ws))
 
                 async for msg in ws:
                     if msg == "pong":
                         continue
-                    await _handle_message(msg)
-
-                keepalive_task.cancel()
+                    try:
+                        await _handle_message(msg)
+                    except Exception as e:
+                        log(f"[WS] _handle_message Fehler (ignoriert): {e}")
 
         except (ConnectionClosedError, ConnectionClosedOK) as e:
-            log(f"[WS] Verbindung getrennt: {e} — Reconnect in {delay}s")
-        except OSError as e:
-            log(f"[WS] Netzwerk-Fehler: {e} — Reconnect in {delay}s")
+            log(f"[WS] ⚠️ Verbindung getrennt: {e} — Reconnect in {delay}s")
+        except (OSError, TimeoutError) as e:
+            log(f"[WS] ⚠️ Netzwerk-Fehler: {e} — Reconnect in {delay}s")
+        except asyncio.CancelledError:
+            log("[WS] Cancelled — beende _connect_and_run")
+            raise  # CancelledError weitergeben (sauberes Shutdown)
         except Exception as e:
-            log(f"[WS] Unerwarteter Fehler: {e} — Reconnect in {delay}s")
+            log(f"[WS] ⚠️ Unerwarteter Fehler: {type(e).__name__}: {e} — Reconnect in {delay}s")
+        finally:
+            if keepalive_task and not keepalive_task.done():
+                keepalive_task.cancel()
 
         await asyncio.sleep(delay)
         delay = min(delay * 2, MAX_RECONNECT)   # Exponential Backoff
@@ -400,21 +407,39 @@ async def _connect_and_run() -> None:
 
 # ── Heartbeat-Writer ──────────────────────────────────────────────────────────
 
-async def _heartbeat_loop() -> None:
-    """Schreibt alle 5 Minuten einen Heartbeat in die DB."""
-    while True:
-        await asyncio.sleep(300)
+def _write_heartbeat(status: str = "ok", msg: str = "") -> None:
+    """Schreibt einen einzelnen Heartbeat-Eintrag (synchron, mit Retry)."""
+    for attempt in range(10):
         try:
             conn = get_connection()
             conn.execute(
                 "INSERT INTO heartbeats(ts, component, status, message, latency_ms) VALUES(?,?,?,?,?)",
-                (datetime.now(timezone.utc).isoformat(), "intake_ws", "ok",
-                 f"channels={len(_build_subscriptions())} last_ts_count={len(_last_ts)}", 0),
+                (datetime.now(timezone.utc).isoformat(), "intake_ws", status,
+                 msg or f"channels={len(_build_subscriptions())} tracked={len(_last_ts)}", 0),
             )
             conn.commit()
             conn.close()
+            return
         except Exception as e:
-            log(f"[WS] Heartbeat-Fehler: {e}")
+            try: conn.close()
+            except Exception: pass
+            if attempt < 9:
+                import time as _t; _t.sleep(0.1)
+            else:
+                log(f"[WS] Heartbeat-Fehler nach 10 Versuchen: {e}")
+
+
+async def _heartbeat_loop() -> None:
+    """Schreibt alle 2 Minuten einen Heartbeat — stirbt nie."""
+    while True:
+        try:
+            await asyncio.sleep(120)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _write_heartbeat)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"[WS] Heartbeat-Loop-Fehler: {e}")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -430,6 +455,7 @@ async def main() -> None:
     await asyncio.gather(
         _connect_and_run(),
         _heartbeat_loop(),
+        return_exceptions=False,
     )
 
 

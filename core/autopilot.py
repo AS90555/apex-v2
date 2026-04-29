@@ -17,6 +17,8 @@ Sicherheits-Checks:
 import math
 import os
 import sys
+import time
+import sqlite3
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -99,55 +101,74 @@ def deploy_discovery(discovery_id: int, mode: str = "dry_run",
     if mode not in ("dry_run", "live", "shadow"):
         return {"error": f"Ungültiger Modus: {mode}"}
 
-    conn = get_connection()
-    row  = conn.execute(
+    # Phase 1: Read-only — eigene Verbindung, sofort schließen
+    rconn = get_connection()
+    row   = rconn.execute(
         "SELECT id, strategy, asset, market_regime, params_json, wr_test "
         "FROM lab_discoveries WHERE id=?",
         (discovery_id,),
     ).fetchone()
+    rconn.close()
 
     if not row:
-        conn.close()
         return {"error": f"Discovery #{discovery_id} nicht gefunden"}
 
     strategy_key  = f"{row['strategy']}_{discovery_id}"
     target_trades = calc_target_trades(row["wr_test"])
     now_iso       = datetime.now(timezone.utc).isoformat()
 
-    # Bestehende Deployments für dieses Asset ersetzen (CIO-Modus)
+    # Phase 2: Write mit Retry (60× 50ms = max 3s)
     replaced = 0
-    if replace_asset:
-        replaced = deactivate_asset_deployments(row["asset"], conn=conn)
+    for attempt in range(60):
+        try:
+            conn = get_connection()
+            try:
+                replaced = 0
+                if replace_asset:
+                    cur = conn.execute(
+                        "UPDATE active_deployments SET active=0 WHERE asset=? AND active=1",
+                        (row["asset"],),
+                    )
+                    replaced = cur.rowcount
 
-    existing = conn.execute(
-        "SELECT id, active FROM active_deployments WHERE discovery_id=?",
-        (discovery_id,),
-    ).fetchone()
+                existing = conn.execute(
+                    "SELECT id, active FROM active_deployments WHERE discovery_id=?",
+                    (discovery_id,),
+                ).fetchone()
 
-    if existing:
-        if existing["active"] and not replace_asset:
-            conn.close()
-            return {"error": f"Setup #{discovery_id} bereits als `{strategy_key}` aktiv",
-                    "strategy_key": strategy_key}
-        conn.execute(
-            "UPDATE active_deployments "
-            "SET active=1, mode=?, deployed_at=?, target_trades=?, go_live_notified=0 "
-            "WHERE discovery_id=?",
-            (mode, now_iso, target_trades, discovery_id),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO active_deployments "
-            "(discovery_id, strategy_key, base_strategy, asset, market_regime, "
-            " params_json, mode, deployed_at, active, target_trades, go_live_notified) "
-            "VALUES (?,?,?,?,?,?,?,?,1,?,0)",
-            (discovery_id, strategy_key, row["strategy"], row["asset"],
-             row["market_regime"], row["params_json"],
-             mode, now_iso, target_trades),
-        )
-
-    conn.commit()
-    conn.close()
+                if existing:
+                    if existing["active"] and not replace_asset:
+                        conn.close()
+                        return {"error": f"Setup #{discovery_id} bereits als `{strategy_key}` aktiv",
+                                "strategy_key": strategy_key}
+                    conn.execute(
+                        "UPDATE active_deployments "
+                        "SET active=1, mode=?, deployed_at=?, target_trades=?, go_live_notified=0 "
+                        "WHERE discovery_id=?",
+                        (mode, now_iso, target_trades, discovery_id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO active_deployments "
+                        "(discovery_id, strategy_key, base_strategy, asset, market_regime, "
+                        " params_json, mode, deployed_at, active, target_trades, go_live_notified) "
+                        "VALUES (?,?,?,?,?,?,?,?,1,?,0)",
+                        (discovery_id, strategy_key, row["strategy"], row["asset"],
+                         row["market_regime"], row["params_json"],
+                         mode, now_iso, target_trades),
+                    )
+                conn.commit()
+                conn.close()
+                break
+            except Exception:
+                try: conn.close()
+                except Exception: pass
+                raise
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 59:
+                time.sleep(0.05)
+                continue
+            return {"error": f"DB gesperrt: {e}"}
     return {
         "ok":            True,
         "strategy_key":  strategy_key,

@@ -20,10 +20,65 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.db import run_migrations
+from core.db import run_migrations, get_connection
 from core.utils import log
 
+
+def _step_processing_recovery():
+    """Bereinigt Signale die zu lange in 'processing' hängen (Stale-Threshold: 5 Minuten).
+    Unterscheidet order-sent vs. no-order für unterschiedliche reject_reason."""
+    conn = get_connection()
+    stale = conn.execute(
+        """SELECT id, order_id FROM signals WHERE status='processing'
+           AND created_at < datetime('now', '-5 minutes')"""
+    ).fetchall()
+    for row in stale:
+        sig_id, order_id = row[0], row[1]
+        reason = "stuck_processing_order_sent" if order_id else "stuck_processing_no_order"
+        conn.execute(
+            "UPDATE signals SET status='failed', reject_reason=? WHERE id=?",
+            (reason, sig_id),
+        )
+        if order_id:
+            log(f"[master_run] ⚠️ ACHTUNG Signal #{sig_id}: order_id={order_id} bereits gesendet — Position-Monitor muss prüfen")
+        else:
+            log(f"[master_run] Signal #{sig_id}: stuck processing → failed (kein Order)")
+    if stale:
+        log(f"[master_run] Processing-Recovery: {len(stale)} Signal(e) bereinigt")
+        conn.commit()
+    conn.close()
+
+
 # Lazy-Import der main()-Funktionen um Ladezeit zu minimieren
+def _step_cleanup():
+    """Bereinigt alte Daten — läuft einmal täglich via system_state['last_cleanup_date']."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = get_connection()
+    last = conn.execute(
+        "SELECT value FROM system_state WHERE key='last_cleanup_date'"
+    ).fetchone()
+    if last and last[0] == today:
+        conn.close()
+        return
+    log(f"[master_run] Cleanup für {today}")
+    conn.execute("DELETE FROM candles    WHERE ts < (strftime('%s','now') - 30*86400) * 1000")
+    conn.execute("DELETE FROM features   WHERE ts < (strftime('%s','now') - 30*86400) * 1000")
+    conn.execute("DELETE FROM heartbeats WHERE ts < datetime('now', '-7 days')")
+    conn.execute(
+        """DELETE FROM signals WHERE status IN ('rejected','expired','failed')
+           AND created_at < datetime('now', '-7 days')"""
+    )
+    conn.execute(
+        """INSERT INTO system_state(key, value, updated_at) VALUES('last_cleanup_date', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+        (today, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    log("[master_run] Cleanup abgeschlossen")
+
+
 def _step_intake():
     from scripts.run_intake import main; main()
 
@@ -44,13 +99,15 @@ def _step_monitor():
 
 
 PIPELINE = [
-    # (Name,         Funktion,          abort_on_fail)
-    ("intake",       _step_intake,       True),
+    # (Name,                  Funktion,                    abort_on_fail)
+    ("processing_recovery",   _step_processing_recovery,   False),
+    ("intake",                _step_intake,                True),
     ("features",     _step_features,     True),
     ("strategies",   _step_strategies,   False),
     ("governance",   _step_governance,   False),
     ("executor",     _step_execution,    False),
     ("monitor",      _step_monitor,      False),
+    ("cleanup",      _step_cleanup,      False),
 ]
 
 

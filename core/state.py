@@ -42,3 +42,13 @@ def set_daily_pnl(date: str, pnl_r: float, pnl_usd: float, trades: int):
 def get_strategy_mode(strategy: str, asset: str) -> str:
     from config.settings import STRATEGY_MODES
     return STRATEGY_MODES.get(strategy, {}).get(asset, "shadow")
+
+
+def get_live_balance() -> float:
+    """Liest die zuletzt bekannte Balance aus system_state['balance_usdt'].
+    Gibt 0.0 zurück wenn der Key fehlt — Governance behandelt das als fail-closed."""
+    raw = get_state("balance_usdt")
+    try:
+        return float(raw) if raw else 0.0
+    except (ValueError, TypeError):
+        return 0.0

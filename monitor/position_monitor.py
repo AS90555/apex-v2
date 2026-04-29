@@ -13,8 +13,8 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from core.db import get_connection
-from core.state import get_daily_pnl, set_daily_pnl
+from core.db import get_connection, set_state
+from core.state import get_daily_pnl, set_daily_pnl, get_hwm, set_hwm
 from core.utils import log, now_iso
 
 
@@ -105,10 +105,37 @@ def _update_open_positions_state(conn, open_assets: list[str]):
     )
 
 
+def _refresh_balance_and_hwm() -> float:
+    """Holt aktuelle Balance von Bitget, schreibt balance_usdt + aktualisiert HWM.
+    Gibt Balance zurück (0.0 bei Fehler — überschreibt dann NICHT den State)."""
+    try:
+        from execution.bitget_client import BitgetClient
+        client = BitgetClient(dry_run=False)
+        if not client.is_ready:
+            return 0.0
+        balance = client.get_balance()
+        if balance > 0:
+            set_state("balance_usdt", str(balance))
+            hwm = get_hwm()
+            if hwm <= 0:
+                set_hwm(balance)
+                log(f"[MONITOR] HWM initialisiert: {balance:.2f} USDT")
+            elif balance > hwm:
+                set_hwm(balance)
+                log(f"[MONITOR] HWM aktualisiert: {hwm:.2f} → {balance:.2f} USDT")
+        return balance
+    except Exception as e:
+        log(f"[MONITOR] Balance-Abruf fehlgeschlagen: {e}")
+        return 0.0
+
+
 def run_position_monitor() -> dict:
     """
     Hauptroutine. Gibt Stats-Dict zurück: {checked, exits, be_applied, open}.
     """
+    # Balance einmalig holen und in system_state schreiben (für Governance)
+    balance = _refresh_balance_and_hwm()
+
     conn = get_connection()
     open_trades = _load_open_trades(conn)
     log(f"[MONITOR] {len(open_trades)} offene Trade(s) in DB")
@@ -144,10 +171,15 @@ def run_position_monitor() -> dict:
 
         if pos is None:
             # Keine Position mehr auf Bitget → Exit
-            # Preis unbekannt → Eintrag ohne pnl (wird später reconciled)
             _mark_exit(conn, trade, exit_price=trade["entry_price"],
                        reason="position_closed_external", pnl_usd=0.0)
             stats["exits"] += 1
+            # HWM nach Exit aktualisieren (balance wurde oben gecacht)
+            if balance > 0:
+                hwm = get_hwm()
+                if balance > hwm:
+                    set_hwm(balance)
+                    log(f"[MONITOR] HWM nach Exit aktualisiert: {hwm:.2f} → {balance:.2f} USDT")
         else:
             # Position noch offen
             current_price = pos.entry_price  # beste verfügbare Approximation

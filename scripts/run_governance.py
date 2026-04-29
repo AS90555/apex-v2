@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime, timezone
 from core.db import get_connection, run_migrations
 from core.models import Signal
+from core.state import get_daily_pnl, set_daily_pnl
 from core.utils import log
 from governance.gate import GovernanceGate
 from governance.checks import (
@@ -84,6 +85,13 @@ def main():
     t0 = time.monotonic()
     log("[run_governance] Start")
 
+    # Daily-PnL-Reset — unabhängig von Trade-Exits, läuft jeden Zyklus
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = get_daily_pnl()
+    if daily.get("date") != today:
+        set_daily_pnl(today, 0.0, 0.0, 0)
+        log(f"[run_governance] Daily-PnL Reset für {today}")
+
     gate = GovernanceGate([
         SignalExpiryCheck(),
         DrawdownKillCheck(),
@@ -118,10 +126,10 @@ def main():
                 rejected_count += 1
         else:
             if signal.mode == "shadow":
-                # Shadow: approved loggen, aber Status bleibt pending damit Executor es ignoriert
-                _update_signal_status(conn, signal.id, "approved", None)
+                # Shadow: technisch getrennter Status — Executor lädt NUR 'approved'
+                _update_signal_status(conn, signal.id, "approved_shadow", None)
                 _write_governance_log(conn, signal.id, "approved_shadow", reason, checks)
-                log(f"[run_governance] Signal #{signal.id} {signal.strategy}/{signal.asset} → approved (shadow, kein Trade)")
+                log(f"[run_governance] Signal #{signal.id} {signal.strategy}/{signal.asset} → approved_shadow (Audit only, kein Trade)")
             else:
                 _update_signal_status(conn, signal.id, "approved", None)
                 _write_governance_log(conn, signal.id, "approved", reason, checks)

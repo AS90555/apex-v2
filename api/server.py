@@ -27,9 +27,16 @@ def _get_ro_conn():
     return conn
 
 
+STATE_WHITELIST = frozenset({
+    "regime", "daily_pnl", "open_positions",
+    "balance_usdt", "last_intake_ts", "last_cleanup_date",
+})
+
+
 def _auth():
     if not API_BEARER_TOKEN:
-        return  # kein Token konfiguriert → offen (nur lokal)
+        print("[API] ⚠️  Kein APEX_V2_API_TOKEN gesetzt — Zugriff verweigert (fail-closed)")
+        abort(401)
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer ") or auth[7:] != API_BEARER_TOKEN:
         abort(401)
@@ -165,6 +172,8 @@ def state():
     conn.close()
     result = {}
     for r in rows:
+        if r[0] not in STATE_WHITELIST:
+            continue
         try:
             result[r[0]] = {"value": json.loads(r[1]), "updated_at": r[2]}
         except Exception:
@@ -180,5 +189,6 @@ def method_not_allowed(e):
 
 
 if __name__ == "__main__":
-    print(f"[API] APEX V2 Read-only API startet auf Port {API_PORT}")
-    app.run(host="0.0.0.0", port=API_PORT, debug=False)
+    host = os.getenv("APEX_API_HOST", "127.0.0.1")
+    print(f"[API] APEX V2 Read-only API startet auf {host}:{API_PORT}")
+    app.run(host=host, port=API_PORT, debug=False)

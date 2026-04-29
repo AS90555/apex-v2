@@ -17,11 +17,11 @@ from typing import Tuple
 
 from core.db import get_connection
 from core.models import Signal
-from core.state import get_hwm, get_daily_pnl, get_regime
+from core.state import get_hwm, get_daily_pnl, get_regime, get_live_balance
 from core.utils import log
 from config.settings import (
     DRAWDOWN_KILL_PCT, MIN_BALANCE_USD,
-    DAILY_DD_KILL_R, CAPITAL,
+    DAILY_DD_KILL_R,
     SIGNAL_EXPIRY_MINUTES,
 )
 from governance.gate import BaseGovernanceCheck
@@ -43,20 +43,25 @@ class SignalExpiryCheck(BaseGovernanceCheck):
 
 
 class DrawdownKillCheck(BaseGovernanceCheck):
-    """HWM-50% Kill-Switch: Balance unter 50% des All-Time-High → Stop."""
+    """HWM-50% Kill-Switch: Live-Balance unter 50% des All-Time-High → Stop."""
 
     @property
     def name(self) -> str:
         return "drawdown_kill"
 
     def evaluate(self, signal: Signal) -> Tuple[bool, str]:
-        hwm = get_hwm()   # float, 0.0 wenn nicht gesetzt
+        if signal.mode == "shadow":
+            return True, "shadow_skip"
+        hwm = get_hwm()
         if hwm <= 0:
             return True, "hwm_not_set"
+        balance = get_live_balance()
+        if balance <= 0:
+            return True, "balance_unknown_skip_hwm_check"
         kill_level = hwm * (1.0 - DRAWDOWN_KILL_PCT)
-        if CAPITAL < kill_level:
-            return False, f"drawdown_kill: capital={CAPITAL:.2f} < hwm*{1-DRAWDOWN_KILL_PCT:.0%}={kill_level:.2f}"
-        return True, f"capital={CAPITAL:.2f} hwm={hwm:.2f}"
+        if balance < kill_level:
+            return False, f"drawdown_kill: balance={balance:.2f} < hwm*{1-DRAWDOWN_KILL_PCT:.0%}={kill_level:.2f}"
+        return True, f"balance={balance:.2f} hwm={hwm:.2f}"
 
 
 class DailyDrawdownCheck(BaseGovernanceCheck):
@@ -92,15 +97,19 @@ class RegimeCheck(BaseGovernanceCheck):
 
 
 class SizingSanityCheck(BaseGovernanceCheck):
-    """Balance > MIN_BALANCE, SL-Distanz plausibel (0.05% – 15%)."""
+    """Balance > MIN_BALANCE (live), SL-Distanz plausibel (0.05% – 15%)."""
 
     @property
     def name(self) -> str:
         return "sizing_sanity"
 
     def evaluate(self, signal: Signal) -> Tuple[bool, str]:
-        if CAPITAL < MIN_BALANCE_USD:
-            return False, f"balance_too_low: {CAPITAL:.2f} < {MIN_BALANCE_USD}"
+        if signal.mode != "shadow":
+            balance = get_live_balance()
+            if balance <= 0:
+                return False, "balance_unknown_no_trade"
+            if balance < MIN_BALANCE_USD:
+                return False, f"balance_too_low: {balance:.2f} < {MIN_BALANCE_USD}"
 
         if not signal.entry_price or not signal.stop_loss or signal.entry_price <= 0:
             return False, "missing_entry_or_sl"
@@ -111,11 +120,13 @@ class SizingSanityCheck(BaseGovernanceCheck):
         if sl_pct < 0.0005 or sl_pct > 0.15:
             return False, f"sl_pct_out_of_range: {sl_pct:.4%}"
 
-        return True, f"sl_pct={sl_pct:.3%}"
+        balance_str = f"balance={get_live_balance():.2f} " if signal.mode != "shadow" else ""
+        return True, f"{balance_str}sl_pct={sl_pct:.3%}"
 
 
 class PositionOpenCheck(BaseGovernanceCheck):
-    """Asset bereits in offener Position → kein neues Signal."""
+    """Asset bereits in offener Position → kein neues Signal.
+    Fallback auf DB-Query wenn Key fehlt oder älter als 10 Minuten."""
 
     @property
     def name(self) -> str:
@@ -124,13 +135,33 @@ class PositionOpenCheck(BaseGovernanceCheck):
     def evaluate(self, signal: Signal) -> Tuple[bool, str]:
         conn = get_connection()
         row = conn.execute(
-            "SELECT value FROM system_state WHERE key='open_positions'",
+            "SELECT value, updated_at FROM system_state WHERE key='open_positions'",
         ).fetchone()
-        conn.close()
 
+        use_fallback = False
         if not row:
-            return True, "no_open_positions_key"
+            use_fallback = True
+        else:
+            try:
+                updated_at = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - updated_at).total_seconds() / 60
+                if age_min > 10:
+                    use_fallback = True
+                    log(f"[PositionOpenCheck] open_positions veraltet ({age_min:.0f}min), nutze DB-Fallback")
+            except Exception:
+                use_fallback = True
 
+        if use_fallback:
+            rows = conn.execute(
+                "SELECT DISTINCT asset FROM trades WHERE exit_ts IS NULL AND mode != 'shadow'",
+            ).fetchall()
+            conn.close()
+            open_assets = [r[0] for r in rows]
+            if signal.asset in open_assets:
+                return False, f"position_already_open: {signal.asset} (db_fallback)"
+            return True, f"open_assets_db={open_assets}"
+
+        conn.close()
         open_positions = json.loads(row[0])
         if signal.asset in open_positions:
             return False, f"position_already_open: {signal.asset}"
