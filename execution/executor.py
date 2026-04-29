@@ -264,7 +264,7 @@ class Executor:
             is_buy=(signal.direction == "long"),
             size=size,
             stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit_2,
+            take_profit=signal.take_profit_1,
         )
 
         if not result.success:

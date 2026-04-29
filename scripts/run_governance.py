@@ -13,11 +13,16 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from core.db import get_connection, run_migrations
 from core.models import Signal
 from core.state import get_daily_pnl, set_daily_pnl
 from core.utils import log
+
+# Strategien ohne Regime-Abhängigkeit — laufen auch bei veraltetem Regime-Key durch.
+# Alle anderen Strategien werden blockiert wenn regime_<ASSET> älter als REGIME_MAX_AGE_MIN ist.
+REGIME_INSENSITIVE_STRATEGIES: frozenset[str] = frozenset()
+REGIME_MAX_AGE_MIN = 15  # 3 verpasste 5-Minuten-Zyklen
 from governance.gate import GovernanceGate
 from governance.checks import (
     SignalExpiryCheck,
@@ -70,6 +75,24 @@ def _update_signal_status(conn, signal_id: int, status: str, reason: str = None)
     )
 
 
+def _regime_age_minutes(conn, asset: str) -> float | None:
+    """Gibt das Alter des regime_<ASSET>-Keys in Minuten zurück, oder None wenn Key fehlt."""
+    row = conn.execute(
+        "SELECT updated_at FROM system_state WHERE key=?",
+        (f"regime_{asset}",),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - ts
+        return delta.total_seconds() / 60
+    except Exception:
+        return None
+
+
 def write_heartbeat(status: str, message: str, latency_ms: float):
     conn = get_connection()
     conn.execute(
@@ -111,6 +134,19 @@ def main():
     expired_count  = 0
 
     for signal in signals:
+        # Regime-Freshness-Guard — nur für regime-sensitive Strategien
+        if signal.strategy not in REGIME_INSENSITIVE_STRATEGIES:
+            age = _regime_age_minutes(conn, signal.asset)
+            if age is None or age > REGIME_MAX_AGE_MIN:
+                age_str = f"{age:.1f}min" if age is not None else "unbekannt (Key fehlt)"
+                log(f"[run_governance] WARN Regime {signal.asset} veraltet ({age_str}) "
+                    f"— Signal #{signal.id} {signal.strategy} blockiert")
+                _update_signal_status(conn, signal.id, "rejected", f"regime_stale: {age_str}")
+                _write_governance_log(conn, signal.id, "rejected",
+                                      f"regime_stale: {age_str}", {})
+                rejected_count += 1
+                continue
+
         # Shadow-Signale: Gate durchlaufen zum Logging, aber nie approved setzen
         passed, reason, checks = gate.evaluate(signal)
 

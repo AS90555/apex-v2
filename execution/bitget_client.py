@@ -365,6 +365,37 @@ class BitgetClient:
             log(f"[BITGET] set_leverage {coin}×{leverage} fehlgeschlagen: {e}")
             return False
 
+    def modify_sl(self, coin: str, new_sl: float, size: float, hold_side: str = "long") -> bool:
+        """
+        Verschiebt den Stop-Loss auf einen neuen Preis.
+        Strategie: bestehende loss_plan-Orders canceln, neue SL-Order platzieren.
+        Dry-Run → True ohne API-Call.
+        """
+        if self.dry_run:
+            return True
+        try:
+            # Nur loss_plan-Orders fetchen und canceln (TP bleibt unberührt)
+            data = self._get("/api/v2/mix/order/orders-plan-pending", {
+                "productType": PRODUCT_TYPE, "symbol": self._symbol(coin),
+                "planType": "loss_plan", "limit": "20",
+            }, auth=True)
+            orders = (data.get("entrustedList", []) if isinstance(data, dict)
+                      else (data if isinstance(data, list) else []))
+            if orders:
+                order_id_list = [{"orderId": o["orderId"], "clientOid": o.get("clientOid", "")}
+                                 for o in orders if o.get("orderId")]
+                if order_id_list:
+                    self._post("/api/v2/mix/order/cancel-plan-order", {
+                        "symbol": self._symbol(coin), "productType": PRODUCT_TYPE,
+                        "marginCoin": MARGIN_COIN, "orderIdList": order_id_list,
+                    })
+            # Neuen SL setzen
+            result = self.place_stop_loss(coin, new_sl, size, hold_side)
+            return result.success
+        except Exception as e:
+            log(f"[BITGET] modify_sl {coin} fehlgeschlagen: {e}")
+            return False
+
     def cancel_tpsl_orders(self, coin: str) -> bool:
         if self.dry_run:
             return True

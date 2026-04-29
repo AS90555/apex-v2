@@ -47,6 +47,224 @@ from telegram.constants import ParseMode
 from core.db import get_connection, DB_PATH
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+
+def _is_authorized(update) -> bool:
+    """Nur der konfigurierte Chat darf Commands ausführen."""
+    allowed = str(os.getenv("TELEGRAM_CHAT_ID", ""))
+    if not allowed:
+        return True  # Kein Filter wenn nicht konfiguriert
+    chat_id = str(update.effective_chat.id)
+    user_id = str(update.effective_user.id) if update.effective_user else ""
+    return chat_id == allowed or user_id == allowed
+
+
+def _escape_md(text: str) -> str:
+    for ch in r'_*[]()~`>#+-=|{}.!':
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
+# ── Portfolio-Manager DB helpers ──────────────────────────────────────────────
+
+def _pm_summary() -> dict:
+    conn = get_connection()
+    total  = conn.execute("SELECT COUNT(*) FROM lab_discoveries").fetchone()[0]
+    live   = conn.execute("SELECT COUNT(*) FROM lab_discoveries WHERE deployment_status='live'").fetchone()[0]
+    dry    = conn.execute("SELECT COUNT(*) FROM lab_discoveries WHERE deployment_status='dry'").fetchone()[0]
+    top    = conn.execute(
+        "SELECT id, strategy, asset, micro_score FROM lab_discoveries ORDER BY micro_score DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return {"total": total, "live": live, "dry": dry, "top": dict(top) if top else None}
+
+
+def _pm_list_by(field: str) -> list[dict]:
+    assert field in ("asset", "strategy", "regime")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT {field} AS key,
+               COUNT(*) AS n,
+               AVG(micro_score) AS avg_ms,
+               SUM(CASE WHEN deployment_status='live' THEN 1 ELSE 0 END) AS n_live,
+               SUM(CASE WHEN deployment_status='dry'  THEN 1 ELSE 0 END) AS n_dry
+            FROM lab_discoveries
+            GROUP BY {field}
+            ORDER BY avg_ms DESC"""
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _pm_top(n: int = 10) -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, strategy, asset, regime, micro_score, deployment_status
+           FROM lab_discoveries
+           ORDER BY micro_score DESC LIMIT ?""", (n,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _pm_active() -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT d.id, d.strategy, d.asset, d.regime, d.micro_score,
+                  d.deployment_status, a.mode, a.active
+           FROM lab_discoveries d
+           JOIN active_deployments a ON a.discovery_id = d.id
+           WHERE a.active = 1
+           ORDER BY d.asset, d.strategy"""
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _pm_detail(disc_id: int) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT id, strategy, asset, regime, micro_score,
+                  deployment_status, deployed_at, deployed_by,
+                  n_test, avg_r_test, wr_test, pf_test, max_dd_r
+           FROM lab_discoveries WHERE id=?""", (disc_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _pm_list_for(field: str, value: str) -> list[dict]:
+    assert field in ("asset", "strategy", "regime")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT id, strategy, asset, regime, micro_score, deployment_status
+            FROM lab_discoveries WHERE {field}=?
+            ORDER BY micro_score DESC LIMIT 20""", (value,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Portfolio-Manager Keyboards & Views ───────────────────────────────────────
+
+def _pm_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Nach Asset",      callback_data="pm_by_asset"),
+            InlineKeyboardButton("🧠 Nach Strategie",  callback_data="pm_by_strategy"),
+        ],
+        [
+            InlineKeyboardButton("🌍 Nach Regime",     callback_data="pm_by_regime"),
+            InlineKeyboardButton("🏆 Top-Gesamt",      callback_data="pm_top"),
+        ],
+        [InlineKeyboardButton("📈 Aktiv deployed",     callback_data="pm_active")],
+        [InlineKeyboardButton("◀️ Menü",               callback_data="back_menu")],
+    ])
+
+
+def _build_pm_main_text() -> str:
+    s = _pm_summary()
+    top = s["top"]
+    top_line = (f"\n🥇 Bester: `{_escape_md(top['strategy'])}/{_escape_md(top['asset'])}` "
+                f"\\(MS {top['micro_score']:.3f}\\)" if top else "")
+    return (
+        f"📊 *Portfolio Manager*\n\n"
+        f"Discoveries: {s['total']} \\| 🔴 Live: {s['live']} \\| ⚙️ Dry: {s['dry']}{top_line}\n\n"
+        f"Wähle eine Ansicht:"
+    )
+
+
+def _build_pm_group_list(field: str, rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    label = {"asset": "Asset", "strategy": "Strategie", "regime": "Regime"}[field]
+    cb_prefix = {"asset": "pm_asset_", "strategy": "pm_strat_", "regime": "pm_regime_"}[field]
+    lines = [f"📋 *Nach {_escape_md(label)}*\n"]
+    buttons = []
+    for r in rows:
+        key = r["key"] or "–"
+        status = ""
+        if r["n_live"]: status += f" 🔴{r['n_live']}"
+        if r["n_dry"]:  status += f" ⚙️{r['n_dry']}"
+        lines.append(f"`{_escape_md(key)}` — {r['n']} Setups, Ø MS {r['avg_ms']:.3f}{_escape_md(status)}")
+        buttons.append([InlineKeyboardButton(
+            f"{key} ({r['n']})", callback_data=f"{cb_prefix}{key}"
+        )])
+    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _build_pm_item_list(field: str, value: str, rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    lines = [f"🔍 *{_escape_md(field.capitalize())}: {_escape_md(value)}*\n"]
+    buttons = []
+    for r in rows:
+        icon = {"live": "🔴", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
+        lines.append(f"{icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        buttons.append([InlineKeyboardButton(
+            f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
+        )])
+    back_cb = {"asset": "pm_by_asset", "strategy": "pm_by_strategy", "regime": "pm_by_regime"}[field]
+    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data=back_cb)])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _build_pm_top_text(rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    lines = ["🏆 *Top\\-10 Discoveries*\n"]
+    buttons = []
+    for i, r in enumerate(rows, 1):
+        icon = {"live": "🔴", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
+        lines.append(f"{i}\\. {icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        buttons.append([InlineKeyboardButton(
+            f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _build_pm_active_text(rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    if not rows:
+        return "📈 *Aktiv deployed*\n\nKein aktives Deployment\\.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")]
+        ])
+    lines = ["📈 *Aktiv deployed*\n"]
+    buttons = []
+    for r in rows:
+        mode_icon = "🔴" if r["mode"] == "live" else "⚙️"
+        lines.append(f"{mode_icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        buttons.append([InlineKeyboardButton(
+            f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _build_pm_detail_text(r: dict) -> tuple[str, InlineKeyboardMarkup]:
+    status = r.get("deployment_status", "lab")
+    status_icon = {"live": "🔴 LIVE", "dry": "⚙️ DRY-RUN", "lab": "🔬 Lab"}.get(status, status)
+    deployed_line = ""
+    if r.get("deployed_at"):
+        deployed_line = f"\nDeployed: `{_escape_md(r['deployed_at'][:10])}`"
+    text = (
+        f"🔬 *Discovery \\#{r['id']}*\n\n"
+        f"Strategie: `{_escape_md(r['strategy'])}`\n"
+        f"Asset: `{_escape_md(r['asset'])}`\n"
+        f"Regime: `{_escape_md(str(r.get('regime') or '–'))}`\n"
+        f"Micro\\-Score: `{r['micro_score']:.4f}`\n"
+        f"Status: {_escape_md(status_icon)}{deployed_line}\n\n"
+        f"OOS\\-Metriken:\n"
+        f"  n={r.get('n_test','?')} \\| AvgR={r.get('avg_r_test',0):.3f} \\| "
+        f"WR={r.get('wr_test',0):.1%} \\| PF={r.get('pf_test',0):.2f} \\| "
+        f"MaxDD={r.get('max_dd_r',0):.2f}R"
+    )
+    disc_id = r["id"]
+    buttons = []
+    if status != "live":
+        buttons.append([InlineKeyboardButton("🔴 Live deployen",    callback_data=f"deploy_live_{disc_id}")])
+    if status != "dry":
+        buttons.append([InlineKeyboardButton("⚙️ Dry deployen",     callback_data=f"deploy_dry_{disc_id}")])
+    if status in ("live", "dry"):
+        buttons.append([InlineKeyboardButton("⏸ Pausieren",         callback_data=f"deploy_pause_{disc_id}")])
+    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
 logging.basicConfig(
     format="%(asctime)s [BOT] %(levelname)s %(message)s",
     level=logging.WARNING,
@@ -911,6 +1129,9 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     text = build_status_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
@@ -1028,6 +1249,9 @@ _HELP_TEXT = (
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     await update.message.reply_text(
         _HELP_TEXT,
         parse_mode=ParseMode.MARKDOWN,
@@ -1124,6 +1348,9 @@ def _build_alpha_text() -> str:
 
 
 async def cmd_lab_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     text = _build_lab_stats_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
@@ -1132,6 +1359,9 @@ async def cmd_lab_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_alpha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     text = _build_alpha_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
@@ -1143,14 +1373,15 @@ async def cmd_alpha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/portfolio — CIO-Modus: beste Setup-Empfehlung für aktuelle Marktlage."""
+    """/portfolio — Portfolio Manager: navigierbarer Lab-Discovery-Browser."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     import asyncio
-    portfolio = await asyncio.get_event_loop().run_in_executor(None, _cio_portfolio)
-    text = _build_portfolio_text(portfolio)
-    kb   = _portfolio_keyboard(portfolio)
+    text = await asyncio.get_event_loop().run_in_executor(None, _build_pm_main_text)
     await update.message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
+        text, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_pm_main_keyboard(),
     )
 
 
@@ -1229,6 +1460,9 @@ async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Aktiviert ein Lab-Discovery als parallele Dry-Run-Instanz.
     Berührt NICHT die laufende squeeze/canary-Konfiguration.
     """
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     args = ctx.args or []
     if not args or not args[0].isdigit():
         await update.message.reply_text(
@@ -1574,11 +1808,147 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "portfolio":
         import asyncio
-        portfolio = await asyncio.get_event_loop().run_in_executor(None, _cio_portfolio)
+        text = await asyncio.get_event_loop().run_in_executor(None, _build_pm_main_text)
         await query.edit_message_text(
-            _build_portfolio_text(portfolio),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_portfolio_keyboard(portfolio),
+            text, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_pm_main_keyboard(),
+        )
+
+    elif action == "pm_main":
+        import asyncio
+        text = await asyncio.get_event_loop().run_in_executor(None, _build_pm_main_text)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_pm_main_keyboard(),
+        )
+
+    elif action == "pm_by_asset":
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_by("asset"))
+        text, kb = _build_pm_group_list("asset", rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action == "pm_by_strategy":
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_by("strategy"))
+        text, kb = _build_pm_group_list("strategy", rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action == "pm_by_regime":
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_by("regime"))
+        text, kb = _build_pm_group_list("regime", rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action == "pm_top":
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, _pm_top)
+        text, kb = _build_pm_top_text(rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action == "pm_active":
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, _pm_active)
+        text, kb = _build_pm_active_text(rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action.startswith("pm_asset_"):
+        value = action[len("pm_asset_"):]
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_for("asset", value))
+        text, kb = _build_pm_item_list("asset", value, rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action.startswith("pm_strat_"):
+        value = action[len("pm_strat_"):]
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_for("strategy", value))
+        text, kb = _build_pm_item_list("strategy", value, rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action.startswith("pm_regime_"):
+        value = action[len("pm_regime_"):]
+        import asyncio
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_for("regime", value))
+        text, kb = _build_pm_item_list("regime", value, rows)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action.startswith("pm_detail_"):
+        disc_id = int(action[len("pm_detail_"):])
+        import asyncio
+        r = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_detail(disc_id))
+        if r is None:
+            await query.answer(text="Discovery nicht gefunden.", show_alert=True)
+        else:
+            text, kb = _build_pm_detail_text(r)
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+    elif action.startswith("deploy_live_"):
+        disc_id = int(action[len("deploy_live_"):])
+        r = _pm_detail(disc_id)
+        asset = _escape_md(r["asset"]) if r else "?"
+        await query.edit_message_text(
+            f"⚠️ *{asset} LIVE deployen?*\n\nSetup \\#{disc_id} handelt mit echtem Kapital\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Ja, LIVE", callback_data=f"deploy_live_confirm_{disc_id}")],
+                [InlineKeyboardButton("❌ Abbrechen", callback_data=f"pm_detail_{disc_id}")],
+            ]),
+        )
+
+    elif action.startswith("deploy_live_confirm_"):
+        disc_id = int(action[len("deploy_live_confirm_"):])
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _db_deploy(disc_id, mode="live", replace_asset=True)
+        )
+        if result.get("ok"):
+            msg = f"🔴 *LIVE aktiv*\n\nInstanz: `{_escape_md(result['strategy_key'])}`"
+        else:
+            msg = f"⚠️ {_escape_md(result.get('error', 'Deploy fehlgeschlagen'))}"
+        await query.edit_message_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
+                InlineKeyboardButton("◀️ Menü",      callback_data="back_menu"),
+            ]]),
+        )
+
+    elif action.startswith("deploy_dry_"):
+        disc_id = int(action[len("deploy_dry_"):])
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _db_deploy(disc_id, mode="dry_run", replace_asset=True)
+        )
+        if result.get("ok"):
+            msg = f"⚙️ *Dry\\-Run aktiv*\n\nInstanz: `{_escape_md(result['strategy_key'])}`"
+        else:
+            msg = f"⚠️ {_escape_md(result.get('error', 'Deploy fehlgeschlagen'))}"
+        await query.edit_message_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
+                InlineKeyboardButton("◀️ Menü",      callback_data="back_menu"),
+            ]]),
+        )
+
+    elif action.startswith("deploy_pause_"):
+        disc_id = int(action[len("deploy_pause_"):])
+        conn = get_connection()
+        conn.execute(
+            "UPDATE active_deployments SET active=0 WHERE discovery_id=?", (disc_id,)
+        )
+        conn.execute(
+            "UPDATE lab_discoveries SET deployment_status='lab' WHERE id=?", (disc_id,)
+        )
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(
+            f"⏸ *Deployment \\#{disc_id} pausiert*",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
+            ]]),
         )
 
     elif action.startswith("cio_dry:") or action.startswith("cio_live:"):

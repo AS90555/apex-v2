@@ -90,9 +90,40 @@ def _check_break_even(conn, trade: dict, current_price: float):
     pnl_r = pnl_usd / (sl_dist * trade["size"]) if trade["size"] > 0 else 0.0
 
     if pnl_r >= 1.0:
-        conn.execute("UPDATE trades SET be_applied=1 WHERE id=?", (trade["id"],))
-        log(f"[MONITOR] Break-Even: Trade #{trade['id']} {trade['asset']} "
-            f"pnl_r={pnl_r:.2f}R ≥ 1R → be_applied=1")
+        # 0.05% Puffer gegen Spike-Out beim BE-SL
+        if trade["direction"] == "long":
+            new_sl = trade["entry_price"] * 0.9995
+        else:
+            new_sl = trade["entry_price"] * 1.0005
+
+        # Shadow + Dry-Run: nur DB-Flag, kein API-Call (keine reale Position)
+        if trade["mode"] in ("shadow", "dry_run"):
+            conn.execute("UPDATE trades SET be_applied=1 WHERE id=?", (trade["id"],))
+            log(f"[MONITOR] Break-Even ({trade['mode']} simuliert): Trade #{trade['id']} {trade['asset']} "
+                f"pnl_r={pnl_r:.2f}R → be_applied=1 (kein API-Call)")
+            return
+
+        # Live: erst API-Call, dann DB-Flag bei Erfolg
+        try:
+            from execution.bitget_client import BitgetClient
+            hold_side = "long" if trade["direction"] == "long" else "short"
+            client = BitgetClient(dry_run=False)
+            ok = client.modify_sl(
+                coin=trade["asset"],
+                new_sl=round(new_sl, 6),
+                size=trade["size"],
+                hold_side=hold_side,
+            )
+            if ok:
+                conn.execute("UPDATE trades SET be_applied=1 WHERE id=?", (trade["id"],))
+                log(f"[MONITOR] Break-Even: Trade #{trade['id']} {trade['asset']} "
+                    f"pnl_r={pnl_r:.2f}R → SL auf {new_sl:.4f} verschoben, be_applied=1")
+            else:
+                log(f"[MONITOR] Break-Even API-Call fehlgeschlagen: Trade #{trade['id']} "
+                    f"{trade['asset']} — be_applied bleibt 0, nächster Zyklus versucht es erneut")
+        except Exception as e:
+            log(f"[MONITOR] Break-Even API-Call Fehler: Trade #{trade['id']} {trade['asset']}: {e} "
+                f"— be_applied bleibt 0")
 
 
 def _update_open_positions_state(conn, open_assets: list[str]):
@@ -161,10 +192,42 @@ def run_position_monitor() -> dict:
         asset = trade["asset"]
 
         if trade["mode"] == "shadow":
-            # Shadow-Trades: kein Exchange-Abgleich, gelten als offen
-            still_open_assets.append(asset)
-            stats["open"] += 1
-            log(f"[MONITOR] Trade #{trade['id']} {asset} shadow → als offen markiert")
+            # Aktuellen Marktpreis holen (kein Auth), SL/TP simulieren
+            current_price = 0.0
+            try:
+                from execution.bitget_client import BitgetClient
+                current_price = BitgetClient(dry_run=True).get_price(asset)
+            except Exception:
+                pass
+
+            if current_price > 0:
+                sl  = trade["stop_loss"]
+                tp1 = trade["take_profit_1"]
+                d   = trade["direction"]
+                if d == "long" and current_price <= sl:
+                    pnl = (sl - trade["entry_price"]) * trade["size"]
+                    _mark_exit(conn, trade, sl, "sl_hit_shadow", pnl)
+                    stats["exits"] += 1
+                elif d == "short" and current_price >= sl:
+                    pnl = (trade["entry_price"] - sl) * trade["size"]
+                    _mark_exit(conn, trade, sl, "sl_hit_shadow", pnl)
+                    stats["exits"] += 1
+                elif tp1 and d == "long" and current_price >= tp1:
+                    pnl = (tp1 - trade["entry_price"]) * trade["size"]
+                    _mark_exit(conn, trade, tp1, "tp1_hit_shadow", pnl)
+                    stats["exits"] += 1
+                elif tp1 and d == "short" and current_price <= tp1:
+                    pnl = (trade["entry_price"] - tp1) * trade["size"]
+                    _mark_exit(conn, trade, tp1, "tp1_hit_shadow", pnl)
+                    stats["exits"] += 1
+                else:
+                    still_open_assets.append(asset)
+                    stats["open"] += 1
+                    log(f"[MONITOR] Trade #{trade['id']} {asset} shadow @ {current_price:.4f} → offen")
+            else:
+                still_open_assets.append(asset)
+                stats["open"] += 1
+                log(f"[MONITOR] Trade #{trade['id']} {asset} shadow → kein Preis, als offen markiert")
             continue
 
         pos = live_positions.get(asset)
@@ -197,3 +260,15 @@ def run_position_monitor() -> dict:
     conn.commit()
     conn.close()
     return stats
+
+
+if __name__ == "__main__":
+    import time as _time
+    log("[MONITOR] Daemon-Modus gestartet (Intervall: 30s)")
+    while True:
+        try:
+            stats = run_position_monitor()
+            log(f"[MONITOR] Lauf abgeschlossen: {stats}")
+        except Exception as e:
+            log(f"[MONITOR] Fehler im Daemon-Loop: {e}")
+        _time.sleep(30)

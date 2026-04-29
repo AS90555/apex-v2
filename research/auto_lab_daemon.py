@@ -129,8 +129,9 @@ _REJECTION_CATEGORY = {
     "wr_test":       "wr_zu_niedrig",
     "avg_r_test":    "avg_r_zu_niedrig",
     "pf_train":      "train_pf_zu_niedrig",
-    "overfit_drop":  "ueberfit",
-    "ruin_filter":   "ruin_drawdown",
+    "overfit_drop":    "ueberfit",
+    "pf_overfit_drop": "ueberfit_pf",
+    "ruin_filter":     "ruin_drawdown",
 }
 
 def _rejection_category(reason: str) -> str:
@@ -361,9 +362,20 @@ def _ensure_schema():
         if col not in cols:
             conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {definition}")
             log(f"[LAB-DAEMON] DB migriert: Spalte {col} hinzugefügt")
-    # Index jetzt anlegen (Spalte garantiert vorhanden)
+    # Deployment-Tracking-Spalten nachrüsten
+    for col, definition in [
+        ("deployment_status", "TEXT NOT NULL DEFAULT 'lab'"),
+        ("deployed_at",       "TEXT"),
+        ("deployed_by",       "TEXT"),
+        ("deploy_notes",      "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {definition}")
+            log(f"[LAB-DAEMON] DB migriert: Spalte {col} hinzugefügt")
+    # Indizes anlegen (Spalten garantiert vorhanden)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_asset_regime ON lab_discoveries(asset, market_regime)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_micro_score ON lab_discoveries(micro_score DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_deployment ON lab_discoveries(deployment_status)")
     conn.commit()
     conn.close()
 
@@ -557,6 +569,9 @@ def _passes_window(tr: dict, te: dict, max_dd_r: float, wcfg: dict) -> tuple[boo
     drop = abs(tr["avg_r"] - te["avg_r"])
     if drop > MAX_TRAIN_TEST_DROP:
         return False, f"overfit_drop={drop:.3f}>{MAX_TRAIN_TEST_DROP}"
+    pf_drop_ratio = (tr["pf"] - te["pf"]) / max(tr["pf"], 0.01)
+    if pf_drop_ratio > 0.35:
+        return False, f"pf_overfit_drop={pf_drop_ratio:.2f}"
     if wcfg["ruin_filter"]:
         max_dd_usdt = max_dd_r * RISK_PER_TRADE
         ruin_limit  = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
@@ -575,13 +590,20 @@ def _passes(window_results: list[dict]) -> tuple[bool, str]:
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
+def _escape_md(text: str) -> str:
+    """Escaped Sonderzeichen für Telegram MarkdownV2."""
+    for ch in r'_*[]()~`>#+-=|{}.!':
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
 def _send_telegram(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2"},
             timeout=10,
         )
         return r.status_code == 200
@@ -596,13 +618,14 @@ _REGIME_ICON = {"TREND_UP": "📈", "TREND_DOWN": "📉", "SIDEWAYS": "↔️", 
 def _notify_highscore(strategy: str, asset: str, regime: str, params: dict,
                       tr: dict, te: dict, fitness: float, prev_pf: float,
                       disc_n: int, max_dd_r: float, micro_score: float,
-                      prev_micro: float):
+                      prev_micro: float, disc_id: int = 0):
     icon       = _REGIME_ICON.get(regime, "❓")
     dd_usdt    = max_dd_r * RISK_PER_TRADE
     ruin_limit = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
     param_lines = "\n".join(f"  `{k}` \\= `{v}`" for k, v in sorted(params.items()))
     msg = (
         f"🏆 *Neuer Micro\\-Score\\-Rekord\\!* \\(Discovery \\#{disc_n}\\)\n"
+        f"🆔 Deploy\\-ID: `{disc_id}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 `{strategy}/{asset}`  {icon} `{regime}`\n"
         f"🎯 Score: `{prev_micro:.2f}` → *`{micro_score:.2f}`*\n\n"
@@ -830,7 +853,7 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
             _update_highscore(conn, strategy, asset, regime, te3["pf"], fitness, disc_id)
             _notify_highscore(strategy, asset, regime, _round_params(params),
                               tr3, te3, fitness, prev_pf, disc_n,
-                              max_dd_r, micro_score, prev_micro)
+                              max_dd_r, micro_score, prev_micro, disc_id=disc_id)
 
         found += 1
 
@@ -854,12 +877,16 @@ def main():
         f"🤖 *Auto\\-Lab Daemon v2 gestartet*\n"
         f"Suchraum: `{len(SEARCH_SPACE)}` Kombinationen\n"
         f"Regime: EMA\\({REGIME_EMA_PERIOD}\\) Slope±{REGIME_SLOPE_PCT*100:.1f}%\n"
-        f"Filter: PF≥{MIN_PF_TEST} | AvgR≥{MIN_AVG_R_TEST} | n≥{MIN_TRADES_TEST}\n"
-        f"Ruin\\-Filter: MaxDD≤${STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT:.0f} \\(${RISK_PER_TRADE}/Trade\\)\n"
+        f"3\\-Fenster OOS: alle Fenster müssen bestehen\n"
+        f"Deploy\\-Filter: PF≥{MIN_PF_TEST}\n"
+        f"Ruin\\-Filter: MaxDD≤${STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT:.0f} "
+        f"\\(${RISK_PER_TRADE}/Trade\\)\n"
         f"Push: nur bei neuem Micro\\-Score\\-Rekord"
     )
 
     iteration = 0
+    _last_heartbeat = time.time()
+    _HEARTBEAT_INTERVAL = 6 * 3600  # 6 Stunden
 
     while True:
         iteration += 1
@@ -906,6 +933,17 @@ def main():
                 f"Neue Funde: {found_this_round} | "
                 f"Schlafe {SLEEP_BETWEEN}s"
             )
+
+            # 6h-Heartbeat
+            if time.time() - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+                c_hb = get_connection()
+                hb_disc = _count_discoveries(c_hb)
+                c_hb.close()
+                _send_telegram(
+                    f"✅ Lab alive \\| Iteration \\#{iteration} "
+                    f"\\| Discoveries: {hb_disc}"
+                )
+                _last_heartbeat = time.time()
 
         except Exception as e:
             log(f"[LAB-DAEMON] Kritischer Fehler in Iteration #{iteration}: {e}")
