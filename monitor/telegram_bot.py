@@ -45,7 +45,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from core.db import get_connection, DB_PATH
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RISK_USDT
 
 
 def _is_authorized(update) -> bool:
@@ -79,14 +79,15 @@ def _pm_summary() -> dict:
 
 
 def _pm_list_by(field: str) -> list[dict]:
-    assert field in ("asset", "strategy", "regime")
+    assert field in ("asset", "strategy", "market_regime")
     conn = get_connection()
     rows = conn.execute(
         f"""SELECT {field} AS key,
                COUNT(*) AS n,
                AVG(micro_score) AS avg_ms,
                SUM(CASE WHEN deployment_status='live' THEN 1 ELSE 0 END) AS n_live,
-               SUM(CASE WHEN deployment_status='dry'  THEN 1 ELSE 0 END) AS n_dry
+               SUM(CASE WHEN deployment_status='dry'  THEN 1 ELSE 0 END) AS n_dry,
+               MAX(n_test) AS best_n_test
             FROM lab_discoveries
             GROUP BY {field}
             ORDER BY avg_ms DESC"""
@@ -98,7 +99,7 @@ def _pm_list_by(field: str) -> list[dict]:
 def _pm_top(n: int = 10) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
-        """SELECT id, strategy, asset, regime, micro_score, deployment_status
+        """SELECT id, strategy, asset, market_regime, micro_score, deployment_status, n_test
            FROM lab_discoveries
            ORDER BY micro_score DESC LIMIT ?""", (n,)
     ).fetchall()
@@ -109,8 +110,8 @@ def _pm_top(n: int = 10) -> list[dict]:
 def _pm_active() -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
-        """SELECT d.id, d.strategy, d.asset, d.regime, d.micro_score,
-                  d.deployment_status, a.mode, a.active
+        """SELECT d.id, d.strategy, d.asset, d.market_regime, d.micro_score,
+                  d.deployment_status, d.n_test, a.mode, a.active
            FROM lab_discoveries d
            JOIN active_deployments a ON a.discovery_id = d.id
            WHERE a.active = 1
@@ -123,9 +124,10 @@ def _pm_active() -> list[dict]:
 def _pm_detail(disc_id: int) -> dict | None:
     conn = get_connection()
     row = conn.execute(
-        """SELECT id, strategy, asset, regime, micro_score,
+        """SELECT id, strategy, asset, market_regime, micro_score,
                   deployment_status, deployed_at, deployed_by,
-                  n_test, avg_r_test, wr_test, pf_test, max_dd_r
+                  n_test, avg_r_test, wr_test, pf_test, max_dd_r,
+                  n_train, pf_train, avg_r_train, params_json
            FROM lab_discoveries WHERE id=?""", (disc_id,)
     ).fetchone()
     conn.close()
@@ -133,15 +135,168 @@ def _pm_detail(disc_id: int) -> dict | None:
 
 
 def _pm_list_for(field: str, value: str) -> list[dict]:
-    assert field in ("asset", "strategy", "regime")
+    assert field in ("asset", "strategy", "market_regime")
     conn = get_connection()
     rows = conn.execute(
-        f"""SELECT id, strategy, asset, regime, micro_score, deployment_status
+        f"""SELECT id, strategy, asset, market_regime, micro_score, deployment_status, n_test
             FROM lab_discoveries WHERE {field}=?
             ORDER BY micro_score DESC LIMIT 20""", (value,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Portfolio-Manager Hilfsfunktionen ────────────────────────────────────────
+
+def _pm_freq_label(n_test: int) -> str:
+    """Menschlich lesbare Trade-Frequenz aus n_test (OOS-Fenster = 60 Tage).
+    Gibt unescapten Plain-Text zurück — Caller rufen _escape_md() drauf."""
+    if not n_test or n_test <= 0:
+        return "Frequenz unbekannt"
+    per_month = n_test / 2.0
+    if per_month > 60:
+        return f"täglich aktiv (~{per_month:.0f}×/Monat)"
+    if per_month > 8:
+        per_week = per_month / 4.33
+        return f"~{per_week:.1f}× pro Woche"
+    if per_month > 2:
+        return f"~{per_month:.0f}× pro Monat"
+    per_week = per_month / 4.33
+    if per_week >= 0.5:
+        return "~alle 2 Wochen"
+    weeks = 4.33 / per_month
+    return f"~alle {weeks:.0f} Wochen"
+
+
+def _pm_score_label(score: float) -> str:
+    """Qualitäts-Label für Composite-Score (Skala ~2–33, Median ~5.7, P90 ~13)."""
+    if score >= 22:
+        return "🌟 Exzellent \\(Top\\-3%\\)"
+    if score >= 13:
+        return "✅ Gut \\(Top\\-10%\\)"
+    if score >= 6:
+        return "⚠️ Brauchbar \\(Mittelfeld\\)"
+    return "🔻 Schwach"
+
+
+# ── Display-Helpers (reine Übersetzung, keine Logik) ─────────────────────────
+
+_REGIME_DE = {
+    "TREND_UP":   "Aufwärts-Trend",
+    "TREND_DOWN": "Abwärts-Trend",
+    "SIDEWAYS":   "Seitwärts",
+    "UNKNOWN":    "Unbekannt",
+}
+
+_REGIME_SHORT = {
+    "TREND_UP":   "↑ Aufwärts",
+    "TREND_DOWN": "↓ Abwärts",
+    "SIDEWAYS":   "↔ Seitwärts",
+    "UNKNOWN":    "?",
+}
+
+
+def _regime_label(regime: str) -> str:
+    return _REGIME_DE.get(regime, regime)
+
+
+def _regime_short(regime: str) -> str:
+    return _REGIME_SHORT.get(regime, regime)
+
+
+def _deployment_label(dep: dict) -> str:
+    """Lesbarer Name aus asset + regime — niemals strategy_key parsen."""
+    asset  = dep.get("asset", "?")
+    regime = _regime_label(dep.get("regime") or dep.get("market_regime") or "")
+    return f"{asset} · {regime}"
+
+
+_EXIT_REASON_DE = {
+    "sl":         "Stop-Loss",
+    "tp1":        "Ziel 1 erreicht",
+    "tp2":        "Ziel 2 erreicht",
+    "timeout":    "Zeit abgelaufen",
+    "invalid_sl": "Ungültiger Stop",
+}
+
+
+def _exit_label(reason: str) -> str:
+    return _EXIT_REASON_DE.get(reason, reason or "?")
+
+
+_COMPONENT_DE = {
+    "intake":     "Marktdaten",
+    "intake_ws":  "Marktdaten WS",
+    "features":   "Analyse",
+    "strategies": "Strategien",
+    "governance": "Steuerung",
+    "executor":   "Ausführung",
+    "monitor":    "Überwachung",
+}
+
+
+def _component_label(comp: str) -> str:
+    return _COMPONENT_DE.get(comp, comp)
+
+
+def _score_bar(score: float, max_score: float = 33.0, width: int = 8) -> str:
+    filled = round(min(score / max_score, 1.0) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _score_10(score: float, max_score: float = 33.0) -> str:
+    return f"{min(score / max_score * 10, 10.0):.1f}/10"
+
+
+def _r_to_usd(r: float) -> str:
+    usd = r * RISK_USDT
+    if usd >= 0:
+        return f"+${usd:.2f}"
+    return f"-${abs(usd):.2f}"
+
+
+def _mode_label(mode: str) -> str:
+    return "LIVE" if mode == "live" else "TEST-LAUF"
+
+
+# ── Ende Display-Helpers ──────────────────────────────────────────────────────
+
+
+def _pm_best_alternative(disc_id: int, strategy: str, asset: str,
+                          regime: str, current_score: float,
+                          current_pf: float = 0.0, current_wr: float = 0.0,
+                          current_avgr: float = 0.0, current_n: int = 0) -> dict | None:
+    """
+    Bestes alternatives Setup in derselben (strategy, asset, regime)-Gruppe.
+    Nutzt Hurdle-Filter: Kandidat muss in ALLEN praktischen Metriken mindestens
+    so gut sein wie das aktuelle Setup (Toleranz: PF/AvgR -5%, WR -3pp, n -20%).
+    Holt Top-5 und iteriert — verhindert LIMIT-1-Blindheit.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, micro_score, pf_test, avg_r_test, wr_test, n_test, max_dd_r, params_json
+           FROM lab_discoveries
+           WHERE strategy=? AND asset=? AND market_regime=?
+             AND id != ? AND micro_score > ?
+           ORDER BY micro_score DESC LIMIT 5""",
+        (strategy, asset, regime, disc_id, current_score),
+    ).fetchall()
+    conn.close()
+
+    # Hurdle-Schwellen (Toleranz gegen kleine Unterschiede)
+    min_pf   = current_pf   * 0.95 if current_pf   > 0 else 0.0
+    min_avgr = current_avgr * 0.95 if current_avgr > 0 else 0.0
+    min_wr   = current_wr   - 3.0  if current_wr   > 0 else 0.0
+    min_n    = int(current_n * 0.80) if current_n  > 0 else 0
+
+    for row in rows:
+        r = dict(row)
+        if (r.get("pf_test", 0)    >= min_pf   and
+                r.get("avg_r_test", 0) >= min_avgr and
+                r.get("wr_test", 0)    >= min_wr   and
+                r.get("n_test", 0)     >= min_n):
+            return r
+    return None
 
 
 # ── Portfolio-Manager Keyboards & Views ───────────────────────────────────────
@@ -164,26 +319,36 @@ def _pm_main_keyboard() -> InlineKeyboardMarkup:
 def _build_pm_main_text() -> str:
     s = _pm_summary()
     top = s["top"]
-    top_line = (f"\n🥇 Bester: `{_escape_md(top['strategy'])}/{_escape_md(top['asset'])}` "
-                f"\\(MS {top['micro_score']:.3f}\\)" if top else "")
+    if top:
+        top_strat = _escape_md(top["strategy"])
+        top_asset = _escape_md(top["asset"])
+        top_ms    = _escape_md(f"{top['micro_score']:.3f}")
+        top_line  = f"\n🥇 Bester: `{top_strat}/{top_asset}` \\(MS {top_ms}\\)"
+    else:
+        top_line = ""
     return (
         f"📊 *Portfolio Manager*\n\n"
-        f"Discoveries: {s['total']} \\| 🔴 Live: {s['live']} \\| ⚙️ Dry: {s['dry']}{top_line}\n\n"
+        f"Discoveries: {s['total']} \\| 💰 Live: {s['live']} \\| ⚙️ Dry: {s['dry']}{top_line}\n\n"
         f"Wähle eine Ansicht:"
     )
 
 
 def _build_pm_group_list(field: str, rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
-    label = {"asset": "Asset", "strategy": "Strategie", "regime": "Regime"}[field]
-    cb_prefix = {"asset": "pm_asset_", "strategy": "pm_strat_", "regime": "pm_regime_"}[field]
+    label = {"asset": "Asset", "strategy": "Strategie", "market_regime": "Regime"}[field]
+    cb_prefix = {"asset": "pm_asset_", "strategy": "pm_strat_", "market_regime": "pm_regime_"}[field]
     lines = [f"📋 *Nach {_escape_md(label)}*\n"]
     buttons = []
     for r in rows:
         key = r["key"] or "–"
         status = ""
-        if r["n_live"]: status += f" 🔴{r['n_live']}"
+        if r["n_live"]: status += f" 💰{r['n_live']}"
         if r["n_dry"]:  status += f" ⚙️{r['n_dry']}"
-        lines.append(f"`{_escape_md(key)}` — {r['n']} Setups, Ø MS {r['avg_ms']:.3f}{_escape_md(status)}")
+        avg_ms_str = _escape_md(f"{r['avg_ms']:.1f}")
+        freq = _escape_md(_pm_freq_label(r.get("best_n_test") or 0))
+        lines.append(
+            f"`{_escape_md(key)}` — {r['n']} Setups, Score {avg_ms_str}{_escape_md(status)}\n"
+            f"  🕐 Bestes Setup: {freq}"
+        )
         buttons.append([InlineKeyboardButton(
             f"{key} ({r['n']})", callback_data=f"{cb_prefix}{key}"
         )])
@@ -195,12 +360,17 @@ def _build_pm_item_list(field: str, value: str, rows: list[dict]) -> tuple[str, 
     lines = [f"🔍 *{_escape_md(field.capitalize())}: {_escape_md(value)}*\n"]
     buttons = []
     for r in rows:
-        icon = {"live": "🔴", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
-        lines.append(f"{icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        icon = {"live": "💰", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
+        ms_str = _escape_md(f"{r['micro_score']:.1f}")
+        freq   = _escape_md(_pm_freq_label(r.get("n_test") or 0))
+        lines.append(
+            f"{icon} \\#{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` "
+            f"Score {ms_str} \\| 🕐 {freq}"
+        )
         buttons.append([InlineKeyboardButton(
             f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
         )])
-    back_cb = {"asset": "pm_by_asset", "strategy": "pm_by_strategy", "regime": "pm_by_regime"}[field]
+    back_cb = {"asset": "pm_by_asset", "strategy": "pm_by_strategy", "market_regime": "pm_by_regime"}[field]
     buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data=back_cb)])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -209,8 +379,13 @@ def _build_pm_top_text(rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     lines = ["🏆 *Top\\-10 Discoveries*\n"]
     buttons = []
     for i, r in enumerate(rows, 1):
-        icon = {"live": "🔴", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
-        lines.append(f"{i}\\. {icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        icon = {"live": "💰", "dry": "⚙️"}.get(r["deployment_status"], "🔬")
+        ms_str = _escape_md(f"{r['micro_score']:.1f}")
+        freq   = _escape_md(_pm_freq_label(r.get("n_test") or 0))
+        lines.append(
+            f"{i}\\. {icon} \\#{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` "
+            f"Score {ms_str} \\| 🕐 {freq}"
+        )
         buttons.append([InlineKeyboardButton(
             f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
         )])
@@ -226,8 +401,13 @@ def _build_pm_active_text(rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     lines = ["📈 *Aktiv deployed*\n"]
     buttons = []
     for r in rows:
-        mode_icon = "🔴" if r["mode"] == "live" else "⚙️"
-        lines.append(f"{mode_icon} #{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` MS {r['micro_score']:.3f}")
+        mode_icon = "💰" if r["mode"] == "live" else "⚙️"
+        ms_str = _escape_md(f"{r['micro_score']:.1f}")
+        freq   = _escape_md(_pm_freq_label(r.get("n_test") or 0))
+        lines.append(
+            f"{mode_icon} \\#{r['id']} `{_escape_md(r['strategy'])}/{_escape_md(r['asset'])}` "
+            f"Score {ms_str} \\| 🕐 {freq}"
+        )
         buttons.append([InlineKeyboardButton(
             f"#{r['id']} {r['strategy']}/{r['asset']}", callback_data=f"pm_detail_{r['id']}"
         )])
@@ -235,33 +415,172 @@ def _build_pm_active_text(rows: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
+def _pm_metric_label(value, good_threshold, ok_threshold, higher_is_better=True) -> str:
+    """Gibt ✅ / ⚠️ / ❌ zurück je nach Schwellenwert."""
+    if value is None:
+        return "❓"
+    if higher_is_better:
+        if value >= good_threshold:
+            return "✅"
+        if value >= ok_threshold:
+            return "⚠️"
+        return "❌"
+    else:
+        if value <= good_threshold:
+            return "✅"
+        if value <= ok_threshold:
+            return "⚠️"
+        return "❌"
+
+
 def _build_pm_detail_text(r: dict) -> tuple[str, InlineKeyboardMarkup]:
-    status = r.get("deployment_status", "lab")
-    status_icon = {"live": "🔴 LIVE", "dry": "⚙️ DRY-RUN", "lab": "🔬 Lab"}.get(status, status)
+    import json as _json
+
+    status      = r.get("deployment_status", "lab")
+    status_icon = {"live": "💰 LIVE", "dry": "⚙️ DRY\\-RUN", "lab": "🔬 Lab"}.get(status, status)
+    disc_id     = r["id"]
+
+    # ── Rohwerte sicher lesen ────────────────────────────────────────────────
+    pf_test   = r.get("pf_test")   or 0.0
+    avg_r     = r.get("avg_r_test") or 0.0
+    wr        = r.get("wr_test")   or 0.0
+    n_test    = r.get("n_test")    or 0
+    max_dd    = r.get("max_dd_r")  or 0.0
+    micro     = r.get("micro_score") or 0.0
+    pf_train  = r.get("pf_train")  or 0.0
+    n_train   = r.get("n_train")   or 0
+
+    # ── Dollar-Beträge (basierend auf aktuellem RISK_USDT) ───────────────────
+    avg_r_usd = avg_r * RISK_USDT
+    dd_usd    = max_dd * RISK_USDT
+
+    # ── Parameter kompakt (max 4 Schlüssel anzeigen) ─────────────────────────
+    params_line = ""
+    try:
+        params = _json.loads(r.get("params_json") or "{}")
+        if params:
+            parts = [f"{k}={v}" for k, v in list(params.items())[:4]]
+            params_line = _escape_md(" | ".join(parts))
+    except Exception:
+        pass
+
+    # ── Bewertungs-Labels ────────────────────────────────────────────────────
+    lbl_pf  = _pm_metric_label(pf_test, 1.5,  1.2,  higher_is_better=True)
+    lbl_avgr= _pm_metric_label(avg_r,   0.10,  0.05, higher_is_better=True)
+    lbl_wr  = _pm_metric_label(wr,      50.0,  45.0, higher_is_better=True)
+    lbl_n   = _pm_metric_label(n_test,  30,    20,   higher_is_better=True)
+    lbl_dd  = _pm_metric_label(max_dd,  3.0,   6.0,  higher_is_better=False)
+
+    # ── Alle float-Werte vorab escapen (Python 3.12: kein \\ in f-strings) ──
+    ms_s      = _escape_md(f"{micro:.1f}")
+    score_lbl = _pm_score_label(micro)
+    pf_s      = _escape_md(f"{pf_test:.2f}")
+    pf_tr_s   = _escape_md(f"{pf_train:.2f}")
+    avgr_s    = _escape_md(f"{avg_r:+.2f}")
+    avgr_usd_s= _escape_md(f"{avg_r_usd:+.2f}")
+    wr_s      = _escape_md(f"{wr:.0f}")
+    dd_s      = _escape_md(f"{max_dd:.1f}")
+    dd_usd_s  = _escape_md(f"{dd_usd:.2f}")
+    risk_s    = _escape_md(f"{RISK_USDT:.2f}")
+
     deployed_line = ""
     if r.get("deployed_at"):
         deployed_line = f"\nDeployed: `{_escape_md(r['deployed_at'][:10])}`"
+
+    freq_s = _escape_md(_pm_freq_label(n_test))
+
     text = (
-        f"🔬 *Discovery \\#{r['id']}*\n\n"
-        f"Strategie: `{_escape_md(r['strategy'])}`\n"
-        f"Asset: `{_escape_md(r['asset'])}`\n"
-        f"Regime: `{_escape_md(str(r.get('regime') or '–'))}`\n"
-        f"Micro\\-Score: `{r['micro_score']:.4f}`\n"
-        f"Status: {_escape_md(status_icon)}{deployed_line}\n\n"
-        f"OOS\\-Metriken:\n"
-        f"  n={r.get('n_test','?')} \\| AvgR={r.get('avg_r_test',0):.3f} \\| "
-        f"WR={r.get('wr_test',0):.1%} \\| PF={r.get('pf_test',0):.2f} \\| "
-        f"MaxDD={r.get('max_dd_r',0):.2f}R"
+        f"*Setup \\#{disc_id}* — {status_icon}{deployed_line}\n"
+        f"`{_escape_md(r['strategy'])}` / `{_escape_md(r['asset'])}` / "
+        f"`{_escape_md(str(r.get('market_regime') or '–'))}`\n"
+        f"Gesamt\\-Score: *{ms_s}* — {score_lbl}\n"
+        f"\n"
+        f"*📊 Profit\\-Faktor: {pf_s}* {lbl_pf}\n"
+        f"Für jeden \\$ Verlust kommen {pf_s}\\$ zurück\n"
+        f"Ziel: \\>1\\.5 \\| Training: {pf_tr_s} \\({n_train} Trades\\)\n"
+        f"\n"
+        f"*📈 Ø Gewinn pro Trade: {avgr_s}R* {lbl_avgr}\n"
+        f"Entspricht ca\\. \\${avgr_usd_s} bei \\${risk_s} Risiko\n"
+        f"Ziel: \\>\\+0\\.10R\n"
+        f"\n"
+        f"*🎯 Trefferquote: {wr_s}%* {lbl_wr}\n"
+        f"{wr_s} von 100 Trades waren gewinnend\n"
+        f"Ziel: \\>50%\n"
+        f"\n"
+        f"*📉 Max\\. Einbruch: \\-{dd_s}R* {lbl_dd}\n"
+        f"Größter Rückgang: ca\\. \\-\\${dd_usd_s} bei \\${risk_s} Risiko\n"
+        f"Ziel: \\<3R\n"
+        f"\n"
+        f"*🔬 Getestet an: {n_test} Trades* {lbl_n}\n"
+        f"Ziel: \\≥30 für statistische Aussagekraft\n"
+        f"\n"
+        f"*🕐 Wann kommt der nächste Trade?*\n"
+        f"{freq_s}"
     )
-    disc_id = r["id"]
-    buttons = []
-    if status != "live":
-        buttons.append([InlineKeyboardButton("🔴 Live deployen",    callback_data=f"deploy_live_{disc_id}")])
-    if status != "dry":
-        buttons.append([InlineKeyboardButton("⚙️ Dry deployen",     callback_data=f"deploy_dry_{disc_id}")])
-    if status in ("live", "dry"):
-        buttons.append([InlineKeyboardButton("⏸ Pausieren",         callback_data=f"deploy_pause_{disc_id}")])
-    buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+    if params_line:
+        text += f"\n\n*Parameter:* `{params_line}`"
+
+    # ── Vergleich: gibt es ein besseres Setup in derselben Gruppe? ───────────
+    best_alt = _pm_best_alternative(
+        disc_id, r["strategy"], r.get("asset", ""),
+        r.get("market_regime", ""), micro,
+        current_pf=pf_test, current_wr=wr, current_avgr=avg_r, current_n=n_test,
+    )
+    if best_alt is not None:
+        try:
+            alt_ms_s   = _escape_md(f"{best_alt['micro_score']:.1f}")
+            alt_pf_s   = _escape_md(f"{best_alt.get('pf_test', 0):.2f}")
+            alt_avgr_s = _escape_md(f"{best_alt.get('avg_r_test', 0):+.2f}")
+            alt_wr_s   = _escape_md(f"{best_alt.get('wr_test', 0):.0f}")
+            alt_id     = best_alt["id"]
+            # Parameter-Diff: geänderte Keys anzeigen
+            diff_parts = []
+            try:
+                import json as _json2
+                cur_p = _json2.loads(r.get("params_json") or "{}")
+                alt_p = _json2.loads(best_alt.get("params_json") or "{}")
+                for k in cur_p:
+                    if k in alt_p and cur_p[k] != alt_p[k]:
+                        diff_parts.append(f"{k}: {cur_p[k]}→{alt_p[k]}")
+                diff_line = _escape_md(", ".join(diff_parts[:3])) if diff_parts else "andere Parameter"
+            except Exception:
+                diff_line = "andere Parameter"
+            text += (
+                f"\n\n*⚠️ Besseres Setup verfügbar:* \\#{alt_id}\n"
+                f"Score: {ms_s} → *{alt_ms_s}* ▲\n"
+                f"PF: {pf_s} → {alt_pf_s} \\| "
+                f"AvgR: {avgr_s} → {alt_avgr_s} \\| "
+                f"WR: {wr_s}% → {alt_wr_s}%\n"
+                f"Unterschied: _{diff_line}_"
+            )
+            buttons = []
+            if status != "live":
+                buttons.append([InlineKeyboardButton("💰 Als LIVE deployen", callback_data=f"deploy_live_{disc_id}")])
+            if status == "live":
+                buttons.append([InlineKeyboardButton("⬇️ Zu Dry-Run herabstufen", callback_data=f"deploy_dry_confirm_{disc_id}")])
+            elif status != "dry":
+                buttons.append([InlineKeyboardButton("⚙️ Als Dry-Run starten", callback_data=f"deploy_dry_confirm_{disc_id}")])
+            if status in ("live", "dry"):
+                buttons.append([InlineKeyboardButton("⏸ Pausieren", callback_data=f"deploy_pause_{disc_id}")])
+            buttons.append([InlineKeyboardButton(f"🔄 Setup #{alt_id} ansehen", callback_data=f"pm_detail_{alt_id}")])
+            buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+        except Exception:
+            # Fallback: Vergleichsblock überspringen, normale Buttons
+            best_alt = None
+
+    if best_alt is None:
+        text += f"\n\n*✅ Aktuell bestes Setup*\nKein besseres in `{_escape_md(r['strategy'])}/{_escape_md(r.get('asset',''))}/{_escape_md(str(r.get('market_regime') or ''))}`"
+        buttons = []
+        if status != "live":
+            buttons.append([InlineKeyboardButton("💰 Als LIVE deployen", callback_data=f"deploy_live_{disc_id}")])
+        if status == "live":
+            buttons.append([InlineKeyboardButton("⬇️ Zu Dry-Run herabstufen", callback_data=f"deploy_dry_confirm_{disc_id}")])
+        elif status != "dry":
+            buttons.append([InlineKeyboardButton("⚙️ Als Dry-Run starten", callback_data=f"deploy_dry_confirm_{disc_id}")])
+        if status in ("live", "dry"):
+            buttons.append([InlineKeyboardButton("⏸ Pausieren", callback_data=f"deploy_pause_{disc_id}")])
+        buttons.append([InlineKeyboardButton("◀️ Zurück", callback_data="pm_main")])
+
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -840,137 +1159,157 @@ def _r_bar(r: float, scale: float = 3.0, width: int = 10) -> str:
     return "░" * filled + "·" * (width - filled)
 
 
+def _db_market_weather_de() -> str:
+    """Markt-Wetter mit deutschen Regime-Labels."""
+    from core.db import get_state
+    parts = []
+    for asset in WEATHER_ASSETS:
+        regime = get_state(f"regime_{asset}", "UNKNOWN")
+        icon, _ = _REGIME_WEATHER.get(regime, ("⚪", "?"))
+        parts.append(f"`{asset}` {icon}{_regime_short(regime)}")
+    return "  ".join(parts)
+
+
 def build_dashboard_text() -> str:
-    d   = _db_pnl_summary()
-    can = _db_canary()
+    from datetime import datetime, timezone
+    d    = _db_pnl_summary()
+    can  = _db_canary()
+    now  = datetime.now(timezone.utc).strftime("%d. %b  %H:%M UTC")
 
-    lines = ["📊 *APEX V2 — Dashboard*\n"]
-    lines.append(f"🌤 *Markt\\-Wetter:*  {_db_market_weather()}\n")
-    lines.append(f"Trades gesamt: *{d['total_n']}*  |  Gesamt: *{_fmt_r(d['total_r'])}*")
-    lines.append(f"Ø Avg R: *{_fmt_r(d['avg_r'])}*  |  Heute: *{_fmt_r(d['today_r'])}*\n")
-
-    if d["rows"]:
-        lines.append("*Nach Strategie/Asset:*")
-        for r in d["rows"]:
-            wr = round(r["wins"] / r["n"] * 100) if r["n"] else 0
-            lines.append(
-                f"  `{r['strategy']}/{r['asset']}`  "
-                f"n={r['n']}  AvgR={_fmt_r(r['avg_r'] or 0)}  WR={wr}%"
-            )
-
-    lines.append("\n*🐦 Squeeze Canary \\(Dry-Run\\):*")
-    total_can   = 0
-    all_ready   = True
-    for asset, ref in LAB_REF.items():
-        target  = _canary_target(asset)
-        c       = can.get(asset)
-        n       = c["n"]     if c else 0
-        total_r = c["total_r"] if c else 0.0
-        avg     = c["avg_r"]   if c else 0.0
-        wins    = c["wins"]    if c else 0
-        total_can += n
-
-        filled  = min(int(n / target * 10), 10) if target else 0
-        prog    = "▓" * filled + "░" * (10 - filled)
-        pct     = min(int(n / target * 100), 100) if target else 0
-        disc    = _fmt_disc(avg, ref["avg_r"]) if n > 0 else ""
-
-        if n == 0:
-            all_ready = False
-            lines.append(f"  `{asset}` 0/{target} \\[{prog}\\] 0%")
-        elif n < target:
-            all_ready = False
-            wr = round(wins / n * 100) if n else 0
-            lines.append(
-                f"  `{asset}` {n}/{target} \\[{prog}\\] {pct}%  "
-                f"· {_fmt_r(total_r)}  AvgR={_fmt_r(avg)} {disc}  WR={wr}%"
-            )
-        else:
-            wr    = round(wins / n * 100) if n else 0
-            badge = "🟢" if total_r > 0 else "🔴"
-            lines.append(
-                f"  `{asset}` {n}/{target} \\[{prog}\\] {pct}%  {badge}\n"
-                f"  {_fmt_r(total_r)}  AvgR={_fmt_r(avg)} {disc}  WR={wr}%"
-            )
-
-    if all_ready and total_can > 0:
-        lines.append("\n🎯 *Alle Assets bereit — Go/No\\-Go Entscheidung fällig\\!*")
-    else:
-        remaining = sum(max(0, _canary_target(a) - (can.get(a, {}).get("n") or 0)) for a in LAB_REF)
-        lines.append(f"\n⏳ Noch ca\\. *{remaining}* Trades bis Go\\-Live\\-Entscheidung")
-
-    # ── Aktive Deployments — aufgeteilt in LIVE und DRY-RUN ──────────────────
+    # ── Overall-Status ────────────────────────────────────────────────────────
     deployments = _db_active_deployments()
-    _regime_icon = {"TREND_UP": "📈", "TREND_DOWN": "📉", "SIDEWAYS": "↔️"}
+    live_deps = [dep for dep in deployments if dep["mode"] == "live"]
+    dry_deps  = [dep for dep in deployments if dep["mode"] != "live"]
+    n_active  = len(deployments)
+    status_line = (
+        f"🟢 SYSTEM OK  ·  {n_active} Strategie{'n' if n_active != 1 else ''} aktiv"
+        if n_active else "⚪ Keine aktiven Strategien"
+    )
 
-    def _dep_block(dep: dict) -> str:
-        n       = dep["n"]
-        wins    = dep["wins"]
-        losses  = n - wins
-        total_r = dep["total_r"]
-        avg_r   = dep["avg_r"]
-        wr      = round(wins / n * 100) if n > 0 else 0
-        r_icon  = _regime_icon.get(dep["regime"], "❓")
-        open_s  = dep["open_signals"]
-        target  = dep["target_trades"]
-        filled  = min(int(n / target * 10), 10) if target else 0
-        prog    = "▓" * filled + "░" * (10 - filled)
-        pct     = min(int(n / target * 100), 100) if target else 0
-        badge   = ("  🟢 *BEREIT*" if total_r > 0 else "  🔴 *FAILED*") if n >= target else ""
+    lines = [
+        f"📊 *APEX V2  ·  {now}*",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        status_line,
+    ]
 
-        if n == 0:
-            perf = f"0/{target} \\[{prog}\\] 0%" + (f"  · {open_s} Signal offen" if open_s else "")
-        else:
-            win_usd  = round(wins  * 1.50, 2)
-            loss_usd = round(losses * 1.50, 2)
-            perf = (
-                f"{n}/{target} \\[{prog}\\] {pct}%{badge}\n"
-                f"  ✅ {wins} Gewinner \\(\\+${win_usd:.2f}\\)  ·  "
-                f"❌ {losses} Verlierer \\(\\-${loss_usd:.2f}\\)\n"
-                f"  {_fmt_r(total_r)}  AvgR={_fmt_r(avg_r)}  WR={wr}%"
-            )
-        return (
-            f"  `{dep['strategy_key']}` {r_icon}{dep['regime']}\n"
-            f"  {perf}"
-        )
+    # ── Performance ──────────────────────────────────────────────────────────
+    if d["total_n"] > 0:
+        today_usd = _r_to_usd(d["today_r"])
+        total_usd = _r_to_usd(d["total_r"])
+        avg_usd   = _r_to_usd(d["avg_r"])
+        avg_icon  = "✅" if d["avg_r"] >= 0.08 else ("⚠️" if d["avg_r"] >= 0 else "❌")
+        lines += [
+            "",
+            "*══ PERFORMANCE ══════════════════*",
+            f"Gesamt seit Start:  *{total_usd}*  ({_fmt_r(d['total_r'])})",
+            f"Heute:              *{today_usd}*  ({d['total_n']} Trades)",
+            f"Ø pro Trade:        *{avg_usd}*  {avg_icon}",
+        ]
 
-    live_deps = [d for d in deployments if d["mode"] == "live"]
-    dry_deps  = [d for d in deployments if d["mode"] != "live"]
+    # ── Aktive Strategien ─────────────────────────────────────────────────────
+    if deployments:
+        lines += ["", "*══ AKTIVE STRATEGIEN ════════════*"]
 
-    def _live_block(dep: dict) -> str:
-        n       = dep["n"]
-        wins    = dep["wins"]
-        losses  = n - wins
-        total_r = dep["total_r"]
-        avg_r   = dep["avg_r"]
-        wr      = round(wins / n * 100) if n > 0 else 0
-        r_icon  = _regime_icon.get(dep["regime"], "❓")
-        open_s  = dep["open_signals"]
-        if n == 0:
-            perf = f"Noch kein Trade{f'  · {open_s} Signal offen' if open_s else ''}"
-        else:
-            pnl_usd = round((wins - losses) * 1.50, 2)
-            pnl_sign = "\\+" if pnl_usd >= 0 else ""
-            perf = (
-                f"✅ {wins} Gewinner  ·  ❌ {losses} Verlierer\n"
-                f"  PnL: *{pnl_sign}${pnl_usd:.2f}*  ·  "
-                f"{_fmt_r(total_r)}  AvgR={_fmt_r(avg_r)}  WR={wr}%"
-            )
-        return (
-            f"  `{dep['strategy_key']}` {r_icon}{dep['regime']}\n"
-            f"  {perf}"
-        )
-
-    if live_deps:
-        lines.append("\n💵 *LIVE TRADING:*")
         for dep in live_deps:
-            lines.append(_live_block(dep))
-    if dry_deps:
-        lines.append("\n⚙️ *DRY\\-RUNS:*")
+            name    = _deployment_label(dep)
+            n       = dep["n"]
+            wins    = dep["wins"]
+            losses  = n - wins
+            total_r = dep["total_r"]
+            avg_r   = dep["avg_r"]
+            wr      = round(wins / n * 100) if n > 0 else 0
+            open_s  = dep["open_signals"]
+            pnl_usd = round((wins - losses) * RISK_USDT, 2)
+            pnl_sign = "\\+" if pnl_usd >= 0 else ""
+            pnl_icon = "🟢" if pnl_usd >= 0 else "🔴"
+            lines.append(f"\n💰 *LIVE — {name}*")
+            if n == 0:
+                sig_hint = f"  · {open_s} Signal offen" if open_s else ""
+                lines.append(f"  Noch kein Trade{sig_hint}")
+            else:
+                wr_icon = "✅" if wr >= 50 else "⚠️"
+                lines.append(
+                    f"  {n} Trades: {wins} Gewinner · {losses} Verlierer\n"
+                    f"  PnL: *{pnl_icon} {pnl_sign}${pnl_usd:.2f}*  ·  "
+                    f"Trefferquote: {wr}% {wr_icon}"
+                )
+
         for dep in dry_deps:
-            lines.append(_dep_block(dep))
-    if not deployments:
-        lines.append("\n_Keine aktiven Deployments — nutze `/deploy <ID>` aus dem Alpha\\-Dashboard\\._")
+            name   = _deployment_label(dep)
+            n      = dep["n"]
+            wins   = dep["wins"]
+            losses = n - wins
+            target = dep["target_trades"]
+            total_r= dep["total_r"]
+            avg_r  = dep["avg_r"]
+            wr     = round(wins / n * 100) if n > 0 else 0
+            open_s = dep["open_signals"]
+            filled = min(int(n / target * 10), 10) if target else 0
+            prog   = "▓" * filled + "░" * (10 - filled)
+            pct    = min(int(n / target * 100), 100) if target else 0
+            pnl_usd = round((wins - losses) * RISK_USDT, 2)
+            lines.append(f"\n⚙️ *TEST — {name}*")
+            if n == 0:
+                sig_hint = f"  · {open_s} Signal offen" if open_s else ""
+                lines.append(
+                    f"  Fortschritt: 0/{target} Trades  \\[{prog}\\] 0%\n"
+                    f"  ⏳ Wartet auf erstes Signal{sig_hint}"
+                )
+            elif n < target:
+                remaining = target - n
+                pnl_sign  = "\\+" if pnl_usd >= 0 else ""
+                lines.append(
+                    f"  Fortschritt: {n}/{target} Trades  \\[{prog}\\] {pct}%\n"
+                    f"  ⏳ Noch {remaining} Trades bis Freischaltung\n"
+                    f"  Bisher: {pnl_sign}${pnl_usd:.2f}  ·  {wr}% Trefferquote"
+                )
+            else:
+                badge = "🟢 *BEREIT*" if total_r > 0 else "🔴 *NICHT BESTANDEN*"
+                pnl_sign = "\\+" if pnl_usd >= 0 else ""
+                lines.append(
+                    f"  {n}/{target} Trades  \\[{prog}\\]  {badge}\n"
+                    f"  PnL: {pnl_sign}${pnl_usd:.2f}  ·  {wr}% Trefferquote"
+                )
+    else:
+        lines += [
+            "",
+            "_Keine aktiven Strategien — wähle ein Setup unter 🏆 Top Setups_",
+        ]
+
+    # ── Canary-Basis-Test (nur wenn noch keine Deployments laufen) ────────────
+    total_can = sum((can.get(a) or {}).get("n", 0) for a in LAB_REF)
+    if total_can > 0 and not deployments:
+        all_ready = True
+        lines += ["", "*══ BASIS-TEST (Canary) ═══════════*"]
+        for asset, ref in LAB_REF.items():
+            target  = _canary_target(asset)
+            c       = can.get(asset)
+            n       = c["n"]      if c else 0
+            total_r = c["total_r"] if c else 0.0
+            wins    = c["wins"]    if c else 0
+            avg     = c["avg_r"]   if c else 0.0
+            filled  = min(int(n / target * 10), 10) if target else 0
+            prog    = "▓" * filled + "░" * (10 - filled)
+            pct     = min(int(n / target * 100), 100) if target else 0
+            if n < target:
+                all_ready = False
+                wr = round(wins / n * 100) if n else 0
+                lines.append(
+                    f"  `{asset}` {n}/{target}  \\[{prog}\\] {pct}%"
+                    + (f"  · PnL {_r_to_usd(total_r)}  WR {wr}%" if n > 0 else "")
+                )
+            else:
+                wr    = round(wins / n * 100) if n else 0
+                badge = "🟢" if total_r > 0 else "🔴"
+                lines.append(f"  `{asset}` {n}/{target}  \\[{prog}\\]  {badge}  PnL {_r_to_usd(total_r)}  WR {wr}%")
+        if all_ready:
+            lines.append("\n🎯 *Alle Assets bereit — Go/No\\-Go Entscheidung fällig\\!*")
+        else:
+            remaining = sum(max(0, _canary_target(a) - (can.get(a, {}).get("n") or 0)) for a in LAB_REF)
+            lines.append(f"\n⏳ Noch ca\\. *{remaining}* Test-Trades bis zur Entscheidung")
+
+    # ── Markt heute ───────────────────────────────────────────────────────────
+    lines += ["", "*══ MARKT HEUTE ══════════════════*", _db_market_weather_de()]
 
     return "\n".join(lines)
 
@@ -978,17 +1317,20 @@ def build_dashboard_text() -> str:
 def build_signals_text() -> str:
     sigs = _db_open_signals()
     if not sigs:
-        return "📂 *Offene Signale*\n\nKeine pending/approved/processing Signale."
+        return "📂 *Offene Signale*\n\nKeine offenen Signale im Moment."
 
-    lines = [f"📂 *Offene Signale* ({len(sigs)})\n"]
+    _status_de = {"pending": "⏳ Wartet", "approved": "✅ Freigegeben", "processing": "⚙️ In Ausführung"}
+    _mode_de   = {"live": "Live", "dry_run": "Test-Lauf"}
+    lines = [f"📂 *Offene Signale*  ({len(sigs)} aktiv)\n"]
     for s in sigs:
-        dt  = s["created_at"][:16].replace("T", " ")
-        dir_icon = "📈" if s["direction"] == "long" else "📉"
-        status_icon = {"pending": "⏳", "approved": "✅", "processing": "⚙️"}.get(s["status"], "❓")
+        dt       = s["created_at"][:16].replace("T", " ")
+        dir_icon = "📈 Long" if s["direction"] == "long" else "📉 Short"
+        status   = _status_de.get(s["status"], s["status"])
+        mode     = _mode_de.get(s["mode"], s["mode"])
         lines.append(
-            f"{status_icon} `{s['strategy']}/{s['asset']}` {dir_icon} "
-            f"@ {s['entry_price']}  [{s['mode']}]\n"
-            f"   SL {s['stop_loss']} → TP {s['take_profit_1']}  `{dt}`"
+            f"{status}  ·  {s['asset']}  {dir_icon}  \\[{mode}\\]\n"
+            f"   Einstieg: `{s['entry_price']}`  Stop: `{s['stop_loss']}`  Ziel: `{s['take_profit_1']}`\n"
+            f"   {dt}"
         )
     return "\n".join(lines)
 
@@ -998,33 +1340,55 @@ def build_status_text() -> str:
     hw   = _server_health()
     now  = datetime.now(timezone.utc)
 
-    # ── Server-Ressourcen ─────────────────────────────────────────────────────
     def _res_icon(pct: float, warn: float = 70, crit: float = 90) -> str:
         return "🔴" if pct >= crit else ("⚠️" if pct >= warn else "✅")
 
-    lines = ["⚙️ *System Status*\n"]
-    lines.append("*Server-Ressourcen:*")
-    lines.append(
-        f"  {_res_icon(hw['cpu_pct'])} CPU: *{hw['cpu_pct']:.1f}%*"
-    )
-    lines.append(
-        f"  {_res_icon(hw['ram_pct'])} RAM: *{hw['ram_pct']:.1f}%*"
-        f"  ({hw['ram_used_gb']:.1f}/{hw['ram_total_gb']:.1f} GB)"
-    )
-    lines.append(
-        f"  {_res_icon(hw['disk_pct'], 80, 95)} Disk: *{hw['disk_pct']:.1f}%*"
-        f"  ({hw['disk_free_gb']:.1f} GB frei)"
-    )
-    lines.append(f"  🕐 Uptime: {hw['uptime_h']:.1f}h\n")
+    # ── Overall-Status vorab bestimmen ────────────────────────────────────────
+    overall_ok = True
+    hb_issues  = []
+    for hb in hbs:
+        comp    = hb["component"]
+        max_min = HEARTBEAT_MAX_AGE_MIN.get(comp, 30)
+        try:
+            ts  = datetime.fromisoformat(hb["ts"])
+            age = (now - ts).total_seconds() / 60
+        except Exception:
+            age = 999.0
+        if age > max_min:
+            overall_ok = False
+            hb_issues.append(_component_label(comp))
 
-    # ── Pipeline-Heartbeats ───────────────────────────────────────────────────
-    lines.append("*Pipeline-Heartbeats:*")
+    server_warn = (
+        hw["cpu_pct"] >= 90 or hw["ram_pct"] >= 90 or hw["disk_pct"] >= 95
+    )
+    if server_warn:
+        overall_ok = False
+
+    status_line = "🟢 Alles läuft normal" if overall_ok else f"⚠️ Prüfung nötig: {', '.join(hb_issues)}"
+    now_str     = now.strftime("%H:%M UTC")
+
+    lines = [
+        f"⚙️ *SYSTEM STATUS  ·  {now_str}*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        status_line,
+        "",
+        "*══ SERVER ════════════════════════*",
+        f"  {_res_icon(hw['cpu_pct'])} CPU:   *{hw['cpu_pct']:.0f}%*",
+        (f"  {_res_icon(hw['ram_pct'])} RAM:   *{hw['ram_pct']:.0f}%*"
+         f"  ({hw['ram_used_gb']:.1f} / {hw['ram_total_gb']:.1f} GB)"),
+        (f"  {_res_icon(hw['disk_pct'], 80, 95)} Disk:  *{hw['disk_pct']:.0f}%*"
+         f"  ({hw['disk_free_gb']:.0f} GB frei)"),
+        f"  🕐 Läuft seit: {hw['uptime_h']:.0f} Stunden",
+    ]
+
+    # ── Pipeline ─────────────────────────────────────────────────────────────
+    lines += ["", "*══ PIPELINE ══════════════════════*"]
     if not hbs:
-        lines.append("  ⚠️ Keine Heartbeats — läuft master\\_run.py?")
+        lines.append("  ⚠️ Keine Heartbeats empfangen — läuft master\\_run.py?")
     else:
-        all_ok = True
         for hb in hbs:
             comp    = hb["component"]
+            name    = _component_label(comp)
             max_min = HEARTBEAT_MAX_AGE_MIN.get(comp, 30)
             try:
                 ts  = datetime.fromisoformat(hb["ts"])
@@ -1036,31 +1400,33 @@ def build_status_text() -> str:
                 icon = "✅"
             elif age <= max_min * 2:
                 icon = "⚠️"
-                all_ok = False
             else:
                 icon = "🔴"
-                all_ok = False
 
             age_s = (now - ts).total_seconds() if age < 999 else 999 * 60
             if age_s < 60:
-                age_str = f"{int(age_s)}s"
+                age_str = f"vor {int(age_s)}s"
             elif age_s < 7200:
-                age_str = f"{int(age_s // 60)}m"
+                age_str = f"vor {int(age_s // 60)} Min"
             else:
-                age_str = f"{age_s / 3600:.1f}h"
-            lines.append(f"  {icon} `{comp:<12}` {age_str} alt")
+                age_str = f"vor {age_s / 3600:.1f}h"
+            limit_str = f"{max_min} Min"
+            lines.append(f"  {icon} {name:<14}  {age_str}  (OK bis {limit_str})")
 
-        lines.append("")
-        lines.append("  ✅ Pipeline OK" if all_ok else "  ⚠️ Mindestens eine Komponente auffällig")
-
-    # ── letzte 5 Trades ───────────────────────────────────────────────────────
+    # ── Letzte 5 Trades ───────────────────────────────────────────────────────
     recent = _db_last_trades(5)
     if recent:
-        lines.append("\n*Letzte Trades:*")
+        lines += ["", "*══ LETZTE TRADES ═════════════════*"]
         for t in recent:
-            r_str = _fmt_r(t["pnl_r"] or 0)
-            icon  = "🟢" if (t["pnl_r"] or 0) > 0 else "🔴"
-            lines.append(f"  {icon} `{t['strategy']}/{t['asset']}` {r_str}  [{t['exit_reason']}]")
+            pnl_r   = t["pnl_r"] or 0
+            pnl_usd = _r_to_usd(pnl_r)
+            icon    = "✅" if pnl_r > 0 else "❌"
+            reason  = _exit_label(t["exit_reason"] or "")
+            regime  = _regime_short(t.get("market_regime") or "")
+            lines.append(
+                f"  {icon} {t['asset']} {t['direction'].capitalize()}"
+                f"  *{pnl_usd}*  ·  {reason}"
+            )
 
     return "\n".join(lines)
 
@@ -1073,9 +1439,8 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
     """Dauerhaftes Tastenfeld — bleibt im Chat-Eingabebereich angedockt."""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 Dashboard"),            KeyboardButton("🏆 Alpha Setups")],
-            [KeyboardButton("💼 Portfolio Empfehlung"), KeyboardButton("🧪 Lab Stats")],
-            [KeyboardButton("⚙️ Status"),               KeyboardButton("🔌 API Test")],
+            [KeyboardButton("📊 Überblick"),    KeyboardButton("💰 Strategien")],
+            [KeyboardButton("🏆 Top Setups"),   KeyboardButton("⚙️ System")],
             [KeyboardButton("📖 Hilfe")],
         ],
         resize_keyboard=True,
@@ -1086,16 +1451,19 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Dashboard",      callback_data="dashboard"),
-            InlineKeyboardButton("📂 Offene Trades",  callback_data="signals"),
+            InlineKeyboardButton("📊 Überblick",       callback_data="dashboard"),
+            InlineKeyboardButton("📂 Offene Signale",  callback_data="signals"),
         ],
         [
-            InlineKeyboardButton("⚙️ System Status",  callback_data="status"),
-            InlineKeyboardButton("🔄 Aktualisieren",  callback_data="refresh_menu"),
+            InlineKeyboardButton("💰 Strategien",      callback_data="manage_strategies"),
+            InlineKeyboardButton("🔄 Aktualisieren",   callback_data="refresh_menu"),
         ],
         [
-            InlineKeyboardButton("🏆 Top Alpha Setups", callback_data="alpha"),
-            InlineKeyboardButton("📖 Hilfe",            callback_data="help"),
+            InlineKeyboardButton("🏆 Top Setups",      callback_data="alpha"),
+            InlineKeyboardButton("⚙️ System",          callback_data="status"),
+        ],
+        [
+            InlineKeyboardButton("📖 Hilfe",           callback_data="help"),
         ],
     ])
 
@@ -1311,40 +1679,56 @@ def _build_alpha_text() -> str:
     setups = _db_alpha_setups()
     if not setups:
         return (
-            "🏆 *Top Alpha Setups*\n\n"
-            "Noch keine kategorisierten Funde in der Alpha\\-Library\\.\n"
-            "Der Lab\\-Daemon muss mindestens eine Iteration abgeschlossen haben\\."
+            "🏆 *Beste Strategien*\n\n"
+            "Noch keine validierten Strategien in der Datenbank\\.\n"
+            "_Der Lab\\-Daemon muss mindestens eine Iteration abgeschlossen haben\\._"
         )
 
-    import json as _json
-    RISK_PER_TRADE = 1.50
-    lines = [f"🏆 *Top Alpha Setups* \\({len(setups)} Funde\\)\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = [f"🏆 *BESTE STRATEGIEN*  \\({len(setups)} gefunden\\)\n"]
 
     for i, s in enumerate(setups, 1):
-        icon       = _REGIME_ICON.get(s["market_regime"], "❓")
-        params     = _json.loads(s["params_json"])
-        max_dd_r   = s.get("max_dd_r") or 0.0
-        max_dd_usd = max_dd_r * RISK_PER_TRADE
+        medal      = medals[i - 1] if i <= 3 else f"#{i}"
+        regime_lbl = _regime_label(s["market_regime"])
+        regime_ico = _REGIME_ICON.get(s["market_regime"], "❓")
         score      = s.get("micro_score") or 0.0
-        p_str      = "  ".join(f"`{k}`\\={v}" for k, v in sorted(params.items()) if k not in ("CAPITAL","MAX_RISK_PCT"))
+        score_lbl  = _pm_score_label(score)
+        bar        = _score_bar(score)
+        score_norm = _score_10(score)
+        max_dd_usd = (s.get("max_dd_r") or 0.0) * RISK_USDT
+        avg_usd    = _r_to_usd(s["avg_r_test"])
+        wr_icon    = "✅" if s["wr_test"] >= 50 else "⚠️"
+        pf_icon    = "✅" if s["pf_test"] >= 1.5 else ("⚠️" if s["pf_test"] >= 1.2 else "❌")
 
         lines.append(
-            f"*#{i} — ID {s['id']} \\| `{s['strategy']}/{s['asset']}`*\n"
-            f"  {icon} {s['market_regime']}\n"
-            f"  📊 Trades: *{s['n_test']}*  ·  💰 PF: *{s['pf_test']:.2f}*\n"
-            f"  🎰 WR: *{s['wr_test']:.1f}%*  ·  📈 Avg R: *{s['avg_r_test']:+.3f}R*\n"
-            f"  📉 Max DD: *\\-${max_dd_usd:.2f}*  ·  🎯 Score: *{score:.1f}*\n"
-            f"  ⚙️ {p_str}\n"
-            f"  ▶️ `/deploy {s['id']}`"
+            f"{medal} *{s['asset']} · {regime_ico} {regime_lbl}*\n"
+            f"  Qualität: `{bar}`  *{score_norm}*  {score_lbl}\n"
+            f"  {s['n_test']} Test-Trades  ·  Trefferquote: *{s['wr_test']:.0f}%* {wr_icon}\n"
+            f"  Ø Gewinn/Trade: *{avg_usd}*  ·  PF: *{s['pf_test']:.2f}* {pf_icon}\n"
+            f"  Max\\. Rückgang: *\\-${max_dd_usd:.2f}*"
         )
         if i < len(setups):
             lines.append("─────────────────────")
 
-    lines.append(
-        "\n_Score \\= PF ÷ \\(MaxDD\\$/Kapital\\) — höher \\= besser\\._\n"
-        "_`/deploy <ID>` startet ein Setup als Dry\\-Run\\._"
-    )
     return "\n".join(lines)
+
+
+def _build_alpha_keyboard(setups: list) -> InlineKeyboardMarkup:
+    """Inline-Keyboard für Alpha-Screen: Deploy-Buttons pro Setup."""
+    rows = []
+    for s in setups:
+        disc_id = s["id"]
+        asset   = s["asset"]
+        rows.append([
+            InlineKeyboardButton(f"🚀 {asset} Live",      callback_data=f"deploy_live_{disc_id}"),
+            InlineKeyboardButton(f"⚙️ {asset} Test-Lauf", callback_data=f"deploy_dry_{disc_id}"),
+            InlineKeyboardButton("🔍 Details",             callback_data=f"pm_detail_{disc_id}"),
+        ])
+    rows.append([
+        InlineKeyboardButton("🔄 Aktualisieren", callback_data="alpha"),
+        InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_lab_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1362,13 +1746,11 @@ async def cmd_alpha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("⛔ Nicht autorisiert.")
         return
-    text = _build_alpha_text()
+    setups = _db_alpha_setups()
+    text   = _build_alpha_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Aktualisieren", callback_data="alpha"),
-            InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
-        ]]),
+        reply_markup=_build_alpha_keyboard(setups),
     )
 
 
@@ -1504,43 +1886,41 @@ async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_keyboard_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Verarbeitet Klicks auf das persistente ReplyKeyboard.
-
-    Sendet den Inhalt mit dem persistenten Keyboard als reply_markup —
-    so bleibt das Keyboard dauerhaft sichtbar, auch nach App-Neustarts.
-    """
+    """Verarbeitet Klicks auf das persistente ReplyKeyboard."""
     text = update.message.text
-    kb   = persistent_keyboard()   # Keyboard bei jedem Reply mitschicken → niemals verschwinden
 
-    if text == "📊 Dashboard":
+    if text == "📊 Überblick":
         await update.message.reply_text(
             build_dashboard_text(), parse_mode=ParseMode.MARKDOWN,
             reply_markup=_dashboard_keyboard(),
         )
-    elif text == "🏆 Alpha Setups":
+    elif text == "💰 Strategien":
+        await update.message.reply_text(
+            _build_manage_strategies_text(), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_manage_strategies_keyboard(),
+        )
+    elif text == "🏆 Top Setups":
+        setups = _db_alpha_setups()
         await update.message.reply_text(
             _build_alpha_text(), parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb,
+            reply_markup=_build_alpha_keyboard(setups),
         )
-    elif text == "⚙️ Status":
+    elif text == "⚙️ System":
         await update.message.reply_text(
             build_status_text(), parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren",    callback_data="status"),
+                InlineKeyboardButton("🔌 API testen",       callback_data="api_test"),
+                InlineKeyboardButton("◀️ Menü",             callback_data="back_menu"),
+            ]]),
         )
     elif text == "📖 Hilfe":
         await update.message.reply_text(
             _HELP_TEXT, parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Menü", callback_data="back_menu"),
+            ]]),
         )
-    elif text == "💼 Portfolio Empfehlung":
-        await cmd_portfolio(update, ctx)
-    elif text == "🧪 Lab Stats":
-        await update.message.reply_text(
-            _build_lab_stats_text(), parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_lab_stats_keyboard(),
-        )
-    elif text == "🔌 API Test":
-        await cmd_api_test(update, ctx)
 
 
 # ── Glossar-Erklärungen für Pop-up-Alerts ────────────────────────────────────
@@ -1696,18 +2076,36 @@ _GLOSSAR = {
 def _build_manage_strategies_text() -> str:
     deps = _db_active_deployments()
     if not deps:
-        return "⚙️ *Strategien verwalten*\n\n_Keine aktiven Deployments\\._"
-    lines = ["⚙️ *Strategien verwalten*\n"]
-    for dep in deps:
-        n      = dep["n"]
-        mode   = dep["mode"]
-        mode_i = "🔴" if mode == "live" else "🧪"
-        mode_label = mode.replace("_", "\\_")
-        lines.append(
-            f"{mode_i} `{dep['strategy_key']}`  \\[{mode_label}\\]\n"
-            f"   {dep['asset']}  {n}/{dep['target_trades']} Trades"
-        )
-    lines.append("\nModus wechseln oder stoppen:")
+        return "💰 *STRATEGIEN VERWALTEN*\n\n_Keine aktiven Strategien\\._\n\n_Wähle ein Setup unter 🏆 Top Setups\\._"
+    live_deps = [d for d in deps if d["mode"] == "live"]
+    dry_deps  = [d for d in deps if d["mode"] != "live"]
+    lines = ["💰 *STRATEGIEN VERWALTEN*\n"]
+    if live_deps:
+        lines.append("*💰 LIVE*")
+        for dep in live_deps:
+            name = _deployment_label(dep)
+            n    = dep["n"]
+            wins = dep["wins"]
+            wr   = round(wins / n * 100) if n > 0 else 0
+            pnl  = _r_to_usd(dep["total_r"])
+            wr_icon = "✅" if wr >= 50 else "⚠️"
+            lines.append(
+                f"  *{name}*\n"
+                f"  {n}/{dep['target_trades']} Trades  ·  {wr}% Trefferquote {wr_icon}  ·  PnL {pnl}"
+            )
+    if dry_deps:
+        lines.append("\n*⚙️ TEST-LÄUFE*")
+        for dep in dry_deps:
+            name   = _deployment_label(dep)
+            n      = dep["n"]
+            target = dep["target_trades"]
+            pct    = min(int(n / target * 100), 100) if target else 0
+            pnl    = _r_to_usd(dep["total_r"])
+            lines.append(
+                f"  *{name}*\n"
+                f"  {n}/{target} Trades  \\({pct}%\\)  ·  PnL {pnl}"
+            )
+    lines.append("\n_Modus wechseln oder stoppen:_")
     return "\n".join(lines)
 
 
@@ -1715,20 +2113,19 @@ def _manage_strategies_keyboard() -> InlineKeyboardMarkup:
     deps = _db_active_deployments()
     rows = []
     for dep in deps:
-        sk   = dep["strategy_key"]
-        mode = dep["mode"]
-        btn_live = InlineKeyboardButton("🔴 LIVE", callback_data=f"dep_mode:{sk}:live")
-        btn_dry  = InlineKeyboardButton("🧪 DRY",  callback_data=f"dep_mode:{sk}:dry_run")
-        btn_stop = InlineKeyboardButton("🗑️ Stop",  callback_data=f"dep_mode:{sk}:stop")
-        # Aktiver Modus nicht als Button anzeigen
+        sk    = dep["strategy_key"]
+        mode  = dep["mode"]
+        asset = dep["asset"]
+        btn_live = InlineKeyboardButton(f"💰 {asset} Live schalten", callback_data=f"dep_mode:{sk}:live")
+        btn_dry  = InlineKeyboardButton(f"⚙️ {asset} Test-Lauf",    callback_data=f"dep_mode:{sk}:dry_run")
+        btn_stop = InlineKeyboardButton(f"🛑 {asset} Stoppen",       callback_data=f"dep_mode:{sk}:stop")
         if mode == "live":
             rows.append([btn_dry, btn_stop])
         else:
             rows.append([btn_live, btn_stop])
-        rows[-1].insert(0, InlineKeyboardButton(f"📌 {dep['asset']}", callback_data="noop"))
     rows.append([
         InlineKeyboardButton("🔄 Aktualisieren", callback_data="manage_strategies"),
-        InlineKeyboardButton("◀️ Dashboard",     callback_data="dashboard"),
+        InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -1789,14 +2186,62 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]]),
         )
 
+    elif action == "api_test":
+        # Delegiert an cmd_api_test — braucht update-Objekt, daher Pseudo-Message-Wrapper
+        await query.answer()
+
+        def _run_test() -> dict:
+            from execution.bitget_client import BitgetClient
+            client = BitgetClient(dry_run=False)
+            if not client.is_ready:
+                return {"ok": False, "msg": "Keine API-Credentials in config/.env gefunden."}
+            try:
+                balance = client.get_balance()
+                from config.settings import LIVE_ASSETS
+                contract_info = {a: client.get_contract_info(a) for a in LIVE_ASSETS}
+                return {"ok": True, "balance": balance, "contracts": contract_info}
+            except Exception as e:
+                err = str(e)
+                if "40037" in err or "invalid api key" in err.lower():
+                    msg = "❌ Ungültiger API-Key — bitte in Bitget prüfen."
+                elif "40039" in err or "ip" in err.lower():
+                    msg = "❌ IP nicht auf der Whitelist."
+                elif "40034" in err or "permission" in err.lower():
+                    msg = "❌ Futures-Handel nicht freigeschaltet."
+                elif "429" in err:
+                    msg = "❌ Rate-Limit — bitte in 60s erneut versuchen."
+                else:
+                    msg = f"❌ API-Fehler: {err[:200]}"
+                return {"ok": False, "msg": msg}
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_test)
+        if not result["ok"]:
+            text_out = f"*API\\-Diagnose*\n\n{result['msg']}"
+        else:
+            bal = result["balance"]
+            contract_lines = "\n".join(
+                f"  `{a}USDT`: minSize={i.get('min_size','?')}"
+                for a, i in result.get("contracts", {}).items()
+            )
+            text_out = (
+                f"*API\\-Diagnose*\n\n"
+                f"✅ *Verbunden\\!* Futures\\-Balance: *{bal:.4f} USDT*\n\n"
+                f"*Kontrakt\\-Limits:*\n{contract_lines}"
+            )
+        await query.edit_message_text(
+            text_out, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Menü", callback_data="back_menu"),
+            ]]),
+        )
+
     elif action == "alpha":
+        setups = _db_alpha_setups()
         await query.edit_message_text(
             _build_alpha_text(),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Aktualisieren", callback_data="alpha"),
-                InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
-            ]]),
+            reply_markup=_build_alpha_keyboard(setups),
         )
 
     elif action == "lab_stats":
@@ -1836,8 +2281,8 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "pm_by_regime":
         import asyncio
-        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_by("regime"))
-        text, kb = _build_pm_group_list("regime", rows)
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_by("market_regime"))
+        text, kb = _build_pm_group_list("market_regime", rows)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
     elif action == "pm_top":
@@ -1869,8 +2314,8 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action.startswith("pm_regime_"):
         value = action[len("pm_regime_"):]
         import asyncio
-        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_for("regime", value))
-        text, kb = _build_pm_item_list("regime", value, rows)
+        rows = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_list_for("market_regime", value))
+        text, kb = _build_pm_item_list("market_regime", value, rows)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
     elif action.startswith("pm_detail_"):
@@ -1883,27 +2328,92 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text, kb = _build_pm_detail_text(r)
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
-    elif action.startswith("deploy_live_"):
-        disc_id = int(action[len("deploy_live_"):])
-        r = _pm_detail(disc_id)
-        asset = _escape_md(r["asset"]) if r else "?"
-        await query.edit_message_text(
-            f"⚠️ *{asset} LIVE deployen?*\n\nSetup \\#{disc_id} handelt mit echtem Kapital\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"✅ Ja, LIVE", callback_data=f"deploy_live_confirm_{disc_id}")],
-                [InlineKeyboardButton("❌ Abbrechen", callback_data=f"pm_detail_{disc_id}")],
-            ]),
-        )
-
     elif action.startswith("deploy_live_confirm_"):
         disc_id = int(action[len("deploy_live_confirm_"):])
         import asyncio
+        # Alten Score VOR dem Deploy lesen für Feedback-Nachricht
+        new_r = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_detail(disc_id))
         result = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _db_deploy(disc_id, mode="live", replace_asset=True)
         )
         if result.get("ok"):
-            msg = f"🔴 *LIVE aktiv*\n\nInstanz: `{_escape_md(result['strategy_key'])}`"
+            asset_s    = _escape_md(result["asset"])
+            strat_s    = _escape_md(result["strategy_key"])
+            new_ms_s   = _escape_md(f"{new_r['micro_score']:.1f}") if new_r else "?"
+            replaced_ids = result.get("replaced_ids", [])
+            if replaced_ids:
+                old_r    = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _pm_detail(replaced_ids[0])
+                )
+                old_ms_s = _escape_md(f"{old_r['micro_score']:.1f}") if old_r else "?"
+                old_id   = replaced_ids[0]
+                replace_line = (
+                    f"Setup \\#{old_id} deaktiviert \\(Score {old_ms_s}\\)\n"
+                    f"Setup \\#{disc_id} aktiv \\(Score {new_ms_s}\\) ▲"
+                )
+            else:
+                replace_line = f"Setup \\#{disc_id} \\(Score {new_ms_s}\\) ist jetzt live"
+            msg = (
+                f"💰 *{asset_s} — LIVE aktiv*\n\n"
+                f"`{strat_s}`\n\n"
+                f"{replace_line}"
+            )
+        else:
+            msg = f"⚠️ {_escape_md(result.get('error', 'Deploy fehlgeschlagen'))}"
+        await query.edit_message_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
+                InlineKeyboardButton("◀️ Menü",      callback_data="back_menu"),
+            ]]),
+        )
+
+    elif action.startswith("deploy_live_"):
+        disc_id = int(action[len("deploy_live_"):])
+        import asyncio
+        r = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_detail(disc_id))
+        asset   = _escape_md(r["asset"]) if r else "?"
+        ms_s    = _escape_md(f"{r['micro_score']:.1f}") if r else "?"
+        await query.edit_message_text(
+            f"⚠️ *{asset} als LIVE deployen?*\n\n"
+            f"Setup \\#{disc_id} \\(Score {ms_s}\\) handelt mit echtem Kapital\\.\n"
+            f"Ein bestehendes Setup für dieses Asset wird ersetzt\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ja, LIVE deployen", callback_data=f"deploy_live_confirm_{disc_id}")],
+                [InlineKeyboardButton("❌ Abbrechen",          callback_data=f"pm_detail_{disc_id}")],
+            ]),
+        )
+
+    elif action.startswith("deploy_dry_confirm_"):
+        disc_id = int(action[len("deploy_dry_confirm_"):])
+        import asyncio
+        new_r  = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_detail(disc_id))
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _db_deploy(disc_id, mode="dry_run", replace_asset=True)
+        )
+        if result.get("ok"):
+            asset_s      = _escape_md(result["asset"])
+            strat_s      = _escape_md(result["strategy_key"])
+            new_ms_s     = _escape_md(f"{new_r['micro_score']:.1f}") if new_r else "?"
+            replaced_ids = result.get("replaced_ids", [])
+            if replaced_ids:
+                old_r    = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _pm_detail(replaced_ids[0])
+                )
+                old_ms_s = _escape_md(f"{old_r['micro_score']:.1f}") if old_r else "?"
+                old_id   = replaced_ids[0]
+                replace_line = (
+                    f"Setup \\#{old_id} deaktiviert \\(Score {old_ms_s}\\)\n"
+                    f"Setup \\#{disc_id} aktiv \\(Score {new_ms_s}\\) ▲"
+                )
+            else:
+                replace_line = f"Setup \\#{disc_id} \\(Score {new_ms_s}\\) ist jetzt aktiv"
+            msg = (
+                f"⚙️ *{asset_s} — Dry\\-Run aktiv*\n\n"
+                f"`{strat_s}`\n\n"
+                f"{replace_line}"
+            )
         else:
             msg = f"⚠️ {_escape_md(result.get('error', 'Deploy fehlgeschlagen'))}"
         await query.edit_message_text(
@@ -1917,19 +2427,20 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action.startswith("deploy_dry_"):
         disc_id = int(action[len("deploy_dry_"):])
         import asyncio
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _db_deploy(disc_id, mode="dry_run", replace_asset=True)
-        )
-        if result.get("ok"):
-            msg = f"⚙️ *Dry\\-Run aktiv*\n\nInstanz: `{_escape_md(result['strategy_key'])}`"
-        else:
-            msg = f"⚠️ {_escape_md(result.get('error', 'Deploy fehlgeschlagen'))}"
+        r = await asyncio.get_event_loop().run_in_executor(None, lambda: _pm_detail(disc_id))
+        asset  = _escape_md(r["asset"]) if r else "?"
+        ms_s   = _escape_md(f"{r['micro_score']:.1f}") if r else "?"
+        status = r.get("deployment_status", "lab") if r else "lab"
+        label  = "⬇️ Zu Dry\\-Run herabstufen?" if status == "live" else "⚙️ Als Dry\\-Run deployen?"
         await query.edit_message_text(
-            msg, parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
-                InlineKeyboardButton("◀️ Menü",      callback_data="back_menu"),
-            ]]),
+            f"{label}\n\n"
+            f"Setup \\#{disc_id} \\(Score {ms_s}\\) für *{asset}*\\.\n"
+            f"Ein bestehendes Dry\\-Run\\-Setup für dieses Asset wird ersetzt\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ja, bestätigen", callback_data=f"deploy_dry_confirm_{disc_id}")],
+                [InlineKeyboardButton("❌ Abbrechen",       callback_data=f"pm_detail_{disc_id}")],
+            ]),
         )
 
     elif action.startswith("deploy_pause_"):
@@ -2152,20 +2663,28 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
     new = _db_new_executed_since(last_ts)
     if new:
         ctx.bot_data[since_key] = now_iso
+        # Tages-PnL für Kontext-Zeile
+        d_summary = _db_pnl_summary()
         for t in new:
-            r_val = t["pnl_r"] or 0
-            icon  = "🟢" if r_val > 0 else "🔴"
-            dir_i = "📈" if t["direction"] == "long" else "📉"
-            mode  = f"[{t['mode']}]" if t["mode"] != "live" else ""
-            msg   = (
-                f"{icon} *Trade geschlossen* {mode}\n"
-                f"`{t['strategy']}/{t['asset']}` {dir_i} "
-                f"@ {t['entry_price']} → {t['exit_price']}\n"
-                f"PnL: *{_fmt_r(r_val)}*  |  Exit: `{t['exit_reason']}`"
+            r_val     = t["pnl_r"] or 0
+            pnl_usd   = _r_to_usd(r_val)
+            icon      = "✅" if r_val > 0 else "❌"
+            dir_label = "Long" if t["direction"] == "long" else "Short"
+            mode_lbl  = _mode_label(t["mode"])
+            reason    = _exit_label(t["exit_reason"] or "")
+            msg = (
+                f"{icon} *Trade abgeschlossen*  ·  {mode_lbl}\n\n"
+                f"{t['asset']} {dir_label}\n"
+                f"Ergebnis: *{pnl_usd}*  \\({_fmt_r(r_val)}\\)  —  {reason}\n"
+                f"Einstieg: `{t['entry_price']}`  →  Ausstieg: `{t['exit_price']}`\n\n"
+                f"_Heute: {_r_to_usd(d_summary['today_r'])}  ·  {d_summary['total_n']} Trades gesamt_"
             )
             await ctx.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, text=msg,
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"),
+                ]]),
             )
 
 
@@ -2196,9 +2715,24 @@ async def push_heartbeat_alert(ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     ctx.bot_data[alerted_key] = now
-    msg = "🚨 *SYSTEM-ALARM* — Heartbeat-Ausfall\n\n" + "\n".join(dead)
+    dead_readable = [
+        f"`{_component_label(hb['component'])}` seit {int((now - datetime.fromisoformat(hb['ts'])).total_seconds() / 60)} Min"
+        for hb in hbs
+        if HEARTBEAT_MAX_AGE_MIN.get(hb["component"], 30) * 2 < (
+            (now - datetime.fromisoformat(hb["ts"])).total_seconds() / 60
+            if "T" in hb.get("ts", "") else 999
+        )
+    ] or [f"`{d}`" for d in dead]
+    msg = (
+        "🔴 *WARNUNG: Pipeline\\-Ausfall*\n\n"
+        + "\n".join(dead_readable)
+        + "\n\n_Andere Komponenten laufen normal\\._"
+    )
     await ctx.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚙️ Status prüfen", callback_data="status"),
+        ]]),
     )
 
 
@@ -2206,29 +2740,57 @@ async def push_daily_status(ctx: ContextTypes.DEFAULT_TYPE):
     """Täglicher Status-Report (wird vom job_queue um 08:00 UTC getriggert)."""
     d    = _db_pnl_summary()
     can  = _db_canary()
+    deps = _db_active_deployments()
     now  = datetime.now(timezone.utc)
 
-    lines = [f"📅 *Tagesstatus — {now.strftime('%Y-%m-%d')}*\n"]
-    lines.append(f"Trades: *{d['total_n']}*  |  Gesamt: *{_fmt_r(d['total_r'])}*")
-    lines.append(f"Heute: *{_fmt_r(d['today_r'])}*  |  Ø Avg R: *{_fmt_r(d['avg_r'])}*\n")
+    today_usd = _r_to_usd(d["today_r"])
+    total_usd = _r_to_usd(d["total_r"])
+    avg_usd   = _r_to_usd(d["avg_r"])
 
-    lines.append("*🐦 Squeeze Canary:*")
-    for asset, ref in LAB_REF.items():
-        target = _canary_target(asset)
-        c      = can.get(asset)
-        n      = c["n"]      if c else 0
-        avg    = c["avg_r"]  if c else 0.0
-        t_r    = c["total_r"] if c else 0.0
-        disc   = _fmt_disc(avg, ref["avg_r"]) if n > 0 else ""
-        pct    = min(int(n / target * 100), 100) if target else 0
-        badge  = ("🟢" if t_r > 0 else "🔴") if n >= target else "⏳"
-        lines.append(f"  {badge} `{asset}` {n}/{target} Trades \\({pct}%\\)  {_fmt_r(t_r)} {disc}")
+    lines = [
+        f"📅 *TAGESBERICHT  ·  {now.strftime('%d. %b %Y')}*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "*══ PERFORMANCE ══════════════════*",
+        f"Trades gesamt: *{d['total_n']}*",
+        f"Gesamt PnL:    *{total_usd}*  ({_fmt_r(d['total_r'])})",
+        f"Heute:         *{today_usd}*",
+        f"Ø pro Trade:   *{avg_usd}*",
+    ]
+
+    if deps:
+        lines += ["", "*══ AKTIVE STRATEGIEN ════════════*"]
+        for dep in deps:
+            name   = _deployment_label(dep)
+            n      = dep["n"]
+            target = dep["target_trades"]
+            t_r    = dep["total_r"]
+            wins   = dep["wins"]
+            pct    = min(int(n / target * 100), 100) if target else 0
+            badge  = ("🟢 Bereit" if t_r > 0 else "🔴 Verfehlt") if n >= target else f"⏳ {pct}%"
+            mode_i = "💰" if dep["mode"] == "live" else "⚙️"
+            lines.append(f"  {mode_i} {name}  {n}/{target}  {badge}  PnL {_r_to_usd(t_r)}")
+    else:
+        lines += ["", "*══ TEST-LÄUFE (Basis) ════════════*"]
+        for asset, ref in LAB_REF.items():
+            target = _canary_target(asset)
+            c      = can.get(asset)
+            n      = c["n"]      if c else 0
+            t_r    = c["total_r"] if c else 0.0
+            pct    = min(int(n / target * 100), 100) if target else 0
+            badge  = ("🟢" if t_r > 0 else "🔴") if n >= target else "⏳"
+            lines.append(f"  {badge} `{asset}`  {n}/{target}  ({pct}%)  PnL {_r_to_usd(t_r)}")
+
+    lines += ["", "*══ MARKT HEUTE ══════════════════*", _db_market_weather_de()]
 
     await ctx.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text="\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📊 Dashboard",  callback_data="dashboard"),
+            InlineKeyboardButton("🏆 Top Setups", callback_data="alpha"),
+        ]]),
     )
 
 
@@ -2242,28 +2804,40 @@ async def push_go_live_check(ctx: ContextTypes.DEFAULT_TYPE):
 
     async def _send_verdict(sk: str, asset: str, regime: str,
                             n: int, target: int, total_r: float,
-                            wins: int) -> None:
-        losses = n - wins
-        pf     = (wins / losses) if losses > 0 else 999.0
-        wr     = round(wins / n * 100, 1) if n > 0 else 0
+                            wins: int, disc_id: int = 0) -> None:
+        losses    = n - wins
+        pf        = (wins / losses) if losses > 0 else 999.0
+        wr        = round(wins / n * 100, 1) if n > 0 else 0
+        pnl_usd   = _r_to_usd(total_r)
+        name      = f"{asset} · {_regime_label(regime)}"
         if total_r > 0:
             msg = (
-                f"🟢 *Go\\-Live Freigabe\\!*\n\n"
-                f"Instanz `{sk}` hat den Forward\\-Test bestanden\\!\n\n"
-                f"*Asset:* `{asset}`  \\|  *Regime:* `{regime}`\n"
-                f"*Trades:* {n}/{target}  \\|  *Total R:* *{_fmt_r(total_r)}*\n"
-                f"*PF:* *{pf:.2f}*  \\|  *WR:* *{wr}%*\n\n"
-                f"✅ Bereit für Live\\-Modus\\!"
+                f"🟢 *TEST-LAUF BESTANDEN\\!*\n\n"
+                f"*{name}* ist bereit für Live-Trading\\.\n\n"
+                f"{n} Trades  ·  {wr}% Trefferquote\n"
+                f"PnL: *{pnl_usd}*  ·  PF: *{pf:.2f}*\n\n"
+                f"✅ Empfehlung: Auf Live schalten"
             )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💰 Jetzt Live schalten", callback_data=f"deploy_live_{disc_id}") if disc_id else
+                InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"),
+                InlineKeyboardButton("📊 Details", callback_data="dashboard"),
+            ]])
         else:
             msg = (
-                f"🔴 *Forward\\-Test nicht bestanden*\n\n"
-                f"`{sk}` — {target} Trades, aber kein positives R\\.\n\n"
-                f"*Total R:* *{_fmt_r(total_r)}*  \\|  *PF:* *{pf:.2f}*  \\|  *WR:* *{wr}%*\n\n"
-                f"Empfehlung: Deployment deaktivieren oder Regime abwarten\\."
+                f"🔴 *TEST-LAUF NICHT BESTANDEN*\n\n"
+                f"*{name}* hat den Forward\\-Test verfehlt\\.\n\n"
+                f"{n} Trades  ·  {wr}% Trefferquote\n"
+                f"PnL: *{pnl_usd}*  ·  PF: *{pf:.2f}*\n\n"
+                f"⚠️ Empfehlung: Deployment stoppen"
             )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛑 Deployment stoppen", callback_data=f"dep_mode:{sk}:stop"),
+                InlineKeyboardButton("📊 Dashboard",          callback_data="dashboard"),
+            ]])
         await ctx.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN,
+            chat_id=TELEGRAM_CHAT_ID, text=msg,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
         )
 
     # ── 1. Deployments prüfen ────────────────────────────────────────────────
@@ -2276,7 +2850,8 @@ async def push_go_live_check(ctx: ContextTypes.DEFAULT_TYPE):
         if n < target:
             continue
         await _send_verdict(dep["strategy_key"], dep["asset"], dep["regime"],
-                            n, target, total_r, dep["wins"])
+                            n, target, total_r, dep["wins"],
+                            disc_id=dep.get("discovery_id", 0))
         conn.execute(
             "UPDATE active_deployments SET go_live_notified=1 WHERE strategy_key=?",
             (dep["strategy_key"],),
