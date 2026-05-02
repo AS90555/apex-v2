@@ -84,19 +84,21 @@ def _find_gaps(timestamps: list[int], interval_ms: int) -> list[tuple[int, int]]
     return gaps
 
 
-def _fill_gap(client, conn, asset: str, interval: str, interval_ms: int,
+def _fill_gap(client, asset: str, interval: str, interval_ms: int,
               gap_start: int, gap_end: int, fetched_at: str) -> int:
-    """Füllt eine konkrete Lücke mit gezieltem start_time/end_time API-Call."""
+    """Füllt eine konkrete Lücke: API-Call OHNE offene Connection, dann kurze Write-Connection."""
     missing = max(1, int((gap_end - gap_start) / interval_ms) + 1)
     limit   = min(missing + 2, BITGET_MAX_LIMIT)
     log(f"[INTAKE] {asset}/{interval}: Lücke {gap_start}→{gap_end} ({missing} Kerzen) → fetch {limit}")
     try:
-        # Bitget start_time ist exklusiv → 1ms früher damit gap_start selbst inkludiert wird
         candles = client.get_candles(
             coin=asset, interval=interval, limit=limit,
             start_time=gap_start - 1, end_time=gap_end + interval_ms,
         )
-        return _store_candles(conn, asset, interval, candles, fetched_at)
+        conn = get_connection()
+        inserted = _store_candles(conn, asset, interval, candles, fetched_at)
+        conn.close()
+        return inserted
     except Exception as e:
         log(f"[INTAKE] FEHLER beim Gap-Füllen {asset}/{interval} {gap_start}→{gap_end}: {e}")
         return 0
@@ -106,13 +108,8 @@ def fetch_and_store(client, asset: str, interval: str) -> dict:
     """
     Holt fehlende Kerzen für (asset, interval) und speichert sie in SQLite.
 
-    Ablauf:
-      1. Alle vorhandenen Timestamps aus DB laden
-      2. Initialload wenn keine Daten vorhanden
-      3. Interior-Gaps finden und füllen
-      4. Trailing-Gap finden und füllen (aktuelle Kerzen nach MAX(ts))
-
-    Gibt Result-Dict zurück: {asset, interval, fetched, inserted, gaps_found, last_ts}
+    Connection-Strategie: Connection wird nur für DB-Operationen geöffnet,
+    vor jedem API-Call geschlossen → kein langer Schreiblock während HTTP-Wartezeit.
     """
     interval_ms = INTERVAL_MS.get(interval)
     if not interval_ms:
@@ -120,40 +117,45 @@ def fetch_and_store(client, asset: str, interval: str) -> dict:
 
     now_ms     = _now_ms()
     fetched_at = datetime.now(timezone.utc).isoformat()
-    conn       = get_connection()
-
-    timestamps = _get_all_timestamps(conn, asset, interval)
 
     total_fetched  = 0
     total_inserted = 0
     gaps_found     = 0
+
+    # ── Timestamps lesen (kurze Read-Connection) ──────────────────────────────
+    conn = get_connection()
+    timestamps = _get_all_timestamps(conn, asset, interval)
+    conn.close()
 
     # ── Initialload ───────────────────────────────────────────────────────────
     if not timestamps:
         log(f"[INTAKE] {asset}/{interval}: Kein Datensatz → Initialload {INITIAL_LIMIT} Kerzen")
         try:
             candles = client.get_candles(coin=asset, interval=interval, limit=INITIAL_LIMIT)
-            ins = _store_candles(conn, asset, interval, candles, fetched_at)
-            total_fetched  += len(candles)
-            total_inserted += ins
-            timestamps = _get_all_timestamps(conn, asset, interval)
         except Exception as e:
-            conn.close()
             log(f"[INTAKE] FEHLER Initialload {asset}/{interval}: {e}")
             return {"asset": asset, "interval": interval, "error": str(e)}
+        conn = get_connection()
+        ins = _store_candles(conn, asset, interval, candles, fetched_at)
+        timestamps = _get_all_timestamps(conn, asset, interval)
+        conn.close()
+        total_fetched  += len(candles)
+        total_inserted += ins
 
     # ── Interior-Gaps finden und füllen ───────────────────────────────────────
     gaps = _find_gaps(timestamps, interval_ms)
     for gap_start, gap_end in gaps:
         gaps_found += 1
-        ins = _fill_gap(client, conn, asset, interval, interval_ms,
-                        gap_start, gap_end, fetched_at)
+        ins = _fill_gap(client, asset, interval, interval_ms, gap_start, gap_end, fetched_at)
         total_inserted += ins
 
-    # ── Trailing-Gap (fehlende aktuelle Kerzen nach MAX(ts)) ──────────────────
-    timestamps = _get_all_timestamps(conn, asset, interval)  # nach Gap-Fixes refreshen
-    last_ts    = timestamps[-1] if timestamps else None
+    # ── Timestamps nach Gap-Fixes refreshen (kurze Read-Connection) ──────────
+    conn = get_connection()
+    timestamps = _get_all_timestamps(conn, asset, interval)
+    conn.close()
+    last_ts = timestamps[-1] if timestamps else None
 
+    # ── Trailing-Gap (fehlende aktuelle Kerzen nach MAX(ts)) ──────────────────
     if last_ts is not None:
         trailing_gap = int((now_ms - last_ts) / interval_ms)
         if trailing_gap > 1:
@@ -161,30 +163,50 @@ def fetch_and_store(client, asset: str, interval: str) -> dict:
             limit      = min(trailing_gap + 2, BITGET_MAX_LIMIT)
             log(f"[INTAKE] {asset}/{interval}: Trailing-Gap {trailing_gap} Kerzen → fetch {limit} ab {start_time}")
             try:
+                # API-Call OHNE offene DB-Connection
                 candles = client.get_candles(
                     coin=asset, interval=interval,
                     limit=limit, start_time=start_time,
                 )
+                # Dann kurze Write-Connection
+                conn = get_connection()
                 ins = _store_candles(conn, asset, interval, candles, fetched_at)
+                conn.close()
                 total_fetched  += len(candles)
                 total_inserted += ins
             except Exception as e:
                 log(f"[INTAKE] FEHLER Trailing-Gap {asset}/{interval}: {e}")
 
-    new_last_ts = _get_all_timestamps(conn, asset, interval)
-    new_last_ts = new_last_ts[-1] if new_last_ts else None
+    # ── Letzten Timestamp + letzten Close für Rückgabe lesen ─────────────────
+    conn = get_connection()
+    new_ts_list = _get_all_timestamps(conn, asset, interval)
+    last_row = conn.execute(
+        "SELECT ts, close FROM candles WHERE asset=? AND interval=? ORDER BY ts DESC LIMIT 1",
+        (asset, interval),
+    ).fetchone()
     conn.close()
+    new_last_ts  = new_ts_list[-1] if new_ts_list else None
+    last_close   = last_row[1] if last_row else None
+    last_close_ts = last_row[0] if last_row else None
+
+    # Warnung wenn letzter Candle älter als 3h (Feature-Berechnungen werden unzuverlässig)
+    if last_close_ts:
+        age_min = (_now_ms() - last_close_ts) / 60_000
+        if age_min > 180:
+            log(f"[INTAKE] ⚠️ {asset}/{interval}: letzter Candle {age_min:.0f} Min alt — Features unzuverlässig")
 
     if total_inserted > 0 or gaps_found > 0:
         log(f"[INTAKE] {asset}/{interval}: fetched={total_fetched} inserted={total_inserted} gaps={gaps_found}")
 
     return {
-        "asset":      asset,
-        "interval":   interval,
-        "fetched":    total_fetched,
-        "inserted":   total_inserted,
-        "gaps_found": gaps_found,
-        "last_ts":    new_last_ts,
+        "asset":       asset,
+        "interval":    interval,
+        "fetched":     total_fetched,
+        "inserted":    total_inserted,
+        "gaps_found":  gaps_found,
+        "last_ts":     new_last_ts,
+        "last_close":  last_close,       # Fallback-Preis für Feature-Agent
+        "last_close_age_min": round((_now_ms() - last_close_ts) / 60_000, 1) if last_close_ts else None,
     }
 
 

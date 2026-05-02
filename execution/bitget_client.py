@@ -49,6 +49,7 @@ class Position:
     unrealized_pnl: float
     leverage: float
     liquidation_price: float
+    mark_price: float = 0.0    # aktueller Mark-Preis für BE-Check
 
 
 class BitgetClient:
@@ -213,6 +214,7 @@ class BitgetClient:
                     unrealized_pnl=float(pos.get("unrealizedPL", 0)),
                     leverage=float(pos.get("leverage", 1)),
                     liquidation_price=float(pos.get("liquidationPrice") or 0),
+                    mark_price=float(pos.get("markPrice") or pos.get("openPriceAvg", 0)),
                 ))
             return positions
         except Exception as e:
@@ -395,6 +397,11 @@ class BitgetClient:
         except Exception as e:
             log(f"[BITGET] modify_sl {coin} fehlgeschlagen: {e}")
             return False
+
+    def place_partial_close(self, coin: str, size: float, hold_side: str = "long") -> OrderResult:
+        """Schließt einen Teil einer Position (reduce_only market order)."""
+        is_buy = (hold_side == "short")   # short schließen = buy; long schließen = sell
+        return self.place_market_order(coin, is_buy=is_buy, size=size, reduce_only=True)
 
     def cancel_tpsl_orders(self, coin: str) -> bool:
         if self.dry_run:

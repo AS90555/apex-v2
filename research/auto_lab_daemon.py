@@ -75,6 +75,7 @@ def log(msg: str):
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
 DAYS = 730  # Gesamtzeitraum für Backtest-Daten in Tagen
+COOLDOWN_BARS = 8  # Bars Pause nach jedem Exit (8h bei 1h-Strategien = eine Session)
 
 # ── Multi-Window OOS Validation ───────────────────────────────────────────────
 # Ersetzt den früheren 70/30-Single-Split.
@@ -193,6 +194,31 @@ RANGES = {
         "SL_ATR_MULT":  [0.5, 2.0, False],
         "TP_R":         [1.5, 4.0, False],
     },
+    "dual_donchian": {
+        "ENTRY_PERIOD": [15,  60, True],
+        "EXIT_PERIOD":  [5,   20, True],
+        "VOL_FACTOR":   [1.2, 3.0, False],
+        "ATR_MIN_MULT": [0.8, 2.0, False],
+        "SL_ATR_MULT":  [0.5, 1.5, False],
+        "TP_R":         [1.2, 3.0, False],
+    },
+    "bb_kc_squeeze": {
+        "BB_PERIOD":  [10,  30, True],
+        "BB_MULT":    [1.5, 3.0, False],
+        "KC_MULT":    [1.0, 2.5, False],
+        "SL_ATR_MULT":[0.5, 2.0, False],
+        "TP_R":       [1.5, 5.0, False],
+    },
+    "supertrend": {
+        "ST1_PERIOD": [7,   14, True],
+        "ST1_MULT":   [0.5, 2.0, False],
+        "ST2_PERIOD": [10,  20, True],
+        "ST2_MULT":   [1.5, 3.5, False],
+        "ST3_PERIOD": [12,  25, True],
+        "ST3_MULT":   [2.5, 5.0, False],
+        "SL_ATR_MULT":[0.5, 2.0, False],
+        "TP_R":       [1.5, 5.0, False],
+    },
 }
 
 GRIDS = {
@@ -243,6 +269,31 @@ GRIDS = {
         "MOTHER_ATR_MIN": [0.3, 0.5, 0.75, 1.0, 1.5],
         "SL_ATR_MULT":    [0.5, 0.75, 1.0, 1.5, 2.0],
         "TP_R":           [1.5, 2.0, 2.5, 3.0, 4.0],
+    },
+    "dual_donchian": {
+        "ENTRY_PERIOD": [15, 20, 30, 40, 50, 60],
+        "EXIT_PERIOD":  [5, 8, 10, 15, 20],
+        "VOL_FACTOR":   [1.2, 1.5, 2.0, 2.5, 3.0],
+        "ATR_MIN_MULT": [0.8, 1.0, 1.2, 1.5, 2.0],
+        "SL_ATR_MULT":  [0.5, 0.75, 1.0, 1.5],
+        "TP_R":         [1.2, 1.5, 2.0, 2.5, 3.0],
+    },
+    "bb_kc_squeeze": {
+        "BB_PERIOD":  [10, 15, 20, 25, 30],
+        "BB_MULT":    [1.5, 1.8, 2.0, 2.5, 3.0],
+        "KC_MULT":    [1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
+        "SL_ATR_MULT":[0.5, 0.75, 1.0, 1.5, 2.0],
+        "TP_R":       [1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+    },
+    "supertrend": {
+        "ST1_PERIOD": [7, 9, 10, 12, 14],
+        "ST1_MULT":   [0.5, 1.0, 1.5, 2.0],
+        "ST2_PERIOD": [10, 11, 13, 16, 20],
+        "ST2_MULT":   [1.5, 2.0, 2.5, 3.0, 3.5],
+        "ST3_PERIOD": [12, 14, 18, 21, 25],
+        "ST3_MULT":   [2.5, 3.0, 3.5, 4.0, 5.0],
+        "SL_ATR_MULT":[0.5, 0.75, 1.0, 1.5, 2.0],
+        "TP_R":       [1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
     },
 }
 
@@ -296,7 +347,52 @@ SEARCH_SPACE = [
     ("inside_bar_breakout", "ADA"),
     ("inside_bar_breakout", "LINK"),
     ("inside_bar_breakout", "AVAX"),
+    ("dual_donchian",       "BTC"),
+    ("dual_donchian",       "ETH"),
+    ("dual_donchian",       "SOL"),
+    ("dual_donchian",       "XRP"),
+    ("dual_donchian",       "ADA"),
+    ("dual_donchian",       "LINK"),
+    ("dual_donchian",       "AVAX"),
+    ("bb_kc_squeeze",       "BTC"),
+    ("bb_kc_squeeze",       "ETH"),
+    ("bb_kc_squeeze",       "SOL"),
+    ("bb_kc_squeeze",       "XRP"),
+    ("bb_kc_squeeze",       "ADA"),
+    ("bb_kc_squeeze",       "LINK"),
+    ("bb_kc_squeeze",       "AVAX"),
+    ("supertrend",          "BTC"),
+    ("supertrend",          "ETH"),
+    ("supertrend",          "SOL"),
+    ("supertrend",          "XRP"),
+    ("supertrend",          "ADA"),
+    ("supertrend",          "LINK"),
+    ("supertrend",          "AVAX"),
 ]
+
+def _load_requested_targets() -> list[tuple[str, str]]:
+    """
+    Liest asset_requests mit status='pending' aus der DB und erzeugt
+    (strategy, asset)-Tupel für alle bekannten Strategien.
+    Gibt leere Liste zurück wenn keine Anfragen vorhanden oder DB-Fehler.
+    """
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT asset FROM asset_requests WHERE status='pending'"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    strategies = list(RANGES.keys())
+    result = []
+    for row in rows:
+        asset = row["asset"]
+        for strategy in strategies:
+            result.append((strategy, asset))
+    return result
+
 
 # Assets ohne bisherige qualifizierte Discovery — werden bevorzugt behandelt
 _PRIORITY_ASSETS = {"XRP", "ADA", "LINK", "AVAX"}
@@ -541,17 +637,26 @@ def _fitness(window_results: list[dict]) -> float:
     return round(total / TOTAL_WEIGHT, 4)
 
 
-def _calc_micro_score(pf: float, max_dd_r: float) -> float:
+def _calc_micro_score(pf: float, avg_r: float, wr: float, n: int, max_dd_r: float) -> float:
     """
-    Micro_Score = PF / (Max_Drawdown_USDT / STARTING_CAPITAL)
-    Belohnt hohen Profit Factor bei minimalem Kontoeinbruch.
-    Wenn max_dd_r = 0 (perfekte Strategie): Score = PF * 100 als Obergrenze.
+    6-dimensionaler Composite-Score (institutioneller Standard):
+      √PF × AvgR × (WR/50) × ln(n) × DD-Penalty × Calmar-Factor
+
+    Calmar-Factor = min(avg_r / max_dd_r / 0.05, 2.0)
+      → Normiert auf 0.05 als neutralen Calmar (AvgR = 5% des MaxDD)
+      → Cap bei 2.0× um Explosion bei sehr kleinem MaxDD zu verhindern
+    Skala: ~0–35 für realistische Setups.
     """
-    max_dd_usdt = max_dd_r * RISK_PER_TRADE
-    dd_ratio    = max_dd_usdt / STARTING_CAPITAL
-    if dd_ratio <= 0:
-        return round(pf * 100.0, 4)   # kein Drawdown → maximaler Bonus
-    return round(pf / dd_ratio, 4)
+    if n < 20 or pf <= 0 or avg_r <= 0 or max_dd_r <= 0:
+        return 0.0
+    dd_penalty    = 1.0 / (1.0 + max_dd_r / 3.0)
+    calmar        = avg_r / max_dd_r
+    calmar_factor = min(calmar / 0.05, 2.0)
+    return round(
+        math.sqrt(pf) * avg_r * (wr / 50.0) * math.log(max(n, 2))
+        * dd_penalty * calmar_factor * 10,
+        2,
+    )
 
 
 def _passes_window(tr: dict, te: dict, max_dd_r: float, wcfg: dict) -> tuple[bool, str]:
@@ -678,24 +783,48 @@ def _already_known(conn, h: str) -> bool:
 
 def _save_discovery(conn, h: str, strategy: str, asset: str, regime: str,
                     params: dict, tr: dict, te: dict, fitness: float,
-                    max_dd_r: float, micro_score: float) -> int:
+                    max_dd_r: float, micro_score: float,
+                    window_results: list[dict] | None = None,
+                    now_ms: int = 0) -> int:
     cur = conn.execute(
         """INSERT OR IGNORE INTO lab_discoveries
            (discovered_at, params_hash, strategy, asset, market_regime, params_json,
             n_train, pf_train, avg_r_train,
             n_test,  pf_test,  avg_r_test,  wr_test,
-            fitness_score, max_dd_r, micro_score, notified)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+            fitness_score, max_dd_r, micro_score, notified, cooldown_bars)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
         (
             datetime.now(timezone.utc).isoformat(), h, strategy, asset, regime,
             json.dumps(_round_params(params), sort_keys=True),
             tr["n"], tr["pf"], tr["avg_r"],
             te["n"], te["pf"], te["avg_r"], te["wr"],
-            fitness, max_dd_r, micro_score,
+            fitness, max_dd_r, micro_score, COOLDOWN_BARS,
         ),
     )
+    disc_id = cur.lastrowid
+
+    # Fenster-Ergebnisse speichern (Weg B)
+    if disc_id and window_results and now_ms:
+        for idx, (wr_data, wcfg) in enumerate(zip(window_results, WF_WINDOWS)):
+            period_start = now_ms + wcfg["test_start"] * 86_400_000
+            period_end   = now_ms + wcfg["test_end"]   * 86_400_000 if wcfg["test_end"] != 0 else now_ms
+            conn.execute(
+                """INSERT OR IGNORE INTO lab_window_results
+                   (discovery_id, window_idx, period_start, period_end,
+                    n_train, pf_train, avg_r_train,
+                    n_test,  pf_test,  avg_r_test,  wr_test,
+                    max_dd_r, passed)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    disc_id, idx, period_start, period_end,
+                    wr_data["tr"]["n"], wr_data["tr"]["pf"], wr_data["tr"]["avg_r"],
+                    wr_data["te"]["n"], wr_data["te"]["pf"], wr_data["te"]["avg_r"], wr_data["te"]["wr"],
+                    wr_data["max_dd_r"], 1 if wr_data["passed"] else 0,
+                ),
+            )
+
     conn.commit()
-    return cur.lastrowid
+    return disc_id
 
 
 def _count_discoveries(conn) -> int:
@@ -704,14 +833,21 @@ def _count_discoveries(conn) -> int:
 
 # ── Lab-Stats Counter ─────────────────────────────────────────────────────────
 
-def _stat_inc(conn, key: str, delta: int = 1) -> None:
-    """Atomar einen Stats-Counter erhöhen (INSERT OR REPLACE)."""
+def _stat_inc(_conn_unused, key: str, delta: int = 1) -> None:
+    """Atomar einen Stats-Counter erhöhen — eigene kurzlebige Verbindung,
+    damit die Backtest-Schleife keine lange Schreibsperre hält."""
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """INSERT INTO lab_stats (key, value, updated_at) VALUES (?, ?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = value + ?, updated_at = ?""",
-        (key, delta, now, delta, now),
-    )
+    try:
+        c = get_connection()
+        c.execute(
+            """INSERT INTO lab_stats (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = value + ?, updated_at = ?""",
+            (key, delta, now, delta, now),
+        )
+        c.commit()
+        c.close()
+    except Exception:
+        pass  # Stats-Fehler sind nicht kritisch
 
 
 def get_lab_stats() -> dict:
@@ -792,8 +928,8 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
             test_start_ms  = now_ms + wcfg["test_start"]  * 86_400_000
             test_end_ms    = now_ms + wcfg["test_end"]    * 86_400_000 if wcfg["test_end"] != 0 else now_ms
             try:
-                tr_res = run_backtest(strategy, asset, start_ms,     train_end_ms, cfg=params)
-                te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,  cfg=params)
+                tr_res = run_backtest(strategy, asset, start_ms,     train_end_ms, cfg=params, cooldown_bars=COOLDOWN_BARS)
+                te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,  cfg=params, cooldown_bars=COOLDOWN_BARS)
             except Exception as e:
                 log(f"[LAB-DAEMON] Backtest-Fehler {strategy}/{asset}: {e}")
                 backtest_error = True
@@ -808,27 +944,26 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
         if backtest_error:
             continue
 
-        # Stats: Gesamt-Testzähler erhöhen
-        _stat_inc(conn, "total_tests")
+        # Stats: Gesamt-Testzähler erhöhen (eigene kurzlebige Verbindung)
+        _stat_inc(None, "total_tests")
 
         ok, reason = _passes(window_results)
         if not ok:
             cat = _rejection_category(reason.split("_", 1)[-1] if "_" in reason else reason)
-            _stat_inc(conn, f"reject_{cat}")
+            _stat_inc(None, f"reject_{cat}")
             if "ruin_filter" in reason:
                 log(f"[LAB-DAEMON] ☠️  Ruin-Filter: {strategy}/{asset} {reason}")
             continue
 
         # Stats: bestandener Test
-        _stat_inc(conn, "total_pass")
-        conn.commit()
+        _stat_inc(None, "total_pass")
 
         # Metriken aus Fenster 3 für Discovery-Eintrag und Deployment
         te3      = window_results[-1]["te"]
         max_dd_r = window_results[-1]["max_dd_r"]
         tr3      = window_results[-1]["tr"]
 
-        micro_score = _calc_micro_score(te3["pf"], max_dd_r)
+        micro_score = _calc_micro_score(te3["pf"], te3["avg_r"], te3["wr"], te3["n"], max_dd_r)
         fitness     = _fitness(window_results)
 
         prev_pf, prev_fit  = _get_highscore(conn, strategy, asset, regime)
@@ -836,7 +971,8 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
         is_micro_highscore = micro_score > prev_micro
 
         disc_id = _save_discovery(conn, h, strategy, asset, regime, params,
-                                  tr3, te3, fitness, max_dd_r, micro_score)
+                                  tr3, te3, fitness, max_dd_r, micro_score,
+                                  window_results=window_results, now_ms=now_ms)
         disc_n  = _count_discoveries(conn)
 
         dd_usdt     = max_dd_r * RISK_PER_TRADE
@@ -907,7 +1043,11 @@ def main():
                     return (1, random.random())
                 return (2, random.random())
 
-            targets = sorted(SEARCH_SPACE.copy(), key=_sort_key)
+            requested = _load_requested_targets()
+            combined  = list(dict.fromkeys(SEARCH_SPACE + requested))  # dedupliziert, Reihenfolge erhalten
+            targets   = sorted(combined, key=_sort_key)
+
+            requested_assets = {asset for _, asset in requested}
 
             found_this_round = 0
             for strategy, asset in targets:
@@ -922,6 +1062,24 @@ def main():
                     conn.close()
                 # Kurze Pause zwischen Targets — gibt anderen Prozessen Luft
                 time.sleep(0.05)
+
+            # Angeforderte Assets die vollständig getestet wurden → status='done'
+            if requested_assets:
+                try:
+                    c_req = get_connection()
+                    for req_asset in requested_assets:
+                        has_run = c_req.execute(
+                            "SELECT 1 FROM research_runs WHERE asset=? LIMIT 1", (req_asset,)
+                        ).fetchone()
+                        if has_run:
+                            c_req.execute(
+                                "UPDATE asset_requests SET status='done' WHERE asset=? AND status='pending'",
+                                (req_asset,),
+                            )
+                    c_req.commit()
+                    c_req.close()
+                except Exception as e:
+                    log(f"[LAB-DAEMON] asset_requests update fehler: {e}")
 
             c2 = get_connection()
             disc_total = _count_discoveries(c2)

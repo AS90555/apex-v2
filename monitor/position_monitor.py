@@ -21,7 +21,8 @@ from core.utils import log, now_iso
 def _load_open_trades(conn) -> list[dict]:
     rows = conn.execute(
         """SELECT id, signal_id, strategy, asset, direction, entry_price,
-                  size, stop_loss, take_profit_1, take_profit_2, be_applied, mode, session
+                  size, stop_loss, take_profit_1, take_profit_2, be_applied, mode, session,
+                  tp1_partial_done
            FROM trades WHERE exit_ts IS NULL""",
     ).fetchall()
     return [
@@ -30,6 +31,7 @@ def _load_open_trades(conn) -> list[dict]:
             "direction": r[4], "entry_price": r[5], "size": r[6],
             "stop_loss": r[7], "take_profit_1": r[8], "take_profit_2": r[9],
             "be_applied": r[10], "mode": r[11], "session": r[12],
+            "tp1_partial_done": r[13],
         }
         for r in rows
     ]
@@ -59,10 +61,12 @@ def _mark_exit(conn, trade: dict, exit_price: float, reason: str, pnl_usd: float
            WHERE id=?""",
         (round(exit_price, 6), ts_now, reason, round(pnl_usd, 4), round(pnl_r, 4), trade["id"]),
     )
+    # Sofort committen damit set_daily_pnl() (eigene Connection) nicht auf diesen Lock wartet
+    conn.commit()
     log(f"[MONITOR] Exit erkannt: Trade #{trade['id']} {trade['asset']} "
         f"pnl={pnl_usd:+.2f}$ ({pnl_r:+.2f}R) reason={reason}")
 
-    # Daily-PnL akkumulieren
+    # Daily-PnL akkumulieren (eigene Connection via set_state — Lock jetzt frei)
     daily = get_daily_pnl()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if daily.get("date") != today:
@@ -73,6 +77,82 @@ def _mark_exit(conn, trade: dict, exit_price: float, reason: str, pnl_usd: float
         pnl_usd=daily["pnl_usd"] + pnl_usd,
         trades=daily["trades"] + 1,
     )
+
+
+def _get_atr_buffer(conn, trade: dict) -> float:
+    """0.5 × ATR(14) aus 1h-Candles als BE-Puffer. Fallback: 0.05% des Entry-Preises."""
+    try:
+        rows = conn.execute(
+            "SELECT high, low FROM candles WHERE asset=? AND interval='1h' ORDER BY ts DESC LIMIT 14",
+            (trade["asset"],),
+        ).fetchall()
+        if len(rows) >= 5:
+            buf = sum(r[0] - r[1] for r in rows) / len(rows) * 0.5
+            if buf > 0:
+                return buf
+    except Exception:
+        pass
+    return trade["entry_price"] * 0.0005
+
+
+def _apply_partial_tp1(conn, trade: dict, tp1_price: float):
+    """
+    Partial-Close bei TP1: schließt 50 % der Position.
+
+    Shadow/Dry-Run:
+      - PnL auf 50 % der Size berechnen und in partial_pnl_usd loggen
+      - trade.size auf 50 % reduzieren
+      - SL auf Break-Even (entry ± ATR-Puffer) verschieben
+      - tp1_partial_done = 1, be_applied = 1 setzen
+
+    Live:
+      - Reduce-Only Market-Order für 50 % der Size an Bitget senden
+      - Bei Erfolg: gleiche DB-Updates wie oben
+    """
+    half_size = trade["size"] * 0.5
+    if trade["direction"] == "long":
+        partial_pnl = (tp1_price - trade["entry_price"]) * half_size
+    else:
+        partial_pnl = (trade["entry_price"] - tp1_price) * half_size
+
+    atr_buf = _get_atr_buffer(conn, trade)
+    if trade["direction"] == "long":
+        new_sl = trade["entry_price"] + atr_buf   # leicht über Entry (Gewinnsicherung)
+    else:
+        new_sl = trade["entry_price"] - atr_buf
+
+    sl_dist = abs(trade["entry_price"] - trade["stop_loss"])
+    partial_pnl_r = (partial_pnl / (sl_dist * trade["size"])) if sl_dist > 0 and trade["size"] > 0 else 0.0
+
+    ok_api = True
+    if trade["mode"] == "live":
+        try:
+            from execution.bitget_client import BitgetClient
+            hold_side = "long" if trade["direction"] == "long" else "short"
+            client = BitgetClient(dry_run=False)
+            result = client.place_partial_close(trade["asset"], half_size, hold_side=hold_side)
+            if result.success:
+                client.modify_sl(trade["asset"], round(new_sl, 6), half_size, hold_side=hold_side)
+            else:
+                log(f"[MONITOR] Partial-Close API fehlgeschlagen: Trade #{trade['id']} {trade['asset']}: {result.error}")
+                ok_api = False
+        except Exception as e:
+            log(f"[MONITOR] Partial-Close Fehler: Trade #{trade['id']} {trade['asset']}: {e}")
+            ok_api = False
+
+    if ok_api:
+        conn.execute(
+            """UPDATE trades
+               SET size=?, stop_loss=?, tp1_partial_done=1, be_applied=1
+               WHERE id=?""",
+            (round(half_size, 6), round(new_sl, 6), trade["id"]),
+        )
+        conn.commit()
+        log(
+            f"[MONITOR] Partial-Close TP1 ({trade['mode']}): Trade #{trade['id']} {trade['asset']} "
+            f"@ {tp1_price:.4f} | PnL 50%={partial_pnl:+.2f}$ ({partial_pnl_r:+.2f}R) | "
+            f"new_sl={new_sl:.4f} | remaining_size={half_size}"
+        )
 
 
 def _check_break_even(conn, trade: dict, current_price: float):
@@ -90,11 +170,11 @@ def _check_break_even(conn, trade: dict, current_price: float):
     pnl_r = pnl_usd / (sl_dist * trade["size"]) if trade["size"] > 0 else 0.0
 
     if pnl_r >= 1.0:
-        # 0.05% Puffer gegen Spike-Out beim BE-SL
+        atr_buffer = _get_atr_buffer(conn, trade)
         if trade["direction"] == "long":
-            new_sl = trade["entry_price"] * 0.9995
+            new_sl = trade["entry_price"] - atr_buffer
         else:
-            new_sl = trade["entry_price"] * 1.0005
+            new_sl = trade["entry_price"] + atr_buffer
 
         # Shadow + Dry-Run: nur DB-Flag, kein API-Call (keine reale Position)
         if trade["mode"] in ("shadow", "dry_run"):
@@ -179,63 +259,107 @@ def run_position_monitor() -> dict:
         conn.close()
         return stats
 
-    # Positionen je Modus holen (shadow → leer, live → Bitget)
-    # Gruppiere nach Modus
-    live_modes = {t["mode"] for t in open_trades if t["mode"] != "shadow"}
+    # Positionen je Modus holen (shadow+dry_run → simuliert, live → Bitget)
+    # dry_run-Orders werden nie auf Bitget platziert → simulieren wie shadow
     live_positions: dict[str, object] = {}
-    for mode in live_modes:
-        live_positions.update(_get_live_positions(mode))
+    live_assets_with_real_position = {t["asset"] for t in open_trades if t["mode"] == "live"}
+    if live_assets_with_real_position:
+        live_positions.update(_get_live_positions("live"))
+
+    # Preise für shadow + dry_run VOR dem DB-Schreiben fetchen
+    simulated_assets = list({t["asset"] for t in open_trades if t["mode"] in ("shadow", "dry_run")})
+    shadow_prices: dict[str, float] = {}
+    if simulated_assets:
+        try:
+            from execution.bitget_client import BitgetClient
+            _price_client = BitgetClient(dry_run=True)
+            for _a in simulated_assets:
+                try:
+                    shadow_prices[_a] = _price_client.get_price(_a)
+                except Exception:
+                    shadow_prices[_a] = 0.0
+        except Exception:
+            pass
 
     still_open_assets: list[str] = []
 
     for trade in open_trades:
         asset = trade["asset"]
 
-        if trade["mode"] == "shadow":
-            # Aktuellen Marktpreis holen (kein Auth), SL/TP simulieren
-            current_price = 0.0
-            try:
-                from execution.bitget_client import BitgetClient
-                current_price = BitgetClient(dry_run=True).get_price(asset)
-            except Exception:
-                pass
+        if trade["mode"] in ("shadow", "dry_run"):
+            current_price = shadow_prices.get(asset, 0.0)
 
             if current_price > 0:
                 sl  = trade["stop_loss"]
                 tp1 = trade["take_profit_1"]
                 d   = trade["direction"]
+                exited = False
                 if d == "long" and current_price <= sl:
                     pnl = (sl - trade["entry_price"]) * trade["size"]
                     _mark_exit(conn, trade, sl, "sl_hit_shadow", pnl)
+                    conn.commit()
                     stats["exits"] += 1
+                    exited = True
                 elif d == "short" and current_price >= sl:
                     pnl = (trade["entry_price"] - sl) * trade["size"]
                     _mark_exit(conn, trade, sl, "sl_hit_shadow", pnl)
+                    conn.commit()
                     stats["exits"] += 1
-                elif tp1 and d == "long" and current_price >= tp1:
-                    pnl = (tp1 - trade["entry_price"]) * trade["size"]
-                    _mark_exit(conn, trade, tp1, "tp1_hit_shadow", pnl)
-                    stats["exits"] += 1
-                elif tp1 and d == "short" and current_price <= tp1:
-                    pnl = (trade["entry_price"] - tp1) * trade["size"]
-                    _mark_exit(conn, trade, tp1, "tp1_hit_shadow", pnl)
-                    stats["exits"] += 1
-                else:
+                    exited = True
+                elif tp1 and not trade["tp1_partial_done"] and d == "long" and current_price >= tp1:
+                    _apply_partial_tp1(conn, trade, tp1)
+                    trade["size"] *= 0.5
+                    trade["tp1_partial_done"] = 1
+                    trade["be_applied"] = 1
+                elif tp1 and not trade["tp1_partial_done"] and d == "short" and current_price <= tp1:
+                    _apply_partial_tp1(conn, trade, tp1)
+                    trade["size"] *= 0.5
+                    trade["tp1_partial_done"] = 1
+                    trade["be_applied"] = 1
+                if not exited:
+                    _check_break_even(conn, trade, current_price)
+                    if conn.execute("SELECT be_applied FROM trades WHERE id=?", (trade["id"],)).fetchone()[0] and not trade["be_applied"]:
+                        stats["be_applied_new"] += 1
                     still_open_assets.append(asset)
                     stats["open"] += 1
-                    log(f"[MONITOR] Trade #{trade['id']} {asset} shadow @ {current_price:.4f} → offen")
+                    log(f"[MONITOR] Trade #{trade['id']} {asset} {trade['mode']} @ {current_price:.4f} → offen")
             else:
                 still_open_assets.append(asset)
                 stats["open"] += 1
-                log(f"[MONITOR] Trade #{trade['id']} {asset} shadow → kein Preis, als offen markiert")
+                log(f"[MONITOR] Trade #{trade['id']} {asset} {trade['mode']} → kein Preis, als offen markiert")
             continue
 
         pos = live_positions.get(asset)
 
         if pos is None:
-            # Keine Position mehr auf Bitget → Exit
-            _mark_exit(conn, trade, exit_price=trade["entry_price"],
-                       reason="position_closed_external", pnl_usd=0.0)
+            # Keine Position mehr auf Bitget → durch SL/TP geschlossen.
+            # Balance-Delta als PnL-Proxy: aktuell gecachte Balance minus
+            # Margin-Einsatz (entry_price × size / leverage ≈ RISK_USDT).
+            # Exakter Exit-Preis: letzten bekannten Mark-Preis aus get_price().
+            try:
+                from execution.bitget_client import BitgetClient
+                _pc = BitgetClient(dry_run=False)
+                exit_price = _pc.get_price(asset) if _pc.is_ready else trade["entry_price"]
+            except Exception:
+                exit_price = trade["entry_price"]
+
+            sl  = trade["stop_loss"]
+            tp1 = trade["take_profit_1"]
+            d   = trade["direction"]
+            # Preis näher an SL oder TP1 → Exit-Reason bestimmen
+            if d == "long":
+                dist_sl  = abs(exit_price - sl)
+                dist_tp1 = abs(exit_price - tp1) if tp1 else float("inf")
+                reason   = "tp1_hit" if dist_tp1 < dist_sl else "sl_hit"
+                pnl_usd  = (exit_price - trade["entry_price"]) * trade["size"]
+            else:
+                dist_sl  = abs(exit_price - sl)
+                dist_tp1 = abs(exit_price - tp1) if tp1 else float("inf")
+                reason   = "tp1_hit" if dist_tp1 < dist_sl else "sl_hit"
+                pnl_usd  = (trade["entry_price"] - exit_price) * trade["size"]
+
+            _mark_exit(conn, trade, exit_price=round(exit_price, 6),
+                       reason=reason, pnl_usd=round(pnl_usd, 4))
             stats["exits"] += 1
             # HWM nach Exit aktualisieren (balance wurde oben gecacht)
             if balance > 0:
@@ -244,8 +368,18 @@ def run_position_monitor() -> dict:
                     set_hwm(balance)
                     log(f"[MONITOR] HWM nach Exit aktualisiert: {hwm:.2f} → {balance:.2f} USDT")
         else:
-            # Position noch offen
-            current_price = pos.entry_price  # beste verfügbare Approximation
+            # Position noch offen — mark_price für BE-Check und Partial-TP1 verwenden
+            current_price = pos.mark_price if pos.mark_price > 0 else pos.entry_price
+            tp1 = trade["take_profit_1"]
+            d   = trade["direction"]
+
+            # Partial-Close TP1 (live): wenn Preis TP1 erreicht und noch nicht ausgeführt
+            if tp1 and not trade["tp1_partial_done"]:
+                if (d == "long" and current_price >= tp1) or (d == "short" and current_price <= tp1):
+                    _apply_partial_tp1(conn, trade, tp1)
+                    trade["tp1_partial_done"] = 1
+                    trade["be_applied"] = 1
+
             be_before = trade["be_applied"]
             _check_break_even(conn, trade, current_price)
             be_after = conn.execute(

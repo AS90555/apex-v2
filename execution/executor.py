@@ -28,7 +28,7 @@ from typing import Optional
 
 from config.settings import (
     RISK_USDT, MIN_NOTIONAL, TARGET_NOTIONAL, MAX_LEVERAGE,
-    SIZE_DECIMALS,
+    SIZE_DECIMALS, MAX_OPEN_RISK_USDT,
 )
 from core.db import get_connection
 from core.models import Signal, Trade
@@ -80,14 +80,43 @@ def _calc_sizing(signal: Signal, current_price: float) -> dict | None:
     raw_size    = RISK_USDT / sl_distance          # Coins
     notional_1x = raw_size * entry                 # USDT ohne Hebel
 
-    # Schritt 3: Hebel bestimmen
+    # Schritt 3a: Offenes Risikobudget prüfen (alle nicht-shadow Positionen)
+    from core.db import get_connection as _get_conn
+    _rconn = _get_conn()
+    _open_rows = _rconn.execute(
+        """SELECT entry_price, stop_loss, size FROM trades
+           WHERE exit_ts IS NULL AND mode != 'shadow'""",
+    ).fetchall()
+    _rconn.close()
+    open_risk = sum(abs(r[0] - r[1]) * r[2] for r in _open_rows)
+    if open_risk + RISK_USDT > MAX_OPEN_RISK_USDT:
+        log(
+            f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
+            f"Risikobudget erschöpft (offen=${open_risk:.2f} + neu=${RISK_USDT:.2f} "
+            f"> MAX=${MAX_OPEN_RISK_USDT:.2f})"
+        )
+        return None
+
+    # Schritt 3b: Balance-Check — Margin-Bedarf = notional_1x (unabhängig von Leverage)
+    # Bei Isolated-Futures gilt: Margin = Size × Price / Leverage = notional_1x (konstant)
+    from core.state import get_live_balance
+    balance = get_live_balance()
+    if balance > 0 and notional_1x > balance * 0.95:
+        log(
+            f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
+            f"Margin-Bedarf ${notional_1x:.2f} > verfügbare Balance ${balance:.2f} "
+            f"(SL-Distanz={sl_distance:.4f} zu eng für RISK ${RISK_USDT:.2f})"
+        )
+        return None
+
+    # Schritt 4: Hebel bestimmen
     if notional_1x >= MIN_NOTIONAL:
         leverage = 1
     else:
-        # Minimaler Hebel um TARGET_NOTIONAL zu erreichen
+        # Minimaler Hebel um MIN_NOTIONAL zu erreichen
         leverage = math.ceil(TARGET_NOTIONAL / notional_1x)
 
-    # Schritt 4: hartes Limit prüfen
+    # Schritt 5: hartes Limit prüfen
     if leverage > MAX_LEVERAGE:
         log(
             f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
@@ -273,6 +302,19 @@ class Executor:
 
         entry_price = result.avg_price if result.avg_price > 0 else signal.entry_price
         order_id    = result.order_id or f"{'DRY' if dry_run else 'LIVE'}-{int(time.time())}"
+
+        # TP2: separater TPSL-Order nach Entry (TP1 war preset im Market-Order)
+        if signal.take_profit_2 and signal.take_profit_2 > 0:
+            tp2_result = client.place_take_profit(
+                coin=signal.asset,
+                trigger_price=signal.take_profit_2,
+                size=result.filled_size or size,
+                hold_side=hold_side,
+            )
+            if tp2_result.success:
+                log(f"[EXECUTOR] TP2 platziert: {signal.asset} @ {signal.take_profit_2}")
+            else:
+                log(f"[EXECUTOR] TP2 fehlgeschlagen (ignoriert): {tp2_result.error}")
 
         t = Trade(
             signal_id=signal.id,

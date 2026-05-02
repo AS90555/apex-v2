@@ -118,13 +118,22 @@ def deploy_discovery(discovery_id: int, mode: str = "dry_run",
     now_iso       = datetime.now(timezone.utc).isoformat()
 
     # Phase 2: Write mit Retry (60× 50ms = max 3s)
-    replaced = 0
+    replaced      = 0
+    replaced_ids  = []
+    dep_status    = "live" if mode == "live" else "dry"
     for attempt in range(60):
         try:
             conn = get_connection()
             try:
-                replaced = 0
+                replaced     = 0
+                replaced_ids = []
                 if replace_asset:
+                    # IDs VOR dem Deaktivieren merken (danach nicht mehr abrufbar)
+                    old_rows = conn.execute(
+                        "SELECT discovery_id FROM active_deployments WHERE asset=? AND active=1",
+                        (row["asset"],),
+                    ).fetchall()
+                    replaced_ids = [r[0] for r in old_rows if r[0] != discovery_id]
                     cur = conn.execute(
                         "UPDATE active_deployments SET active=0 WHERE asset=? AND active=1",
                         (row["asset"],),
@@ -157,6 +166,20 @@ def deploy_discovery(discovery_id: int, mode: str = "dry_run",
                          row["market_regime"], row["params_json"],
                          mode, now_iso, target_trades),
                     )
+
+                # lab_discoveries.deployment_status synchron halten
+                if replaced_ids:
+                    conn.execute(
+                        f"UPDATE lab_discoveries SET deployment_status='lab' "
+                        f"WHERE id IN ({','.join('?' * len(replaced_ids))})",
+                        replaced_ids,
+                    )
+                conn.execute(
+                    "UPDATE lab_discoveries SET deployment_status=?, deployed_at=?, deployed_by='telegram' "
+                    "WHERE id=?",
+                    (dep_status, now_iso, discovery_id),
+                )
+
                 conn.commit()
                 conn.close()
                 break
@@ -178,6 +201,7 @@ def deploy_discovery(discovery_id: int, mode: str = "dry_run",
         "wr_test":       row["wr_test"],
         "mode":          mode,
         "replaced":      replaced,
+        "replaced_ids":  replaced_ids,
     }
 
 
