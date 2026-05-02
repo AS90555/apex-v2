@@ -25,13 +25,18 @@ REGIME_ASSETS = [a for a, intervals in INTAKE_MATRIX.items() if "1h" in interval
 REGIME_MIN_CANDLES = 70   # EMA(50) + 15 Puffer + 5 Reserve
 
 
+_STALE_CANDLE_MINUTES = 180   # Candle älter als 3h → Regime-Update überspringen
+
+
 def _compute_and_store_regimes():
     """Berechnet das aktuelle Markt-Regime für alle Assets und speichert in system_state."""
+    import time as _time
     conn = get_connection()
+    now_ms = int(_time.time() * 1000)
     updated = []
     for asset in REGIME_ASSETS:
         rows = conn.execute(
-            """SELECT open, high, low, close, volume FROM candles
+            """SELECT open, high, low, close, volume, ts FROM candles
                WHERE asset=? AND interval='1h'
                ORDER BY ts DESC LIMIT ?""",
             (asset, REGIME_MIN_CANDLES),
@@ -39,6 +44,14 @@ def _compute_and_store_regimes():
 
         if len(rows) < REGIME_MIN_CANDLES:
             log(f"[run_features] Regime {asset}: zu wenig Candles ({len(rows)}<{REGIME_MIN_CANDLES})")
+            continue
+
+        # Fallback-Schutz: letzten Candle auf Frische prüfen
+        last_candle_ts = rows[0][5]   # DESC → erstes Element ist neuester
+        age_min = (now_ms - last_candle_ts) / 60_000
+        if age_min > _STALE_CANDLE_MINUTES:
+            log(f"[run_features] ⚠️ Regime {asset}: letzter Candle {age_min:.0f} Min alt "
+                f"— Regime-Update übersprungen (Fallback-Schutz)")
             continue
 
         # Umkehren: DESC → ASC für Indikator-Berechnung

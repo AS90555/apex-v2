@@ -815,6 +815,237 @@ def _inside_bar_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[B
     return None
 
 
+def _dual_donchian_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Adaptive Channel-Breakout (Dual-Donchian):
+      Entry-Kanal (länger) bestimmt den Breakout.
+      Exit-Kanal (kürzer) dient als Trailing-Stop-Referenz.
+      Volumen- und ATR-Filter wie beim klassischen Donchian.
+    """
+    entry_period = int(cfg.get("ENTRY_PERIOD", 20))
+    exit_period  = int(cfg.get("EXIT_PERIOD",  10))
+    vol_factor   = cfg.get("VOL_FACTOR",   1.5)
+    atr_min      = cfg.get("ATR_MIN_MULT", 1.0)
+    sl_mult      = cfg.get("SL_ATR_MULT",  1.0)
+    tp_r         = cfg.get("TP_R",         2.0)
+
+    limit = entry_period + 30
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < entry_period + 5:
+        return None
+
+    cur = candles[-1]
+    ts  = cur["time"]
+
+    entry_window = candles[-(entry_period + 1):-1]
+    entry_high   = max(c["high"] for c in entry_window)
+    entry_low    = min(c["low"]  for c in entry_window)
+
+    atr     = atr_wilder(candles, 14)
+    atr_avg = atr_wilder(candles[:-14], 14) if len(candles) > 28 else atr
+    vol_avg = vol_sma(candles, 20)
+
+    if atr <= 0 or vol_avg <= 0:
+        return None
+
+    atr_ok = atr >= atr_min * atr_avg if atr_avg > 0 else True
+    vol_ok = cur["volume"] >= vol_factor * vol_avg
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cur["close"] > entry_high and vol_ok and atr_ok:
+        sl_dist = atr * sl_mult
+        sl = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="dual_donchian", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cur["close"] < entry_low and vol_ok and atr_ok:
+        sl_dist = atr * sl_mult
+        sl  = cur["close"] + sl_dist
+        tp2 = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="dual_donchian", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _bb_kc_squeeze_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    BB + Keltner Channel Squeeze (Volatility-Breakout):
+      Squeeze erkannt wenn BB-Breite < KC-Breite (Kompressionsphase).
+      Signal wenn Squeeze sich auflöst + Momentum-Richtung bestätigt.
+      Momentum = Close - SMA(Close, period).
+    """
+    bb_period  = int(cfg.get("BB_PERIOD",  20))
+    bb_mult    = cfg.get("BB_MULT",    2.0)
+    kc_mult    = cfg.get("KC_MULT",    1.5)
+    sl_mult    = cfg.get("SL_ATR_MULT", 1.0)
+    tp_r       = cfg.get("TP_R",       2.5)
+
+    candles = _candles(conn, asset, "1h", as_of_ts, bb_period + 30)
+    if len(candles) < bb_period + 5:
+        return None
+
+    cur = candles[-1]
+    ts  = cur["time"]
+    closes = [c["close"] for c in candles]
+
+    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, bb_period, bb_mult)
+    atr    = atr_wilder(candles, bb_period)
+    kc_mid = sma(closes, bb_period)
+    kc_upper = kc_mid + kc_mult * atr
+    kc_lower = kc_mid - kc_mult * atr
+
+    if atr <= 0 or kc_mid <= 0:
+        return None
+
+    # Squeeze: vorherige Kerze hatte BB innerhalb KC
+    closes_prev = [c["close"] for c in candles[:-1]]
+    bb_u_prev, bb_m_prev, bb_l_prev = bollinger_bands(closes_prev, bb_period, bb_mult)
+    atr_prev    = atr_wilder(candles[:-1], bb_period)
+    kc_mid_prev = sma(closes_prev, bb_period)
+    kc_u_prev   = kc_mid_prev + kc_mult * atr_prev
+    kc_l_prev   = kc_mid_prev - kc_mult * atr_prev
+
+    was_squeeze = (bb_u_prev < kc_u_prev and bb_l_prev > kc_l_prev)
+    is_squeeze  = (bb_upper  < kc_upper  and bb_lower  > kc_lower)
+
+    # Squeeze löst sich auf: vorher drin, jetzt raus
+    if not was_squeeze or is_squeeze:
+        return None
+
+    # Momentum: Close minus SMA
+    momentum = cur["close"] - kc_mid
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    sl_dist  = atr * sl_mult
+
+    if momentum > 0:
+        sl = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="bb_kc_squeeze", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if momentum < 0:
+        sl  = cur["close"] + sl_dist
+        tp2 = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="bb_kc_squeeze", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _supertrend_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Supertrend Trend-Following (ATR-basiert, 3-facher Konsensfilter):
+      Drei unabhängige Supertrend-Instanzen mit unterschiedlichen Parametern.
+      Long: alle 3 zeigen 'up' (Preis über Upper Band).
+      Short: alle 3 zeigen 'down' (Preis unter Lower Band).
+      Richtungswechsel-Signal: vorherige Kerze hatte anderen Konsens.
+    """
+    configs = [
+        (int(cfg.get("ST1_PERIOD", 10)), cfg.get("ST1_MULT", 1.0)),
+        (int(cfg.get("ST2_PERIOD", 11)), cfg.get("ST2_MULT", 2.0)),
+        (int(cfg.get("ST3_PERIOD", 12)), cfg.get("ST3_MULT", 3.0)),
+    ]
+    sl_mult  = cfg.get("SL_ATR_MULT", 1.0)
+    tp_r     = cfg.get("TP_R",        2.5)
+
+    max_period = max(p for p, _ in configs)
+    candles = _candles(conn, asset, "1h", as_of_ts, max_period + 50)
+    if len(candles) < max_period + 10:
+        return None
+
+    def _supertrend_direction(cands: list, period: int, mult: float) -> Optional[str]:
+        if len(cands) < period + 2:
+            return None
+        closes = [c["close"] for c in cands]
+        highs  = [c["high"]  for c in cands]
+        lows   = [c["low"]   for c in cands]
+        # ATR via Wilder
+        atr_val = atr_wilder(cands, period)
+        if atr_val <= 0:
+            return None
+        mid = (highs[-1] + lows[-1]) / 2
+        upper = mid + mult * atr_val
+        lower = mid - mult * atr_val
+        price = closes[-1]
+        return "up" if price > lower else "down"
+
+    dirs_cur  = [_supertrend_direction(candles,        p, m) for p, m in configs]
+    dirs_prev = [_supertrend_direction(candles[:-1],   p, m) for p, m in configs]
+
+    if None in dirs_cur or None in dirs_prev:
+        return None
+
+    all_up_cur   = all(d == "up"   for d in dirs_cur)
+    all_down_cur = all(d == "down" for d in dirs_cur)
+    all_up_prev   = all(d == "up"   for d in dirs_prev)
+    all_down_prev = all(d == "down" for d in dirs_prev)
+
+    # Nur bei Richtungswechsel signalisieren (Einstieg, nicht Fortsetzung)
+    if not (all_up_cur and not all_up_prev) and not (all_down_cur and not all_down_prev):
+        return None
+
+    cur      = candles[-1]
+    ts       = cur["time"]
+    atr      = atr_wilder(candles, configs[0][0])
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    sl_dist  = atr * sl_mult
+
+    if all_up_cur:
+        sl = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="supertrend", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if all_down_cur:
+        sl  = cur["close"] + sl_dist
+        tp2 = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="supertrend", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
 SIGNAL_FNS = {
     "vaa":                _vaa_signal,
     "kdt":            _kdt_signal,
@@ -826,6 +1057,9 @@ SIGNAL_FNS = {
     "ema_pullback":       _ema_pullback_signal,
     "donchian_breakout":  _donchian_breakout_signal,
     "inside_bar_breakout": _inside_bar_signal,
+    "dual_donchian":      _dual_donchian_signal,
+    "bb_kc_squeeze":      _bb_kc_squeeze_signal,
+    "supertrend":         _supertrend_signal,
 }
 
 STRATEGY_INTERVAL = {
@@ -839,6 +1073,9 @@ STRATEGY_INTERVAL = {
     "ema_pullback":       "1h",
     "donchian_breakout":  "1h",
     "inside_bar_breakout": "1h",
+    "dual_donchian":      "1h",
+    "bb_kc_squeeze":      "1h",
+    "supertrend":         "1h",
 }
 
 EXIT_INTERVAL = {
@@ -852,6 +1089,16 @@ EXIT_INTERVAL = {
     "ema_pullback":       "1h",
     "donchian_breakout":  "1h",
     "inside_bar_breakout": "1h",
+    "dual_donchian":      "1h",
+    "bb_kc_squeeze":      "1h",
+    "supertrend":         "1h",
+}
+
+
+INTERVAL_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "12h": 43_200_000, "1d": 86_400_000,
 }
 
 
@@ -862,6 +1109,7 @@ def run_backtest(
     end_ts: int,
     cfg: dict = None,
     max_exit_bars: int = 48,
+    cooldown_bars: int = 0,
     verbose: bool = False,
 ) -> BtResult:
     """
@@ -891,6 +1139,9 @@ def run_backtest(
     result      = BtResult(strategy=strategy, asset=asset)
     conn        = get_connection()
 
+    interval_ms      = INTERVAL_MS.get(interval, 3_600_000)
+    cooldown_until_ts: int = 0   # kein Cooldown aktiv am Start
+
     # Alle Timestamps im Bereich laden
     timestamps = [
         r[0] for r in conn.execute(
@@ -903,7 +1154,8 @@ def run_backtest(
 
     log(f"[BACKTEST] {strategy}/{asset}: {len(timestamps)} Bars von "
         f"{datetime.fromtimestamp(start_ts/1000, tz=timezone.utc).date()} bis "
-        f"{datetime.fromtimestamp(end_ts/1000, tz=timezone.utc).date()}")
+        f"{datetime.fromtimestamp(end_ts/1000, tz=timezone.utc).date()}"
+        + (f" cooldown={cooldown_bars}bars" if cooldown_bars > 0 else ""))
 
     open_trade: Optional[BtTrade] = None
 
@@ -916,10 +1168,15 @@ def run_backtest(
                 if verbose:
                     log(f"[BACKTEST]   EXIT {open_trade.exit_reason} "
                         f"pnl={open_trade.pnl_r:+.2f}R @ {open_trade.exit_price}")
+                if cooldown_bars > 0 and open_trade.exit_ts:
+                    cooldown_until_ts = open_trade.exit_ts + cooldown_bars * interval_ms
                 open_trade = None
 
         if open_trade:
             continue  # kein neuer Trade solange Position offen
+
+        if cooldown_bars > 0 and ts <= cooldown_until_ts:
+            continue  # Cooldown nach letztem Exit aktiv
 
         sig = signal_fn(conn, asset, ts, cfg)
         if sig:
@@ -993,4 +1250,19 @@ def _default_cfg(strategy: str) -> dict:
                 "RSI_OB": ASIAN_FADE_RSI_OB,
                 "SL_ATR_MULT": ASIAN_FADE_SL_ATR_MULT,
                 "TP_MULT": ASIAN_FADE_TP_MULT}
+    if strategy == "dual_donchian":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "ENTRY_PERIOD": 20, "EXIT_PERIOD": 10,
+                "VOL_FACTOR": 1.5, "ATR_MIN_MULT": 1.0,
+                "SL_ATR_MULT": 1.0, "TP_R": 2.0}
+    if strategy == "bb_kc_squeeze":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "BB_PERIOD": 20, "BB_MULT": 2.0,
+                "KC_MULT": 1.5, "SL_ATR_MULT": 1.0, "TP_R": 2.5}
+    if strategy == "supertrend":
+        return {**base, "MAX_RISK_PCT": MAX_RISK_PCT,
+                "ST1_PERIOD": 10, "ST1_MULT": 1.0,
+                "ST2_PERIOD": 11, "ST2_MULT": 2.0,
+                "ST3_PERIOD": 12, "ST3_MULT": 3.0,
+                "SL_ATR_MULT": 1.0, "TP_R": 2.5}
     return base

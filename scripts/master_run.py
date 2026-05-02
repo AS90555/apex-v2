@@ -62,7 +62,8 @@ def _step_cleanup():
         conn.close()
         return
     log(f"[master_run] Cleanup für {today}")
-    conn.execute("DELETE FROM candles    WHERE ts < (strftime('%s','now') - 30*86400) * 1000")
+    # Nur live-gefetchte Bitget-Kerzen löschen — Binance-History (source='binance') bleibt erhalten
+    conn.execute("DELETE FROM candles    WHERE ts < (strftime('%s','now') - 30*86400) * 1000 AND source='bitget'")
     conn.execute("DELETE FROM features   WHERE ts < (strftime('%s','now') - 30*86400) * 1000")
     conn.execute("DELETE FROM heartbeats WHERE ts < datetime('now', '-7 days')")
     conn.execute(

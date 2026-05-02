@@ -141,6 +141,39 @@ CREATE TABLE IF NOT EXISTS active_deployments (
     go_live_notified   INTEGER NOT NULL DEFAULT 0,
     note               TEXT
 );
+
+CREATE TABLE IF NOT EXISTS asset_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset        TEXT NOT NULL UNIQUE,
+    requested_at TEXT NOT NULL,
+    requested_by TEXT NOT NULL DEFAULT 'telegram',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    -- pending → lab picks it up next cycle
+    -- in_progress → lab is currently testing it
+    -- done → at least one research_run exists for this asset
+    note         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lab_window_results (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    discovery_id INTEGER NOT NULL REFERENCES lab_discoveries(id),
+    window_idx   INTEGER NOT NULL,   -- 0=alt (480d), 1=mittel (240d), 2=aktuell (60d)
+    period_start INTEGER NOT NULL,   -- Unix-ms (Anfang des OOS-Fensters)
+    period_end   INTEGER NOT NULL,   -- Unix-ms (Ende des OOS-Fensters)
+    n_train      INTEGER,
+    pf_train     REAL,
+    avg_r_train  REAL,
+    n_test       INTEGER,
+    pf_test      REAL,
+    avg_r_test   REAL,
+    wr_test      REAL,
+    max_dd_r     REAL,
+    passed       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(discovery_id, window_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wres_discovery ON lab_window_results(discovery_id);
+CREATE INDEX IF NOT EXISTS idx_wres_window    ON lab_window_results(window_idx, passed);
 """
 
 
@@ -164,6 +197,8 @@ def run_migrations():
         conn.execute("ALTER TABLE trades ADD COLUMN session TEXT")
     if "order_id" not in existing_cols:
         conn.execute("ALTER TABLE trades ADD COLUMN order_id TEXT")
+    if "tp1_partial_done" not in existing_cols:
+        conn.execute("ALTER TABLE trades ADD COLUMN tp1_partial_done INTEGER DEFAULT 0")
     candle_cols = {row[1] for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
     if "source" not in candle_cols:
         conn.execute("ALTER TABLE candles ADD COLUMN source TEXT NOT NULL DEFAULT 'bitget'")
@@ -172,6 +207,9 @@ def run_migrations():
         conn.execute("ALTER TABLE active_deployments ADD COLUMN target_trades INTEGER NOT NULL DEFAULT 50")
     if "go_live_notified" not in dep_cols:
         conn.execute("ALTER TABLE active_deployments ADD COLUMN go_live_notified INTEGER NOT NULL DEFAULT 0")
+    ld_cols = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    if "cooldown_bars" not in ld_cols:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN cooldown_bars INTEGER DEFAULT 0")
     sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
     if "signal_key" not in sig_cols:
         conn.execute("ALTER TABLE signals ADD COLUMN signal_key TEXT")
@@ -179,6 +217,43 @@ def run_migrations():
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_signal_key
            ON signals(signal_key) WHERE signal_key IS NOT NULL"""
     )
+    # asset_requests (additive — safe on existing DBs)
+    req_cols = {row[1] for row in conn.execute("PRAGMA table_info(asset_requests)").fetchall()}
+    if not req_cols:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS asset_requests (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset        TEXT NOT NULL UNIQUE,
+                requested_at TEXT NOT NULL,
+                requested_by TEXT NOT NULL DEFAULT 'telegram',
+                status       TEXT NOT NULL DEFAULT 'pending',
+                note         TEXT
+            );
+        """)
+    # lab_window_results — idempotent via DDL (CREATE TABLE IF NOT EXISTS)
+    wres_cols = {row[1] for row in conn.execute("PRAGMA table_info(lab_window_results)").fetchall()}
+    if not wres_cols:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS lab_window_results (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                discovery_id INTEGER NOT NULL,
+                window_idx   INTEGER NOT NULL,
+                period_start INTEGER NOT NULL,
+                period_end   INTEGER NOT NULL,
+                n_train      INTEGER,
+                pf_train     REAL,
+                avg_r_train  REAL,
+                n_test       INTEGER,
+                pf_test      REAL,
+                avg_r_test   REAL,
+                wr_test      REAL,
+                max_dd_r     REAL,
+                passed       INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(discovery_id, window_idx)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wres_discovery ON lab_window_results(discovery_id);
+            CREATE INDEX IF NOT EXISTS idx_wres_window    ON lab_window_results(window_idx, passed);
+        """)
     conn.commit()
     conn.close()
 

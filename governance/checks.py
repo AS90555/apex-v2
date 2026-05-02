@@ -9,6 +9,7 @@ Reihenfolge (in gate.py registriert):
   5. check_sizing_sanity      — Balance > MIN_BALANCE, SL plausibel
   6. check_position_open      — Asset bereits in offener Position
   7. check_session_traded     — Bereits in dieser Session gehandelt
+  8. check_btc_cross_asset    — Soft-Filter: BTC-Regime als Markt-Kontext (Phase 1: nur logging)
 """
 
 import json
@@ -176,6 +177,8 @@ class SessionTradedCheck(BaseGovernanceCheck):
         return "session_traded"
 
     def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        if signal.session is None:
+            return True, "session_trades_today=skip(no_session)"
         conn = get_connection()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute(
@@ -189,3 +192,75 @@ class SessionTradedCheck(BaseGovernanceCheck):
         if count > 0:
             return False, f"session_already_traded: {signal.asset}/{signal.session} count={count}"
         return True, f"session_trades_today={count}"
+
+
+class CrossAssetRegimeCheck(BaseGovernanceCheck):
+    """
+    Phase 1 (Soft-Filter): BTC als Markt-Führungsindikator.
+
+    Prüft ob das Signal-Asset gegen das BTC-Regime handelt:
+      - Long-Signal + BTC TREND_DOWN → btc_contra=True
+      - Short-Signal + BTC TREND_UP  → btc_contra=True
+      - BTC SIDEWAYS oder Asset=BTC  → neutral, immer approved
+
+    Phase 1: blockiert NIE — gibt immer True zurück, schreibt btc_contra
+    in den reason-String für spätere Auswertung im governance_log.
+
+    Aktivierung als Hard-Filter: CROSS_ASSET_HARD_REJECT = True setzen
+    sobald Datenbasis aus Phase 1 vorliegt (empfohlen: nach 30+ Trades).
+    """
+
+    CROSS_ASSET_HARD_REJECT = False   # Phase 1: nur loggen
+    REGIME_MAX_AGE_MIN      = 15      # BTC-Regime älter als 15 Min → skip
+
+    @property
+    def name(self) -> str:
+        return "btc_cross_asset"
+
+    def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        # BTC-Signale prüfen sich nicht selbst
+        if signal.asset == "BTC":
+            return True, "btc_cross_asset=skip(self)"
+
+        # BTC-Regime aus system_state lesen
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT value, updated_at FROM system_state WHERE key='regime_BTC'",
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return True, "btc_cross_asset=skip(no_btc_regime)"
+
+        # Alter prüfen — veraltetes Regime nicht als Signal werten
+        try:
+            ts = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+            if age_min > self.REGIME_MAX_AGE_MIN:
+                return True, f"btc_cross_asset=skip(regime_stale_{age_min:.0f}min)"
+        except Exception:
+            return True, "btc_cross_asset=skip(ts_parse_error)"
+
+        btc_regime = row[0]
+
+        # Nur bei klarem BTC-Trend prüfen — SIDEWAYS/UNKNOWN ist neutral
+        if btc_regime not in ("TREND_UP", "TREND_DOWN"):
+            return True, f"btc_cross_asset=neutral(btc={btc_regime})"
+
+        direction  = signal.direction.lower()
+        contra     = (
+            (direction == "long"  and btc_regime == "TREND_DOWN") or
+            (direction == "short" and btc_regime == "TREND_UP")
+        )
+
+        if contra:
+            reason = f"btc_cross_asset=CONTRA(btc={btc_regime} signal={direction})"
+            log(f"[CrossAsset] {signal.asset} {direction.upper()} gegen BTC {btc_regime} "
+                f"— {'BLOCKED' if self.CROSS_ASSET_HARD_REJECT else 'soft_flag'}")
+            if self.CROSS_ASSET_HARD_REJECT:
+                return False, reason
+            return True, reason   # Phase 1: durchlassen, aber markieren
+
+        return True, f"btc_cross_asset=aligned(btc={btc_regime} signal={direction})"

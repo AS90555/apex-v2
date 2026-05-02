@@ -32,6 +32,7 @@ from governance.checks import (
     SizingSanityCheck,
     PositionOpenCheck,
     SessionTradedCheck,
+    CrossAssetRegimeCheck,
 )
 
 
@@ -123,6 +124,7 @@ def main():
         SizingSanityCheck(),
         PositionOpenCheck(),
         SessionTradedCheck(),
+        CrossAssetRegimeCheck(),
     ])
 
     conn = get_connection()

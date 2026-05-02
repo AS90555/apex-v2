@@ -28,6 +28,7 @@ MAX_SL_DISTANCE_PCT = 0.10
 
 # ── Micro-Account Position Sizing ────────────────────────────────────────────
 RISK_USDT          = 1.50    # Festes Risiko pro Trade in USDT
+MAX_OPEN_RISK_USDT = 4.50    # Max. gebundenes Risiko aller offenen Positionen (= 3R)
 MIN_NOTIONAL       = 5.0     # Bitget Mindest-Order-Volumen in USDT
 TARGET_NOTIONAL    = 6.0     # Zielbetrag wenn unter MIN_NOTIONAL (etwas Puffer)
 MAX_LEVERAGE       = 20      # Hartes Leverage-Limit — darüber: Trade abgelehnt
@@ -67,7 +68,7 @@ HEARTBEAT_TTL_DAYS = 7
 
 # ── Governance ───────────────────────────────────────────────────────────────
 # Signal älter als N Minuten → direkt auf 'expired' setzen
-SIGNAL_EXPIRY_MINUTES = 30
+SIGNAL_EXPIRY_MINUTES = 60
 
 # ── Strategie-Modi ───────────────────────────────────────────────────────────
 # 'shadow'  → Signal wird geloggt, aber nie an Execution übergeben
