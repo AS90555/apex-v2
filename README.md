@@ -2,14 +2,30 @@
 
 Ein vollständig automatisiertes Algorithmic-Trading-System für Bitget Futures (Micro-Account, USDT-M Perpetuals). Gebaut auf einer sauberen Daten-Pipeline, zentralem Feature-Layer, separatem Governance-Gate und einem selbstlernenden Research-Lab.
 
-> **Status:** Aktiver Forschungs- und Shadow-Betrieb. Kein Live-Trading ohne explizite Freigabe per Telegram-Bot.
+> **Status:** Aktiver Live-Betrieb. SOL läuft live, BTC/XRP im Paper-Trading (Dry-Run), weitere Assets im Shadow-Monitoring.
+
+---
+
+## Aktueller Betriebsstatus (Stand: Mai 2026)
+
+| Asset | Modus | Strategie | MS | PF | WR | Regime |
+|-------|-------|-----------|-----|-----|-----|--------|
+| SOL | 💰 **LIVE** | donchian_breakout | 22.8 | 2.37 | 64% | SIDEWAYS |
+| XRP | ⚙️ Dry-Run | inside_bar_breakout | 21.7 | 2.40 | 66% | SIDEWAYS |
+| BTC | ⚙️ Dry-Run | donchian_breakout | 12.6 | 1.96 | 57% | SIDEWAYS |
+| LINK | 👁️ Shadow | donchian_breakout | 26.7 | 2.51 | 63% | SIDEWAYS |
+| AVAX | 👁️ Shadow | donchian_breakout | 22.6 | 2.60 | 68% | SIDEWAYS |
+| ADA | 👁️ Shadow | donchian_breakout | 31.7 | 2.85 | 70% | SIDEWAYS |
+| ETH | ⏸️ Pausiert | — | — | — | — | — |
+
+Alle Deployments basieren auf Lab-Discoveries mit `cooldown_bars=8` (8h Mindestabstand zwischen Trades) und bestandenem Walk-Forward-OOS-Test.
 
 ---
 
 ## Architektur
 
 ```
-Cron (alle 5 Min.)
+Cron (alle 5 Min.) → master_run.py (sequenziell, kein Subprocess-Overhead)
     │
     ▼
 [Data Intake]  ←── Bitget WebSocket (Live) + Binance REST (History)
@@ -18,7 +34,7 @@ Cron (alle 5 Min.)
 [Feature Registry]  ←── EMA, ATR, Bollinger, Volume-SMA, Regime-Detektor
     │                    Ergebnisse gecacht in features-Tabelle
     ▼
-[Strategy Layer]  ←── 7 Strategien generieren Signale (kein Order-Code!)
+[Strategy Layer]  ←── 10 Strategien generieren Signale via GenericDeployedStrategy
     │                  Signale → signals-Tabelle mit status='pending'
     ▼
 [Governance Gate]  ←── Risiko-Checks: DD-Kill-Switch, Regime, Position offen,
@@ -32,18 +48,24 @@ Cron (alle 5 Min.)
 [Monitor]  ←── Break-Even SL, Exit-Tracking, Heartbeats
     │
     ▼
-[Telegram Bot]  ←── Vollständiges Dashboard, CIO-Portfolio-Empfehlung,
-                     Alpha-Library, Deploy-Buttons, API-Diagnose
+[Telegram Bot]  ←── Vollständiges Dashboard, Portfolio Manager,
+                     Lab-Screens, Deploy-Buttons, API-Diagnose
 ```
 
-Parallel dazu läuft dauerhaft:
+Parallel dazu laufen dauerhaft:
 
 ```
+[intake_ws.py]     ←── Bitget WebSocket-Verbindung (Candle-Stream, 24/7)
+
 [Auto-Lab Daemon]  ←── Walk-Forward-Optimierung über 730 Tage History
-    │                   49 Kombinationen (7 Strategien × 7 Assets)
+    │                   70 Kombinationen (10 Strategien × 7 Assets)
     │                   Monte-Carlo + Grid-Search, Ruin-Filter, WR-Filter
+    │                   cooldown_bars=8 in jedem Backtest
     ▼
-[lab_discoveries]  ←── Validierte Setups (OOS-PF ≥ 1.30, WR ≥ 48%)
+[lab_discoveries]  ←── Validierte Setups (OOS-PF ≥ 1.30, WR ≥ 48%, n ≥ 40)
+    ▼
+[GenericDeployedStrategy]  ←── Universeller Live-Signal-Generator für alle
+                                Lab-Discoveries ohne separate Strategy-Datei
     ▼
 [Autopilot]        ←── Regime-Wechsel → automatisches Deploy des besten Setups
 ```
@@ -55,12 +77,12 @@ Parallel dazu läuft dauerhaft:
 | Asset | Intervalle | Bemerkung |
 |-------|-----------|-----------|
 | BTC | 5m, 15m, 1h | Basisasset, liquidester Markt |
-| ETH | 5m, 15m, 1h, 4h | Champion: Squeeze PF=1.14 OOS |
-| SOL | 5m, 15m, 1h | Hohe Volatilität, gute Signaldichte |
-| XRP | 5m, 15m, 1h | — |
-| ADA | 5m, 15m, 1h | — |
-| LINK | 5m, 15m, 1h | — |
-| AVAX | 5m, 15m, 1h | — |
+| ETH | 5m, 15m, 1h, 4h | Pausiert nach Cooldown-Rebacktest |
+| SOL | 5m, 15m, 1h | Erstes Live-Asset |
+| XRP | 5m, 15m, 1h | Dry-Run: inside_bar_breakout |
+| ADA | 5m, 15m, 1h | Shadow-Monitoring |
+| LINK | 5m, 15m, 1h | Shadow-Monitoring |
+| AVAX | 5m, 15m, 1h | Shadow-Monitoring |
 
 Historische Daten: 730 Tage via Binance (ccxt), Live-Feed via Bitget WebSocket.
 
@@ -77,10 +99,14 @@ Historische Daten: 730 Tage via Binance (ccxt), Live-Feed via Bitget WebSocket.
 | `ema_pullback` | EMA200-Trend + EMA50-Pullback + Bestätigungskerze | Long & Short |
 | `donchian_breakout` | N-Bar-Hoch/-Tief-Ausbruch + Volumen- und ATR-Filter | Long & Short |
 | `inside_bar_breakout` | Kompressions-Setup (Inside Bar) + Trendfilter | Long & Short |
+| `dual_donchian` | Langer Kanal für Entry, kurzer Kanal für Exit + ATR-Filter | Long & Short |
+| `bb_kc_squeeze` | Squeeze wenn BB-Breite < KC-Breite, Signal bei Release + Momentum | Long & Short |
+| `supertrend` | 3× Supertrend mit verschiedenen Parametern, Signal nur bei Richtungswechsel aller 3 | Long & Short |
 
 Jedes Backtest-Setup durchläuft:
 1. **Train-Phase** (70% des 2J-Fensters) — Parameter-Optimierung
 2. **Test-Phase / OOS** (30%) — Validierung, nur dieser Zeitraum zählt
+3. **Cooldown-Simulation** (`cooldown_bars=8`) — 8h Mindestabstand zwischen Trades im Backtest
 
 ---
 
@@ -92,10 +118,12 @@ Jedes Backtest-Setup durchläuft:
 | `MIN_NOTIONAL` | $5.00 | Bitget Mindest-Ordervolumen |
 | `MAX_LEVERAGE` | 20× | Hartes Hebel-Limit |
 | `DRAWDOWN_KILL_PCT` | 50% | Kill-Switch ab 50% Drawdown vom HWM |
-| `DAILY_DD_KILL_R` | −2R | Tages-DD-Stopp |
+| `DAILY_DD_HALF_R` | −1.5R | Tages-DD: halbe Position ab hier |
+| `DAILY_DD_KILL_R` | −2.0R | Tages-DD-Stopp: kein weiterer Trade |
 | `MIN_WR_TEST` (Lab) | 48% | Mindest-Win-Rate im OOS-Fenster |
 | `MIN_PF_TEST` (Lab) | 1.30 | Mindest-Profit-Factor OOS |
 | `MAX_DRAWDOWN_PERCENT` (Lab) | 25% | Ruin-Filter: Max. Kontoeinbruch |
+| `cooldown_bars` (Lab) | 8 | Mindest-Bars zwischen Trades im Backtest |
 
 Position Sizing:
 ```
@@ -112,11 +140,11 @@ Jede Strategie/Asset-Kombination kann unabhängig konfiguriert werden:
 
 | Modus | Verhalten |
 |-------|-----------|
-| `shadow` | Signal wird geloggt, nie ausgeführt |
-| `dry_run` | Execution simuliert Order lokal, kein API-Call |
+| `shadow` | Signal wird geloggt, nie ausgeführt — reines Monitoring |
+| `dry_run` | Paper-Trade: Signal wird simuliert und getrackt, kein API-Call |
 | `live` | Echter Order an Bitget |
 
-Konfiguration in `config/settings.py` → `STRATEGY_MODES`.
+Upgrade-Pfad: Shadow → Dry-Run (manuell per Telegram) → Live (manuell nach Dry-Run-Bestätigung).
 
 ---
 
@@ -130,13 +158,16 @@ apex-v2/
 ├── core/
 │   ├── db.py                # SQLite-Verbindung, WAL-Mode, Migrationen
 │   ├── models.py            # Dataclasses: Signal, Trade, Candle
+│   ├── autopilot.py         # Regime-Switching, Deploy-Logik
 │   └── utils.py             # Logging, Zeitzone
 ├── intake/
-│   └── intake_ws.py         # Bitget WebSocket → SQLite (Live-Feed)
+│   └── intake_ws.py         # Bitget WebSocket → SQLite (Live-Feed, dauerhaft)
 ├── features/
 │   ├── indicators.py        # EMA, ATR, RSI, Bollinger, VWAP, Regime
 │   └── registry.py          # Feature-Cache-Layer
-├── strategies/              # Signal-Generatoren (kein Order-Code)
+├── strategies/
+│   ├── base.py              # BaseStrategy ABC
+│   └── generic_deployed.py  # Universeller Live-Signal-Generator für Lab-Discoveries
 ├── governance/
 │   ├── checks.py            # Einzelne Risk-Checks als Funktionen
 │   └── gate.py              # Orchestrierung → approved/rejected
@@ -144,23 +175,22 @@ apex-v2/
 │   ├── executor.py          # Einziger Order-Sender
 │   └── bitget_client.py     # Bitget REST API Client
 ├── backtest/
-│   └── engine.py            # Alle 7 Strategien als Backtest-Signalgeneratoren
+│   └── engine.py            # Alle 10 Strategien als Backtest-Signalgeneratoren (SIGNAL_FNS)
 ├── research/
-│   └── auto_lab_daemon.py   # Walk-Forward-Lab (läuft dauerhaft)
+│   └── auto_lab_daemon.py   # Walk-Forward-Lab (läuft dauerhaft, 70 Kombinationen)
 ├── monitor/
 │   ├── position_monitor.py  # Break-Even, Exit-Tracking
 │   ├── heartbeat.py         # Systemgesundheit
-│   └── telegram_bot.py      # Vollständiger Bot (Dashboard, Deploy, CIO)
+│   └── telegram_bot.py      # Vollständiger Bot (Dashboard, Lab, Portfolio Manager)
 ├── api/
 │   └── server.py            # Read-only REST API (Port 8890)
 ├── scripts/
-│   ├── run_intake.py        # Cron: Kerzen holen
-│   ├── run_features.py      # Cron: Features + Regime berechnen
-│   ├── run_strategies.py    # Cron: Signale generieren
-│   ├── run_governance.py    # Cron: Signale prüfen
-│   ├── run_execution.py     # Cron: Approved Signale ausführen
-│   ├── run_monitor.py       # Cron: Positionen überwachen
-│   └── master_run.py        # Optionaler All-in-One-Runner
+│   ├── run_features.py      # Pipeline-Schritt: Features + Regime berechnen
+│   ├── run_strategies.py    # Pipeline-Schritt: Signale generieren
+│   ├── run_governance.py    # Pipeline-Schritt: Signale prüfen
+│   ├── run_execution.py     # Pipeline-Schritt: Approved Signale ausführen
+│   ├── run_monitor.py       # Pipeline-Schritt: Positionen überwachen
+│   └── master_run.py        # Haupt-Runner: alle Schritte sequenziell in einem Prozess
 └── data/
     └── apex_v2.db           # SQLite (WAL-Mode)
 ```
@@ -181,7 +211,7 @@ apex-v2/
 | `active_deployments` | Aktuell laufende Lab-Setups mit Trade-Zähler |
 | `system_state` | Key-Value-State: Regime, HWM, Daily-PnL |
 | `heartbeats` | Systemgesundheit aller Komponenten |
-| `opening_ranges` | ORB-Boxen historisiert |
+| `asset_requests` | Vom Nutzer angefragte neue Assets für das Lab |
 
 ---
 
@@ -213,10 +243,6 @@ TELEGRAM_CHAT_ID=...
 APEX_V2_API_TOKEN=...    # Für die Read-only REST API
 ```
 
-```bash
-source config/.env   # oder in Shell-Profil eintragen
-```
-
 ### Datenbank initialisieren
 
 ```bash
@@ -229,67 +255,85 @@ python3 -c "from core.db import run_migrations; run_migrations()"
 python3 scripts/fetch_binance_history.py   # 730 Tage × 7 Assets × 1h
 ```
 
-### Live-Feed starten
+### Dauerhaft laufende Prozesse starten
 
 ```bash
-# WebSocket Intake (im Hintergrund)
+# WebSocket Intake (Candle-Stream, 24/7)
 nohup python3 intake/intake_ws.py >> logs/intake_ws.log 2>&1 &
 
 # Telegram Bot
 nohup python3 monitor/telegram_bot.py >> logs/telegram_bot.log 2>&1 &
 
-# Auto-Lab (dauerhaft recherchieren)
+# Auto-Lab (dauerhaft neue Setups suchen)
 nohup python3 research/auto_lab_daemon.py >> logs/lab_daemon.log 2>&1 &
 ```
 
-### Crontab (empfohlen)
+### Crontab
 
 ```cron
-# APEX V2 — alle 5 Minuten, versetzt
-*/5 * * * *  python3 /root/apex-v2/scripts/run_intake.py    >> /root/apex-v2/logs/intake.log 2>&1
-*/5 * * * *  sleep 20 && python3 /root/apex-v2/scripts/run_features.py  >> /root/apex-v2/logs/features.log 2>&1
-*/5 * * * *  sleep 40 && python3 /root/apex-v2/scripts/run_strategies.py >> /root/apex-v2/logs/strategies.log 2>&1
-*/5 * * * *  sleep 60 && python3 /root/apex-v2/scripts/run_governance.py  >> /root/apex-v2/logs/governance.log 2>&1
-*/5 * * * *  sleep 80 && python3 /root/apex-v2/scripts/run_execution.py   >> /root/apex-v2/logs/execution.log 2>&1
-*/5 * * * *  sleep 100 && python3 /root/apex-v2/scripts/run_monitor.py   >> /root/apex-v2/logs/monitor.log 2>&1
+# APEX V2 — Master-Pipeline alle 5 Minuten (sequenziell, kein sleep-Hack)
+*/5 * * * *  cd /root/apex-v2 && python3 scripts/master_run.py >> logs/master.log 2>&1
+
+# API-Server (nur starten wenn nicht läuft)
+5 4 * * *    pgrep -f "api/server.py" || (cd /root/apex-v2 && nohup python3 api/server.py >> logs/api.log 2>&1 &)
 ```
 
 ---
 
-## Telegram-Bot Befehle
+## Telegram-Bot
 
-| Befehl | Funktion |
+Der Bot bietet ein vollständiges Interface über Inline-Buttons ohne manuelle Befehle eingeben zu müssen.
+
+| Screen | Inhalt |
 |--------|---------|
-| Dashboard | Systemstatus, offene Positionen, heutige P&L |
-| Alpha Setups | Lab-Discoveries sortiert nach Micro-Score |
-| 💼 Portfolio Empfehlung | CIO-Modus: bestes Setup je Asset/Regime, Deploy-Buttons |
-| ⚙️ Status | Heartbeats aller Komponenten |
-| 🔌 API Test | Bitget-Verbindung testen, Balance + Contract Limits |
-| `/deploy <ID>` | Setup aus der Alpha-Library deployen |
-| `/portfolio` | CIO-Portfolio-Übersicht |
+| 📊 Überblick | Performance, aktive Strategien, Fortschrittsbalken, Markt-Wetter |
+| 💰 Strategien | Verwaltung aktiver Deployments, Modus-Wechsel |
+| 🏆 Top Setups | Beste Lab-Discoveries nach Micro-Score, Deploy-Buttons |
+| 📂 Offene Trades | Laufende Positionen mit Live-PnL |
+| 🔬 Labor | Lab-Status, Suchraum, Lernkurve, Heatmap, Funde |
+| ⚙️ System | Heartbeats aller Komponenten, Server-Ressourcen, letzte Trades |
+| 📊 Portfolio Manager | Nach Asset/Strategie/Regime filtern, Regime-Fit-Check |
 
 ---
 
 ## Auto-Lab — Wie es funktioniert
 
 ```
-Für jede (strategie, asset)-Kombination alle ~60s:
+Für jede (strategie, asset)-Kombination (70 total), ~alle 60s eine Iteration:
   1. Regime im OOS-Fenster bestimmen (EMA50-Slope + ATR-Volatilität)
   2. 20 Parameter-Sets samplen (50% Monte-Carlo, 50% Grid)
-  3. Walk-Forward-Backtest: Train (70%) → Test (30%)
+  3. Walk-Forward-Backtest mit cooldown_bars=8:
+       Train (70% von 730 Tagen) → Parameter-Optimierung
+       Test  (30% von 730 Tagen) → OOS-Validierung
   4. Filter-Gauntlet:
        n_test ≥ 40        (statistische Signifikanz)
        PF_test ≥ 1.30     (positiver Edge)
        WR_test ≥ 48%      (psychologisch tradebar)
        AvgR_test ≥ 0.08R  (ausreichende Effizienz)
-       Ruin-Filter: Max-DD ≤ $14 (25% von $56 Startkapital)
+       Ruin-Filter: Max-DD ≤ 25% des Startkapitals
        Overfit-Check: |AvgR_train - AvgR_test| ≤ 0.15R
-  5. Micro-Score = PF / (MaxDD_USDT / Startkapital)
-     → Belohnt hohen Edge bei minimalem Kontorisiko
+  5. Micro-Score = PF_factor × Calmar_factor × n_factor
+       PF_factor   = min(PF_test / 1.3, 3.0)
+       Calmar_factor = min(AvgR / MaxDD_R / 0.20, 2.0)   ← Normierung bei 0.20
+       n_factor    = min(n_test / 40, 2.0)
   6. Neuer Highscore → Telegram-Notification + DB-Eintrag
 ```
 
 Validierte Setups landen in `lab_discoveries` und können per Bot oder Autopilot deployed werden.
+
+---
+
+## GenericDeployedStrategy
+
+Alle Lab-Discoveries nutzen denselben universellen Signal-Generator statt separater Strategy-Dateien:
+
+```python
+# Lädt alle aktiven Deployments und nutzt SIGNAL_FNS[base_strategy] direkt
+strategies = load_deployed_strategies()
+# → Eine Instanz pro aktivem Deployment, dieselbe Backtest-Logik live
+```
+
+Vorteile: Jede neue Strategie im Lab wird automatisch live-fähig sobald sie in `SIGNAL_FNS` registriert ist. Keine separate Strategy-Datei nötig.
 
 ---
 
@@ -310,10 +354,11 @@ Regime-Wechsel erkannt
 
 - **Kein Schreiben über API**: Die REST API (Port 8890) ist vollständig read-only
 - **Idempotente Execution**: `UPDATE ... WHERE status='approved'` atomar — kein Doppel-Trade möglich
-- **Shadow-First**: Jede neue Strategie startet im `shadow`-Modus, manueller Schritt zu `dry_run` / `live`
+- **Cooldown im Backtest**: `cooldown_bars=8` stellt sicher dass Lab-Scores nicht durch Overtrading aufgebläht werden
 - **Ruin-Filter im Lab**: Kein Setup mit theoretischem Kontoeinbruch > 25% wird deployed
 - **Kill-Switches**: Tages-DD (−2R) und Gesamt-DD (−50% HWM) stoppen automatisch alle Trades
-- **WAL-Mode**: SQLite mit Write-Ahead-Logging — parallele Reads (Dashboard, Monitor) ohne Locking
+- **WAL-Mode**: SQLite mit Write-Ahead-Logging — parallele Reads ohne Locking
+- **Signal-Deduplication**: `signal_key` (strategy + asset + session + datum) verhindert Doppel-Signale
 
 ---
 
