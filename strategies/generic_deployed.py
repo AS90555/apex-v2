@@ -143,21 +143,25 @@ class GenericDeployedStrategy(BaseStrategy):
             conn.close()
             return []
 
-        # Aktueller Marktpreis (WS-Kerze) für Entry verwenden — nicht der 1h-alte Close
-        cur_row = conn.execute(
-            "SELECT close FROM candles WHERE asset=? AND interval='1h' ORDER BY ts DESC LIMIT 1",
-            (self._asset,),
-        ).fetchone()
-
         dec_size  = SIZE_DECIMALS.get(self._asset, 2)
         dec_price = PRICE_DECIMALS.get(self._asset, 2)
 
-        # Entry-Preis: aktueller Marktpreis wenn verfügbar und > 0, sonst Signal-Close
+        # Fix B: entry_price == Signal-Close — identisch zum Backtest, parity_test-kompatibel
         entry_price = bt_sig.entry_price
-        if cur_row and cur_row[0] and cur_row[0] > 0:
-            entry_price = round(cur_row[0], dec_price)
 
-        # SL/TP-Abstände bleiben relativ zum Signal-Close (Backtestlogik korrekt)
+        # Fix A: Zeitfilter auf geschlossene Kerzen (ts < candle_open)
+        # Fix C: Marktpreis nur für Drift-Monitoring, nicht als Entry-Override
+        cur_row = conn.execute(
+            "SELECT close FROM candles WHERE asset=? AND interval='1h' AND ts < ? ORDER BY ts DESC LIMIT 1",
+            (self._asset, candle_open),
+        ).fetchone()
+        if cur_row and cur_row[0] and cur_row[0] > 0:
+            market_price = round(cur_row[0], dec_price)
+            drift_pct = abs(market_price - entry_price) / entry_price * 100
+            if drift_pct > 0.5:
+                log(f"[{self._key}] DRIFT {drift_pct:.2f}%: signal={entry_price} market={market_price}")
+
+        # SL/TP-Distanzen relativ zum Signal-Close — bit-identisch zum Backtest
         sl_dist_orig = abs(bt_sig.entry_price - bt_sig.stop_loss)
         tp1_dist     = abs(bt_sig.entry_price - bt_sig.take_profit_1)
         tp2_dist     = abs(bt_sig.entry_price - bt_sig.take_profit_2)

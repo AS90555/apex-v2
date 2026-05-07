@@ -171,7 +171,10 @@ class SqueezeStrategy(BaseStrategy):
                 status="pending",
                 mode=mode,
             )
-            _save_signal(conn, sig)
+            row_id = _save_signal(conn, sig)
+            if row_id == 0:
+                log(f"[{self.name}] {asset}: Signal heute bereits vorhanden — überspringe (Dedup)")
+                continue
             log(f"[{self.name}] {asset} {direction.upper()} @ {entry:.2f} "
                 f"SL={sl:.2f} TP={tp:.2f} mode={mode}")
             signals.append(sig)

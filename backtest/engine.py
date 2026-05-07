@@ -1102,6 +1102,28 @@ INTERVAL_MS = {
 }
 
 
+def _apply_trade_costs(trade: BtTrade) -> BtTrade:
+    """
+    Zieht Transaktionskosten vom abgeschlossenen Trade ab.
+    Kostenmodell: Round-Trip-Fee+Slippage + Funding proportional zur Haltedauer.
+    """
+    from config.settings import ROUND_TRIP, FUNDING_8H
+    sig      = trade.signal
+    notional = sig.entry_price * sig.size          # Positionsgröße in USD
+    rt_cost  = notional * ROUND_TRIP               # Ein- + Ausstiegskosten
+
+    periods  = (trade.exit_ts - trade.entry_ts) / (8 * 3_600_000) if trade.exit_ts else 0
+    funding  = notional * FUNDING_8H * periods     # Funding proportional zur Dauer
+
+    total_cost = rt_cost + funding
+    sl_dist    = abs(sig.entry_price - sig.stop_loss)
+    denominator = sl_dist * sig.size
+
+    trade.pnl_usd = round(trade.pnl_usd - total_cost, 4)
+    trade.pnl_r   = round(trade.pnl_usd / denominator, 3) if denominator > 0 else 0.0
+    return trade
+
+
 def run_backtest(
     strategy: str,
     asset: str,
@@ -1111,6 +1133,7 @@ def run_backtest(
     max_exit_bars: int = 48,
     cooldown_bars: int = 0,
     verbose: bool = False,
+    apply_costs: bool = True,
 ) -> BtResult:
     """
     Führt einen Backtest für eine Strategie auf einem Asset durch.
@@ -1122,6 +1145,7 @@ def run_backtest(
         end_ts:        End-Timestamp ms (Unix)
         cfg:           Strategy-Parameter (Standard aus config/settings.py)
         max_exit_bars: Maximale Bars bis Timeout-Exit
+        apply_costs:   Transaktionskosten (Fees + Slippage + Funding) einrechnen
         verbose:       Detaillierte Bar-Logs
 
     Returns:
@@ -1164,6 +1188,8 @@ def run_backtest(
         if open_trade and not open_trade.closed and ts > open_trade.signal.ts:
             open_trade = _simulate_exit(conn, open_trade, asset, exit_intv, max_exit_bars)
             if open_trade.closed:
+                if apply_costs:
+                    open_trade = _apply_trade_costs(open_trade)
                 result.trades.append(open_trade)
                 if verbose:
                     log(f"[BACKTEST]   EXIT {open_trade.exit_reason} "
@@ -1189,6 +1215,8 @@ def run_backtest(
     if open_trade and not open_trade.closed:
         open_trade = _simulate_exit(conn, open_trade, asset, exit_intv, max_exit_bars)
         if open_trade.closed:
+            if apply_costs:
+                open_trade = _apply_trade_costs(open_trade)
             result.trades.append(open_trade)
 
     conn.close()

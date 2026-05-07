@@ -21,9 +21,13 @@ from core.db import get_connection, run_migrations
 from core.utils import log
 
 ASSETS = {
-    "ETH": "ETH/USDT:USDT",
-    "BTC": "BTC/USDT:USDT",
-    "SOL": "SOL/USDT:USDT",
+    "BTC":  "BTC/USDT:USDT",
+    "ETH":  "ETH/USDT:USDT",
+    "SOL":  "SOL/USDT:USDT",
+    "XRP":  "XRP/USDT:USDT",
+    "ADA":  "ADA/USDT:USDT",
+    "LINK": "LINK/USDT:USDT",
+    "AVAX": "AVAX/USDT:USDT",
 }
 INTERVAL  = "1h"
 DAYS_BACK = 730   # 2 Jahre
@@ -102,14 +106,24 @@ def main():
     for asset, symbol in ASSETS.items():
         fetch_and_store(ex, asset, symbol, DAYS_BACK)
 
-    log(f"[BINANCE] Alle Assets geladen ({(time.monotonic()-t0):.0f}s) — starte Feature-Berechnung")
+    elapsed = time.monotonic() - t0
+    log(f"[BINANCE] Alle Assets geladen ({elapsed:.0f}s) — starte Feature-Berechnung")
 
     from features.feature_agent import run_all_features
     matrix = {asset: [INTERVAL] for asset in ASSETS}
     run_all_features(matrix)
 
-    log("[BINANCE] Features berechnet — Deep Backtest kann gestartet werden")
-    log("[BINANCE] Befehl: python3 backtest/runner.py --all --days 730")
+    log("[BINANCE] Features berechnet — Lab kann jetzt alle WF-Fenster abdecken")
+
+    # Kurze Verifikation: frühester Candle pro Asset
+    conn = get_connection()
+    for asset in ASSETS:
+        row = conn.execute(
+            "SELECT MIN(datetime(ts/1000,'unixepoch')), COUNT(*) FROM candles WHERE asset=? AND interval='1h'",
+            (asset,),
+        ).fetchone()
+        log(f"[BINANCE] {asset}: {row[1]} 1h-Candles | frühester: {row[0]}")
+    conn.close()
 
 
 if __name__ == "__main__":

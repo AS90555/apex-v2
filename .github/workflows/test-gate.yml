@@ -1,0 +1,32 @@
+name: Test Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: pytest
+        run: pytest tests/ -v
+
+      - name: Parity Test (Backtest == Live)
+        run: python tests/parity_test.py
+
+      - name: Governance Invariants
+        run: python tests/governance_invariants.py

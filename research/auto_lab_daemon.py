@@ -75,36 +75,43 @@ def log(msg: str):
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
 DAYS = 730  # Gesamtzeitraum für Backtest-Daten in Tagen
-COOLDOWN_BARS = 8  # Bars Pause nach jedem Exit (8h bei 1h-Strategien = eine Session)
+COOLDOWN_BARS = 4  # Bars Pause nach jedem Exit (4h = halbe Session → mehr Signalchancen)
+
+# Mindest-Signalfrequenz: ≥2.5 Trades/Woche im OOS-Fenster.
+# Sichert, dass deployed Setups im Live-Betrieb mind. 4x/Woche über 6 Assets feuern.
+MIN_SIGNALS_PER_WEEK = 2.5
 
 # ── Multi-Window OOS Validation ───────────────────────────────────────────────
 # Ersetzt den früheren 70/30-Single-Split.
 # Ein Setup muss ALLE 3 Fenster bestehen — kein Fenster kompensiert das andere.
 # Offsets in Tagen relativ zu now_ms (negativ = Vergangenheit).
 WF_WINDOWS = [
-    # Fenster 1 (alt): 120 Tage OOS
+    # Fenster 1 (alt): 120 Tage OOS — min_n=35 → ≥2/Woche
     {"train_end": -480, "test_start": -480, "test_end": -360,
-     "min_n": 30, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
-     "ruin_filter": False, "weight": 1.0},
-    # Fenster 2 (mittel): 120 Tage OOS
+     "min_n": 35, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": True, "weight": 1.0, "days": 120},
+    # Fenster 2 (mittel): 120 Tage OOS — min_n=35 → ≥2/Woche
     {"train_end": -240, "test_start": -240, "test_end": -120,
-     "min_n": 30, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
-     "ruin_filter": False, "weight": 1.5},
+     "min_n": 35, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": True, "weight": 1.5, "days": 120},
     # Fenster 3 (aktuell): 60 Tage OOS — deployment-relevant, Ruin-Filter aktiv
     {"train_end": -60,  "test_start": -60,  "test_end": 0,
-     "min_n": 20, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
-     "ruin_filter": True, "weight": 2.0},
+     "min_n": 22, "min_pf": 1.20, "min_avg_r": 0.06, "min_wr": 46.0,
+     "ruin_filter": True, "weight": 2.0, "days": 60},
 ]
 TOTAL_WEIGHT = sum(w["weight"] for w in WF_WINDOWS)
 
 # Schwellen für Alpha-Library-Aufnahme (alle Fenster müssen bestehen)
-MIN_PF_TEST         = 1.30   # Autopilot-Deploy-Filter (strenger als OOS-Gate)
+MIN_PF_TEST         = 1.80   # Brutto-Minimum für Netto-PF ≥ 1.3 nach Kosten (ca. 25-35% Abzug)
+MIN_N_TEST_TOTAL    = 100    # Mindest-Gesamtanzahl OOS-Trades über alle 3 Fenster (V-04)
 MIN_PF_TRAIN        = 1.10
 MAX_TRAIN_TEST_DROP = 0.40
 
 # Monte-Carlo vs. Grid: 80% random sampling, 20% Grid-Abdeckung
 MONTE_CARLO_FRAC = 0.80
 BATCH_SIZE       = 20
+N_TRIALS_DAEMON  = 20   # Daemon-Modus (--single-pass): schnellere Rotation
+N_TRIALS_FULL    = 50   # Manueller Aufruf: volle Suchtiefe
 SLEEP_BETWEEN    = 30
 SLEEP_ON_ERROR   = 120
 
@@ -126,6 +133,8 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # damit /lab_stats eine lesbare Top-Liste ausgeben kann.
 _REJECTION_CATEGORY = {
     "n_test":        "zu_wenig_trades",
+    "total_n":       "zu_wenig_trades_gesamt",
+    "freq=":         "zu_selten",
     "pf_test":       "pf_zu_niedrig",
     "wr_test":       "wr_zu_niedrig",
     "avg_r_test":    "avg_r_zu_niedrig",
@@ -454,7 +463,7 @@ def _ensure_schema():
         conn.execute("ALTER TABLE lab_discoveries ADD COLUMN market_regime TEXT NOT NULL DEFAULT 'UNKNOWN'")
         log("[LAB-DAEMON] DB migriert: Spalte market_regime hinzugefügt")
     # Neue Spalten nachrüsten falls Tabelle älter ist
-    for col, definition in [("max_dd_r", "REAL"), ("micro_score", "REAL")]:
+    for col, definition in [("max_dd_r", "REAL"), ("micro_score", "REAL"), ("signals_per_week", "REAL")]:
         if col not in cols:
             conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {definition}")
             log(f"[LAB-DAEMON] DB migriert: Spalte {col} hinzugefügt")
@@ -468,6 +477,14 @@ def _ensure_schema():
         if col not in cols:
             conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {definition}")
             log(f"[LAB-DAEMON] DB migriert: Spalte {col} hinzugefügt")
+    # cost_model_applied nachrüsten (V-01)
+    if "cost_model_applied" not in cols:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN cost_model_applied INTEGER NOT NULL DEFAULT 0")
+        log("[LAB-DAEMON] DB migriert: Spalte cost_model_applied hinzugefügt")
+    # dsr nachrüsten (V-03)
+    if "dsr" not in cols:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN dsr REAL")
+        log("[LAB-DAEMON] DB migriert: Spalte dsr hinzugefügt")
     # Indizes anlegen (Spalten garantiert vorhanden)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_asset_regime ON lab_discoveries(asset, market_regime)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_micro_score ON lab_discoveries(micro_score DESC)")
@@ -605,21 +622,23 @@ def _max_r_drawdown(result) -> float:
     return round(max_dd, 4)
 
 
-def _metrics(result) -> dict:
+def _metrics(result, window_days: int = 0) -> dict:
     s = result.summary()
     n = s["trades"]
     if n == 0:
-        return {"n": 0, "avg_r": 0.0, "pf": 0.0, "wr": 0.0}
+        return {"n": 0, "avg_r": 0.0, "pf": 0.0, "wr": 0.0, "spw": 0.0}
     wins       = [t.pnl_r for t in result.trades if t.pnl_r > 0]
     losses     = [t.pnl_r for t in result.trades if t.pnl_r < 0]
     gross_win  = sum(wins)
     gross_loss = abs(sum(losses))
-    pf = gross_win / gross_loss if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+    pf  = gross_win / gross_loss if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+    spw = round(n / window_days * 7, 2) if window_days > 0 else 0.0
     return {
         "n":     n,
         "avg_r": round(s["avg_r"], 4),
         "pf":    round(pf, 3),
         "wr":    round(s["winrate"], 2),
+        "spw":   spw,  # signals per week
     }
 
 
@@ -663,6 +682,10 @@ def _passes_window(tr: dict, te: dict, max_dd_r: float, wcfg: dict) -> tuple[boo
     """Prüft ein einzelnes OOS-Fenster gegen die Fenster-spezifischen Schwellen."""
     if te["n"] < wcfg["min_n"]:
         return False, f"n_test={te['n']}<{wcfg['min_n']}"
+    # Frequenzfilter: Strategie muss mindestens MIN_SIGNALS_PER_WEEK im OOS-Fenster feuern
+    spw = te["n"] / wcfg["days"] * 7
+    if spw < MIN_SIGNALS_PER_WEEK:
+        return False, f"freq={spw:.2f}/w<{MIN_SIGNALS_PER_WEEK}/w"
     if te["pf"] < wcfg["min_pf"]:
         return False, f"pf_test={te['pf']:.2f}<{wcfg['min_pf']}"
     if te["wr"] < wcfg["min_wr"]:
@@ -685,12 +708,21 @@ def _passes_window(tr: dict, te: dict, max_dd_r: float, wcfg: dict) -> tuple[boo
     return True, ""
 
 
-def _passes(window_results: list[dict]) -> tuple[bool, str]:
+def _passes(window_results: list[dict],
+            pnl_rs_w3: list[float] | None = None,
+            n_tested: int = 1) -> tuple[bool, str | tuple[str, float]]:
     """Multi-Window OOS Validation: alle Fenster müssen bestehen."""
     for i, wr in enumerate(window_results):
         if not wr["passed"]:
             return False, f"w{i+1}_{wr['reason']}"
-    return True, ""
+    total_n = sum(wr["te"]["n"] for wr in window_results)
+    if total_n < MIN_N_TEST_TOTAL:
+        return False, f"total_n={total_n}<{MIN_N_TEST_TOTAL}"
+    # DSR (V-03): berechnen und als Metrik mitgeben — kein Pass/Fail-Filter,
+    # da DSR bei großem N (70+) für alle realen Strategien gegen 0 geht.
+    # Gespeichert in lab_discoveries.dsr für Ranking und spätere Analyse.
+    dsr = _calc_dsr(pnl_rs_w3, n_tested) if pnl_rs_w3 is not None else 0.0
+    return True, ("", dsr)
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
@@ -727,6 +759,7 @@ def _notify_highscore(strategy: str, asset: str, regime: str, params: dict,
     icon       = _REGIME_ICON.get(regime, "❓")
     dd_usdt    = max_dd_r * RISK_PER_TRADE
     ruin_limit = STARTING_CAPITAL * MAX_DRAWDOWN_PERCENT
+    spw        = te.get("spw", 0.0)
     param_lines = "\n".join(f"  `{k}` \\= `{v}`" for k, v in sorted(params.items()))
     msg = (
         f"🏆 *Neuer Micro\\-Score\\-Rekord\\!* \\(Discovery \\#{disc_n}\\)\n"
@@ -735,7 +768,7 @@ def _notify_highscore(strategy: str, asset: str, regime: str, params: dict,
         f"📌 `{strategy}/{asset}`  {icon} `{regime}`\n"
         f"🎯 Score: `{prev_micro:.2f}` → *`{micro_score:.2f}`*\n\n"
         f"*Out\\-of\\-Sample \\(OOS\\):*\n"
-        f"  📊 Trades:   *{te['n']}*\n"
+        f"  📊 Trades:   *{te['n']}*  \\({spw:.1f}/Woche\\)\n"
         f"  💰 PF:       *{te['pf']:.2f}*\n"
         f"  🎰 Win\\-Rate: *{te['wr']:.1f}%*\n"
         f"  📈 Avg R:    *{te['avg_r']:+.3f}R*\n"
@@ -785,20 +818,22 @@ def _save_discovery(conn, h: str, strategy: str, asset: str, regime: str,
                     params: dict, tr: dict, te: dict, fitness: float,
                     max_dd_r: float, micro_score: float,
                     window_results: list[dict] | None = None,
-                    now_ms: int = 0) -> int:
+                    now_ms: int = 0, dsr: float | None = None) -> int:
     cur = conn.execute(
         """INSERT OR IGNORE INTO lab_discoveries
            (discovered_at, params_hash, strategy, asset, market_regime, params_json,
             n_train, pf_train, avg_r_train,
             n_test,  pf_test,  avg_r_test,  wr_test,
-            fitness_score, max_dd_r, micro_score, notified, cooldown_bars)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+            fitness_score, max_dd_r, micro_score, signals_per_week, notified, cooldown_bars,
+            cost_model_applied, dsr)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,1,?)""",
         (
             datetime.now(timezone.utc).isoformat(), h, strategy, asset, regime,
             json.dumps(_round_params(params), sort_keys=True),
             tr["n"], tr["pf"], tr["avg_r"],
             te["n"], te["pf"], te["avg_r"], te["wr"],
-            fitness, max_dd_r, micro_score, COOLDOWN_BARS,
+            fitness, max_dd_r, micro_score, te.get("spw", 0.0), COOLDOWN_BARS,
+            dsr,
         ),
     )
     disc_id = cur.lastrowid
@@ -866,7 +901,7 @@ def get_lab_stats() -> dict:
             has = conn.execute(
                 """SELECT 1 FROM lab_discoveries
                    WHERE asset=? AND market_regime=?
-                     AND micro_score > 0 AND wr_test >= 48.0 AND n_test >= 40
+                     AND micro_score > 0 AND wr_test >= 48.0 AND n_test >= 30
                    LIMIT 1""",
                 (asset, regime),
             ).fetchone()
@@ -897,9 +932,334 @@ def get_lab_stats() -> dict:
     }
 
 
+# ── FDR-Control: Benjamini-Hochberg ──────────────────────────────────────────
+
+def _normal_cdf(z: float) -> float:
+    """Standard-Normal-CDF via math.erfc (keine scipy-Abhängigkeit)."""
+    import math
+    return 0.5 * math.erfc(-z / math.sqrt(2))
+
+
+def _pf_to_pvalue(pf: float, n: int) -> float:
+    """
+    Approximiert p-Wert aus Profit-Factor und Sample-Size.
+    Einseitiger Binomial-Test (WR > 50%) mit Normal-Approximation.
+    Trades sind zeitlich korreliert → p-Werte sind konservativ zu interpretieren.
+    """
+    import math
+    wr  = pf / (1.0 + pf)
+    se  = math.sqrt(wr * (1.0 - wr) / max(n, 1))
+    if se == 0:
+        return 0.0001
+    z = (wr - 0.5) / se
+    return max(0.0001, 1.0 - _normal_cdf(z))
+
+
+def _benjamini_hochberg(pvalues: list[float], q: float) -> list[bool]:
+    """
+    Standard BH-Prozedur: kontrolliert FDR auf Niveau q.
+    Gibt Boolean-Maske zurück: True = Discovery akzeptiert.
+    """
+    m = len(pvalues)
+    if m == 0:
+        return []
+    sorted_idx = sorted(range(m), key=lambda i: pvalues[i])
+    sorted_p   = [pvalues[i] for i in sorted_idx]
+
+    k_max = -1
+    for k in range(m):
+        if sorted_p[k] <= (k + 1) / m * q:
+            k_max = k
+
+    accept = [False] * m
+    if k_max >= 0:
+        for j in range(k_max + 1):
+            accept[sorted_idx[j]] = True
+    return accept
+
+
+def _calc_dsr(pnl_rs: list[float], n_tested: int) -> float:
+    """
+    Deflated Sharpe Ratio (Bailey & López de Prado 2014).
+    Gibt P(SR_hat > SR_benchmark | N Tests) zurück — Wert zwischen 0 und 1.
+    Je mehr Kombinationen getestet wurden (n_tested), desto höher muss SR_hat sein.
+    """
+    import math
+
+    T = len(pnl_rs)
+    if T < 10:
+        return 0.0   # numerisch instabil bei zu kleinem n
+
+    mean_r = sum(pnl_rs) / T
+    var_r  = sum((r - mean_r) ** 2 for r in pnl_rs) / max(T - 1, 1)
+    std_r  = math.sqrt(var_r) if var_r > 0 else 1e-9
+
+    # SR_hat annualisiert: skaliert auf Jahresbasis via Trades pro Jahr.
+    # Annahme: ~2 Signale/Woche → ~104 Trades/Jahr (konservativ für Micro-Account).
+    # Annualisierungsfaktor √(trades_per_year) analog zu √252 bei täglichen Returns.
+    trades_per_year = 104
+    sr_hat = mean_r / std_r * math.sqrt(trades_per_year)
+
+    # Schiefe (γ3) und Excess-Kurtosis (γ4) der Returns
+    if std_r > 0 and T >= 3:
+        gamma3 = sum((r - mean_r) ** 3 for r in pnl_rs) / (T * std_r ** 3)
+        gamma4 = sum((r - mean_r) ** 4 for r in pnl_rs) / (T * std_r ** 4) - 3.0
+        gamma4 = max(gamma4, 0.0)   # Clipping: neg. Excess-Kurtosis stabilisiert Formel
+    else:
+        gamma3, gamma4 = 0.0, 0.0
+
+    # SR-Benchmark unter Null-Hypothese (erwarteter Max-Sharpe bei N Tests)
+    N = max(n_tested, 1)
+    gamma_e = 0.5772156649   # Euler-Mascheroni-Konstante
+
+    def phi_inv(p: float) -> float:
+        """Inverse Normalverteilung via Newton-Raphson auf erfc."""
+        p = max(1e-9, min(1 - 1e-9, p))
+        # Abramowitz & Stegun Näherung
+        if p < 0.5:
+            t = math.sqrt(-2 * math.log(p))
+            c0, c1, c2 = 2.515517, 0.802853, 0.010328
+            d1, d2, d3 = 1.432788, 0.189269, 0.001308
+            return -(t - (c0 + c1*t + c2*t**2) / (1 + d1*t + d2*t**2 + d3*t**3))
+        else:
+            t = math.sqrt(-2 * math.log(1 - p))
+            c0, c1, c2 = 2.515517, 0.802853, 0.010328
+            d1, d2, d3 = 1.432788, 0.189269, 0.001308
+            return t - (c0 + c1*t + c2*t**2) / (1 + d1*t + d2*t**2 + d3*t**3)
+
+    sr_benchmark = (
+        (1 - gamma_e) * phi_inv(1 - 1 / N)
+        + gamma_e     * phi_inv(1 - 1 / (N * math.e))
+    )
+
+    # DSR-Z-Score
+    denom_sq = 1 - gamma3 * sr_hat + gamma4 * sr_hat ** 2 / 4
+    if denom_sq <= 0 or T <= 1:
+        return 0.0
+
+    z = (sr_hat - sr_benchmark) * math.sqrt(T - 1) / math.sqrt(denom_sq)
+    return round(_normal_cdf(z), 6)
+
+
+# ── Optuna TPE (Phase 2: alle SIGNAL_FNS) ────────────────────────────────────
+
+# Parameter-Spaces für Optuna: (min, max, is_int)
+# Abgeleitet aus cfg.get()-Calls in backtest/engine.py.
+OPTUNA_SPACES: dict[str, dict[str, tuple]] = {
+    "vaa": {
+        "VOL_MULT":   (1.5, 4.0, False),
+        "BODY_MULT":  (0.3, 0.8, False),
+        "ATR_EXPAND": (0.8, 2.0, False),
+        "TP_R":       (1.5, 5.0, False),
+        "SL_ATR_MULT":(0.5, 2.0, False),
+    },
+    "kdt": {
+        # KDT hat minimale eigene Parameter — SL/TP tunable
+        "SL_ATR_MULT": (0.5, 2.0, False),
+        "TP_R":        (1.5, 5.0, False),
+    },
+    "weekend_momo": {
+        "MOMENTUM_THRESHOLD": (0.01, 0.06, False),
+        "ATR_SL_MULT":        (0.5,  2.5, False),
+        "ATR_TP_MULT":        (1.5,  5.0, False),
+    },
+    "asian_fade": {
+        "PUMP_THRESHOLD": (0.008, 0.03,  False),
+        "RSI_OB":         (60,    80,    True),
+        "RSI_OS":         (20,    40,    True),
+        "SL_ATR_MULT":    (0.5,   2.0,  False),
+        "TP_MULT":        (1.0,   3.0,  False),
+    },
+    "squeeze": {
+        "SQUEEZE_PERIOD": (10,  30, True),
+        "EMA_PERIOD":     (10,  40, True),
+        "SL_ATR_MULT":    (0.5, 2.0, False),
+        "TP_R":           (1.5, 5.0, False),
+    },
+    "mean_reversion": {
+        "BB_PERIOD":  (10,  30, True),
+        "BB_MULT":    (1.5, 3.0, False),
+        "RSI_PERIOD": (7,   21, True),
+        "RSI_OS":     (25,  45, False),
+        "SL_ATR_MULT":(0.5, 2.0, False),
+        "TP_R":       (1.5, 4.0, False),
+    },
+    "vwap_bounce": {
+        "VWAP_PERIOD": (12, 48, True),
+        "VWAP_BAND":   (0.1, 0.5, False),
+        "EMA_PERIOD":  (20,  80, True),
+        "RSI_MIN":     (40,  60, False),
+        "SL_ATR_MULT": (0.5, 2.0, False),
+        "TP_R":        (1.5, 4.0, False),
+    },
+    "ema_pullback": {
+        "EMA_SLOW":    (100, 200, True),
+        "EMA_FAST":    (20,   75, True),
+        "BODY_FACTOR": (0.1,  0.6, False),
+        "SL_ATR_MULT": (0.5,  2.0, False),
+        "TP_R":        (1.5,  5.0, False),
+    },
+    "donchian_breakout": {
+        "DC_PERIOD":    (10,  50, True),
+        "VOL_FACTOR":   (1.2, 3.0, False),
+        "ATR_MIN_MULT": (0.8, 2.0, False),
+        "SL_ATR_MULT":  (0.5, 1.5, False),
+        "TP_R":         (1.2, 3.0, False),
+    },
+    "inside_bar_breakout": {
+        "EMA_PERIOD":     (20, 100, True),
+        "MOTHER_ATR_MIN": (0.3, 1.5, False),
+        "SL_ATR_MULT":    (0.5, 2.0, False),
+        "TP_R":           (1.5, 4.0, False),
+    },
+    "dual_donchian": {
+        "ENTRY_PERIOD": (15,  60, True),
+        "EXIT_PERIOD":  (5,   20, True),
+        "VOL_FACTOR":   (1.2, 3.0, False),
+        "ATR_MIN_MULT": (0.8, 2.0, False),
+        "SL_ATR_MULT":  (0.5, 1.5, False),
+        "TP_R":         (1.2, 3.0, False),
+    },
+    "bb_kc_squeeze": {
+        "BB_PERIOD":  (10,  30, True),
+        "BB_MULT":    (1.5, 3.0, False),
+        "KC_MULT":    (1.0, 2.5, False),
+        "SL_ATR_MULT":(0.5, 2.0, False),
+        "TP_R":       (1.5, 5.0, False),
+    },
+    "supertrend": {
+        "ST1_PERIOD": (7,   14, True),
+        "ST1_MULT":   (0.5, 2.0, False),
+        "ST2_PERIOD": (10,  20, True),
+        "ST2_MULT":   (1.5, 3.5, False),
+        "ST3_PERIOD": (12,  25, True),
+        "ST3_MULT":   (2.5, 5.0, False),
+        "SL_ATR_MULT":(0.5, 2.0, False),
+        "TP_R":       (1.5, 5.0, False),
+    },
+}
+
+
+def _optuna_objective(trial, strategy: str, asset: str,
+                      now_ms: int, start_ms: int, conn) -> float:
+    """
+    Optuna-Objective für eine (strategy, asset)-Kombination.
+    Gibt fitness_score zurück (0.0 bei Nicht-Bestehen).
+    Pruned nach Fenster 1 wenn PF < MIN_PF_TEST.
+    """
+    import optuna
+
+    space = OPTUNA_SPACES[strategy]
+    params: dict = {}
+    for key, (lo, hi, is_int) in space.items():
+        if is_int:
+            params[key] = trial.suggest_int(key, int(lo), int(hi))
+        else:
+            params[key] = round(trial.suggest_float(key, lo, hi), 3)
+
+    h = _param_hash(strategy, asset, params)
+    if _already_known(conn, h):
+        raise optuna.exceptions.TrialPruned()
+
+    window_results = []
+    te_res_w3      = None
+    for w_idx, wcfg in enumerate(WF_WINDOWS):
+        train_end_ms  = now_ms + wcfg["train_end"]  * 86_400_000
+        test_start_ms = now_ms + wcfg["test_start"] * 86_400_000
+        test_end_ms   = now_ms + wcfg["test_end"]   * 86_400_000 if wcfg["test_end"] != 0 else now_ms
+        try:
+            tr_res = run_backtest(strategy, asset, start_ms,      train_end_ms,
+                                  cfg=params, cooldown_bars=COOLDOWN_BARS, apply_costs=True)
+            te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,
+                                  cfg=params, cooldown_bars=COOLDOWN_BARS, apply_costs=True)
+        except Exception:
+            return 0.0
+
+        tr       = _metrics(tr_res)
+        te       = _metrics(te_res, window_days=wcfg["days"])
+        max_dd_r = _max_r_drawdown(te_res)
+        passed, reason = _passes_window(tr, te, max_dd_r, wcfg)
+        window_results.append({"tr": tr, "te": te, "max_dd_r": max_dd_r,
+                               "passed": passed, "reason": reason})
+        if wcfg is WF_WINDOWS[-1]:
+            te_res_w3 = te_res
+
+        # Frühzeitiges Pruning nach Fenster 1 bei schwachem PF
+        if w_idx == 0:
+            trial.report(te["pf"], step=0)
+            if te["pf"] < MIN_PF_TEST * 0.85:   # 15% Toleranz für spätere Fenster
+                raise optuna.exceptions.TrialPruned()
+
+    pnl_rs_w3 = [t.pnl_r for t in te_res_w3.trades] if te_res_w3 else []
+    ok, result = _passes(window_results, pnl_rs_w3=pnl_rs_w3,
+                         n_tested=trial.number + 1)
+    if not ok:
+        return 0.0
+
+    dsr = result[1] if isinstance(result, tuple) else 0.0
+    fitness = _fitness(window_results)
+
+    # Candidate für spätere BH-Auswertung im trial user_attrs speichern
+    trial.set_user_attr("params",         params)
+    trial.set_user_attr("h",              h)
+    trial.set_user_attr("window_results", window_results)
+    trial.set_user_attr("dsr",            dsr)
+    trial.set_user_attr("passed",         True)
+
+    return fitness
+
+
+def _run_optuna_target(strategy: str, asset: str,
+                       now_ms: int, conn, n_trials: int = 50) -> list[dict]:
+    """
+    Führt eine Optuna-Study für (strategy, asset) durch.
+    Gibt Liste von Candidates zurück (analog zum Batch-Pfad).
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    start_ms = now_ms - DAYS * 86_400_000
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+    )
+    study.optimize(
+        lambda trial: _optuna_objective(trial, strategy, asset, now_ms, start_ms, conn),
+        n_trials=n_trials,
+        catch=(Exception,),
+    )
+
+    # Nur bestandene Trials als Candidates
+    candidates = []
+    for t in study.trials:
+        if not t.user_attrs.get("passed"):
+            continue
+        pvalue = _pf_to_pvalue(
+            t.user_attrs["window_results"][-1]["te"]["pf"],
+            t.user_attrs["window_results"][-1]["te"]["n"],
+        )
+        candidates.append({
+            "h":              t.user_attrs["h"],
+            "params":         t.user_attrs["params"],
+            "window_results": t.user_attrs["window_results"],
+            "pvalue":         pvalue,
+            "dsr":            t.user_attrs.get("dsr", 0.0),
+        })
+
+    pruned  = sum(1 for t in study.trials if t.state.name == "PRUNED")
+    ok_cnt  = sum(1 for t in study.trials if t.state.name == "COMPLETE")
+    log(f"[OPTUNA] {strategy}/{asset}: {n_trials} Trials — "
+        f"{ok_cnt} complete, {pruned} pruned, {len(candidates)} passed")
+
+    return candidates
+
+
 # ── Haupt-Loop ───────────────────────────────────────────────────────────────
 
-def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
+def _run_one_target(strategy: str, asset: str, now_ms: int, conn,
+                    n_trials: int = N_TRIALS_FULL) -> int:
     """Multi-Window OOS Validation: alle 3 Fenster müssen bestehen."""
     # Regime anhand des aktuellsten Fensters bestimmen (Fenster 3)
     w3 = WF_WINDOWS[-1]
@@ -911,57 +1271,139 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
         log(f"[LAB-DAEMON] Bucket {asset}/{regime} voll ({MAX_DISCOVERIES_PER_BUCKET}) — überspringe")
         return 0
 
+    from config.settings import BH_FDR_Q
+
+    # ── Optuna-Pfad (Phase 1: donchian_breakout) ──────────────────────────────
+    if strategy in OPTUNA_SPACES:
+        candidates = _run_optuna_target(strategy, asset, now_ms, conn,
+                                        n_trials=n_trials)
+        # BH + Discovery-Speicherung (identisch zum Batch-Pfad unten)
+        if not candidates:
+            return 0
+        pvalues  = [c["pvalue"] for c in candidates]
+        accepted = _benjamini_hochberg(pvalues, q=BH_FDR_Q)
+        bh_rejected = sum(1 for a in accepted if not a)
+        if bh_rejected:
+            _stat_inc(None, "bh_rejected_today", bh_rejected)
+        found = 0
+        for cand, is_accepted in zip(candidates, accepted):
+            if not is_accepted:
+                continue
+            window_results = cand["window_results"]
+            te3    = window_results[-1]["te"]
+            max_dd_r = window_results[-1]["max_dd_r"]
+            tr3    = window_results[-1]["tr"]
+            dsr    = cand.get("dsr")
+            micro_score = _calc_micro_score(te3["pf"], te3["avg_r"], te3["wr"], te3["n"], max_dd_r)
+            fitness     = _fitness(window_results)
+            prev_pf, prev_fit = _get_highscore(conn, strategy, asset, regime)
+            prev_micro        = _get_best_micro_score(conn, strategy, asset, regime)
+            is_micro_highscore = micro_score > prev_micro
+            disc_id = _save_discovery(conn, cand["h"], strategy, asset, regime, cand["params"],
+                                      tr3, te3, fitness, max_dd_r, micro_score,
+                                      window_results=window_results, now_ms=now_ms, dsr=dsr)
+            disc_n  = _count_discoveries(conn)
+            dd_usdt = max_dd_r * RISK_PER_TRADE
+            log(f"[OPTUNA] {'🏆' if is_micro_highscore else '✅'} Discovery #{disc_n}: "
+                f"{strategy}/{asset} PF={te3['pf']:.2f} AvgR={te3['avg_r']:+.3f} "
+                f"n={te3['n']} MaxDD=${dd_usdt:.1f} Score={micro_score:.2f} DSR={dsr:.3f}")
+            if is_micro_highscore:
+                _update_highscore(conn, strategy, asset, regime, te3["pf"], fitness, disc_id)
+                _notify_highscore(strategy, asset, regime, _round_params(cand["params"]),
+                                  tr3, te3, fitness, prev_pf, disc_n,
+                                  max_dd_r, micro_score, prev_micro, disc_id=disc_id)
+            found += 1
+        return found
+
+    # ── Legacy Batch-Pfad (nicht mehr erreichbar — alle Strategien in OPTUNA_SPACES) ──
     start_ms = now_ms - DAYS * 86_400_000
-    batch = _batch(strategy, BATCH_SIZE)
-    found = 0
+    batch    = _batch(strategy, BATCH_SIZE)
+
+    # ── Phase A: Alle Kombinationen der Runde evaluieren ─────────────────────
+    # Kandidaten werden gesammelt statt sofort gespeichert, damit BH über die
+    # gesamte Runde (Round-Level) angewendet werden kann, nicht nur per Batch.
+    candidates = []   # [{h, params, window_results, pvalue}]
 
     for params in batch:
         h = _param_hash(strategy, asset, params)
         if _already_known(conn, h):
             continue
 
-        # ── 3 Fenster-Backtests ───────────────────────────────────────────────
         window_results = []
         backtest_error = False
+        te_res_w3      = None   # Fenster-3-Ergebnis für DSR-Berechnung
         for wcfg in WF_WINDOWS:
-            train_end_ms   = now_ms + wcfg["train_end"]   * 86_400_000
-            test_start_ms  = now_ms + wcfg["test_start"]  * 86_400_000
-            test_end_ms    = now_ms + wcfg["test_end"]    * 86_400_000 if wcfg["test_end"] != 0 else now_ms
+            train_end_ms  = now_ms + wcfg["train_end"]  * 86_400_000
+            test_start_ms = now_ms + wcfg["test_start"] * 86_400_000
+            test_end_ms   = now_ms + wcfg["test_end"]   * 86_400_000 if wcfg["test_end"] != 0 else now_ms
             try:
-                tr_res = run_backtest(strategy, asset, start_ms,     train_end_ms, cfg=params, cooldown_bars=COOLDOWN_BARS)
-                te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,  cfg=params, cooldown_bars=COOLDOWN_BARS)
+                tr_res = run_backtest(strategy, asset, start_ms,      train_end_ms, cfg=params, cooldown_bars=COOLDOWN_BARS, apply_costs=True)
+                te_res = run_backtest(strategy, asset, test_start_ms, test_end_ms,  cfg=params, cooldown_bars=COOLDOWN_BARS, apply_costs=True)
             except Exception as e:
                 log(f"[LAB-DAEMON] Backtest-Fehler {strategy}/{asset}: {e}")
                 backtest_error = True
                 break
-            tr = _metrics(tr_res)
-            te = _metrics(te_res)
+            tr       = _metrics(tr_res)
+            te       = _metrics(te_res, window_days=wcfg["days"])
             max_dd_r = _max_r_drawdown(te_res)
             passed, reason = _passes_window(tr, te, max_dd_r, wcfg)
             window_results.append({"tr": tr, "te": te, "max_dd_r": max_dd_r,
                                    "passed": passed, "reason": reason})
+            if wcfg is WF_WINDOWS[-1]:
+                te_res_w3 = te_res   # aktuellstes Fenster merken
 
         if backtest_error:
             continue
 
-        # Stats: Gesamt-Testzähler erhöhen (eigene kurzlebige Verbindung)
         _stat_inc(None, "total_tests")
 
-        ok, reason = _passes(window_results)
+        pnl_rs_w3 = [t.pnl_r for t in te_res_w3.trades] if te_res_w3 else []
+        ok, result = _passes(window_results, pnl_rs_w3=pnl_rs_w3,
+                             n_tested=len(candidates) + 1)
         if not ok:
+            reason = result
             cat = _rejection_category(reason.split("_", 1)[-1] if "_" in reason else reason)
             _stat_inc(None, f"reject_{cat}")
             if "ruin_filter" in reason:
                 log(f"[LAB-DAEMON] ☠️  Ruin-Filter: {strategy}/{asset} {reason}")
             continue
 
-        # Stats: bestandener Test
+        dsr = result[1] if isinstance(result, tuple) else 0.0
         _stat_inc(None, "total_pass")
 
-        # Metriken aus Fenster 3 für Discovery-Eintrag und Deployment
-        te3      = window_results[-1]["te"]
-        max_dd_r = window_results[-1]["max_dd_r"]
-        tr3      = window_results[-1]["tr"]
+        # p-Wert aus Fenster-3-Metriken (deployment-relevantes Fenster)
+        te3    = window_results[-1]["te"]
+        pvalue = _pf_to_pvalue(te3["pf"], te3["n"])
+        candidates.append({"h": h, "params": params,
+                            "window_results": window_results, "pvalue": pvalue,
+                            "dsr": dsr})
+
+    if not candidates:
+        return 0
+
+    # ── Phase B: Benjamini-Hochberg über alle Kandidaten der Runde ───────────
+    pvalues  = [c["pvalue"] for c in candidates]
+    accepted = _benjamini_hochberg(pvalues, q=BH_FDR_Q)
+
+    bh_rejected = sum(1 for a in accepted if not a)
+    if bh_rejected:
+        _stat_inc(None, "bh_rejected_today", bh_rejected)
+        log(f"[LAB-DAEMON] BH-FDR (q={BH_FDR_Q}): {len(candidates)} Kandidaten → "
+            f"{sum(accepted)} akzeptiert, {bh_rejected} verworfen")
+
+    # ── Phase C: Nur BH-akzeptierte Kandidaten speichern ────────────────────
+    found = 0
+    for cand, is_accepted in zip(candidates, accepted):
+        if not is_accepted:
+            continue
+
+        h              = cand["h"]
+        params         = cand["params"]
+        window_results = cand["window_results"]
+        te3            = window_results[-1]["te"]
+        max_dd_r       = window_results[-1]["max_dd_r"]
+        tr3            = window_results[-1]["tr"]
+        dsr            = cand.get("dsr")
 
         micro_score = _calc_micro_score(te3["pf"], te3["avg_r"], te3["wr"], te3["n"], max_dd_r)
         fitness     = _fitness(window_results)
@@ -972,7 +1414,8 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
 
         disc_id = _save_discovery(conn, h, strategy, asset, regime, params,
                                   tr3, te3, fitness, max_dd_r, micro_score,
-                                  window_results=window_results, now_ms=now_ms)
+                                  window_results=window_results, now_ms=now_ms,
+                                  dsr=dsr)
         disc_n  = _count_discoveries(conn)
 
         dd_usdt     = max_dd_r * RISK_PER_TRADE
@@ -981,7 +1424,8 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
             f"[LAB-DAEMON] {'🏆' if is_micro_highscore else '✅'} Discovery #{disc_n}: "
             f"{strategy}/{asset} [{regime_icon}{regime}] "
             f"PF={te3['pf']:.2f} AvgR={te3['avg_r']:+.3f} n={te3['n']} "
-            f"MaxDD=${dd_usdt:.1f}({max_dd_r:.1f}R) Score={micro_score:.2f} [3-Window]"
+            f"MaxDD=${dd_usdt:.1f}({max_dd_r:.1f}R) Score={micro_score:.2f} "
+            f"DSR={dsr:.3f} [BH q={BH_FDR_Q}]"
             + (f" ← NEUER SCORE (war {prev_micro:.2f})" if is_micro_highscore else "")
         )
 
@@ -996,9 +1440,10 @@ def _run_one_target(strategy: str, asset: str, now_ms: int, conn) -> int:
     return found
 
 
-def main():
+def main(single_pass: bool = False):
     _ensure_schema()
     log("[LAB-DAEMON] ════════════════════════════════════════════════")
+    n_trials = N_TRIALS_DAEMON if single_pass else N_TRIALS_FULL
     log("[LAB-DAEMON] APEX Auto-Lab Daemon v2 gestartet")
     log(f"[LAB-DAEMON] Suchraum: {[f'{s}/{a}' for s,a in SEARCH_SPACE]}")
     log(f"[LAB-DAEMON] Multi-Window OOS: {len(WF_WINDOWS)} Fenster — alle müssen bestehen")
@@ -1056,7 +1501,8 @@ def main():
                 # Jedes Target bekommt eine eigene kurzlebige Verbindung
                 conn = get_connection()
                 try:
-                    found = _run_one_target(strategy, asset, now_ms, conn)
+                    found = _run_one_target(strategy, asset, now_ms, conn,
+                                           n_trials=n_trials)
                     found_this_round += found
                 finally:
                     conn.close()
@@ -1108,8 +1554,16 @@ def main():
             time.sleep(SLEEP_ON_ERROR)
             continue
 
+        if single_pass:
+            log("[LAB-DAEMON] --single-pass abgeschlossen")
+            break
         time.sleep(SLEEP_BETWEEN)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--single-pass", action="store_true",
+                        help="Einmalig alle Targets durchlaufen, dann beenden")
+    args = parser.parse_args()
+    main(single_pass=args.single_pass)

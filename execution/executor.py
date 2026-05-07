@@ -97,36 +97,38 @@ def _calc_sizing(signal: Signal, current_price: float) -> dict | None:
         )
         return None
 
-    # Schritt 3b: Balance-Check — Margin-Bedarf = notional_1x (unabhängig von Leverage)
-    # Bei Isolated-Futures gilt: Margin = Size × Price / Leverage = notional_1x (konstant)
+    # Schritt 3b: Balance-Check mit Hebel-Berücksichtigung
+    # Isolated-Futures: Margin = Notional / Leverage → auto-Hebel wenn Notional > Balance
     from core.state import get_live_balance
     balance = get_live_balance()
-    if balance > 0 and notional_1x > balance * 0.95:
-        log(
-            f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
-            f"Margin-Bedarf ${notional_1x:.2f} > verfügbare Balance ${balance:.2f} "
-            f"(SL-Distanz={sl_distance:.4f} zu eng für RISK ${RISK_USDT:.2f})"
-        )
-        return None
 
     # Schritt 4: Hebel bestimmen
     if notional_1x >= MIN_NOTIONAL:
-        leverage = 1
+        # Großposition: Hebel = 1 wenn Balance reicht, sonst Mindest-Hebel für Margin-Fit
+        if balance > 0 and notional_1x > balance * 0.95:
+            leverage = math.ceil(notional_1x / (balance * 0.95))
+        else:
+            leverage = 1
     else:
-        # Minimaler Hebel um MIN_NOTIONAL zu erreichen
+        # Kleinposition: Hebel inflationiert auf MIN_NOTIONAL (Exchange-Minimum)
         leverage = math.ceil(TARGET_NOTIONAL / notional_1x)
 
     # Schritt 5: hartes Limit prüfen
     if leverage > MAX_LEVERAGE:
         log(
             f"[SIZING] ⛔ Signal #{signal.id} {signal.asset}: Trade abgelehnt — "
-            f"Hebel-Limit überschritten ({leverage}x > {MAX_LEVERAGE}x). "
+            f"Hebel-Limit überschritten ({leverage}x > {MAX_LEVERAGE}x bei Balance ${balance:.2f}). "
             f"SL-Distanz={sl_distance:.4f}, Notional@1x=${notional_1x:.3f}"
         )
         return None
 
-    # Effektive Positionsgröße mit Hebel (Coins)
-    effective_size    = raw_size * leverage
+    # Effektive Positionsgröße:
+    # Großposition (notional >= MIN_NOTIONAL): size bleibt raw_size, Leverage = Margin-Reducer
+    # Kleinposition (notional < MIN_NOTIONAL):  size ×= leverage um Exchange-Minimum zu erreichen
+    if notional_1x >= MIN_NOTIONAL:
+        effective_size    = raw_size
+    else:
+        effective_size    = raw_size * leverage
     effective_notional = effective_size * entry
 
     s_dec = SIZE_DECIMALS.get(signal.asset, 2)
@@ -273,6 +275,24 @@ class Executor:
 
         size     = sizing["size"]
         leverage = sizing["leverage"]
+
+        # Schritt 2b: Daily-DD Half-Size — Governance-Flag aus governance_log lesen
+        _conn = get_connection()
+        _row = _conn.execute(
+            "SELECT reason FROM governance_log WHERE signal_id=? ORDER BY ts DESC LIMIT 1",
+            (signal.id,),
+        ).fetchone()
+        _conn.close()
+        if _row and _row[0] and "HALF_SIZE" in _row[0]:
+            s_dec = SIZE_DECIMALS.get(signal.asset, 2)
+            size  = round(size * 0.5, s_dec)
+            log(f"[EXECUTOR] Half-size wegen Daily-DD -1.5R: neue Größe {size}")
+
+        if _row and _row[0] and "REGIME_HALF" in _row[0]:
+            s_dec = SIZE_DECIMALS.get(signal.asset, 2)
+            size  = round(size * 0.5, s_dec)
+            regime_tag = "SIDEWAYS" if "SIDEWAYS" in _row[0] else "HIGH_VOL"
+            log(f"[EXECUTOR] Regime-Half-Size: {size} (Regime: {regime_tag})")
 
         # Schritt 3: Hebel setzen (beide Seiten, isolated margin)
         hold_side = "long" if signal.direction == "long" else "short"

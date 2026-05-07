@@ -37,6 +37,37 @@ MAX_LEVERAGE       = 20      # Hartes Leverage-Limit — darüber: Trade abgeleh
 DAILY_DD_HALF_R = -1.5
 DAILY_DD_KILL_R = -2.0
 
+# ── Live-vs-Backtest Drift Monitor ───────────────────────────────────────────
+DRIFT_WARNING_PCT  = -15.0   # drift < -15% → Warning (Log + Push) | Kalibriert gegen Brutto-OOS-PF (Netto ca. 15-30% niedriger)
+DRIFT_CRITICAL_PCT = -30.0   # drift < -30% + n >= MIN_TRADES → Auto-Pause (shadow) | Kalibriert gegen Brutto-OOS-PF (Netto ca. 15-30% niedriger)
+DRIFT_MIN_TRADES   = 30      # Mindest-Trade-Anzahl bevor Drift-Check greift
+
+# ── FDR-Control (Benjamini-Hochberg) ─────────────────────────────────────────
+BH_FDR_Q = 0.05   # FDR-Niveau q=0.05 (konservativ wegen zeitl. Korrelation der Trades)
+MIN_DSR   = 0.95  # Deflated Sharpe Ratio Mindestkonfidenz (Bailey & López de Prado 2014)
+
+# ── HMM Regime-Filter (P-02) ─────────────────────────────────────────────────
+# Erlaubte Regimes pro Strategie. Fehlt ein Eintrag → alle 3 Regimes erlaubt.
+# HMM_MODE = "warn"  → "block" nach 30 validierten Live-Trades (B-05)
+STRATEGY_ALLOWED_REGIMES: dict[str, list[str]] = {
+    "donchian_breakout":  ["TREND", "HIGH_VOL"],
+    "dual_donchian":      ["TREND", "HIGH_VOL"],
+    "mean_reversion":     ["SIDEWAYS"],
+    "squeeze":            ["SIDEWAYS", "TREND"],
+    "bb_kc_squeeze":      ["SIDEWAYS", "TREND"],
+    "ema_pullback":       ["TREND"],
+    "inside_bar_breakout":["TREND"],
+    "supertrend":         ["TREND", "HIGH_VOL"],
+    # Alle anderen (vaa, kdt, weekend_momo, asian_fade, vwap_bounce) → kein Filter
+}
+
+# ── Backtest-Kostenmodell (Bitget Richtwerte) ────────────────────────────────
+TAKER_FEE    = 0.0006   # 0.06% pro Side (Taker-Order)
+MAKER_FEE    = 0.0002   # 0.02% pro Side (Maker-Order)
+SLIPPAGE_EST = 0.0003   # 0.03% geschätzte Markt-Slippage
+FUNDING_8H   = 0.0001   # 0.01% Funding-Rate per 8h-Periode
+ROUND_TRIP   = (TAKER_FEE + SLIPPAGE_EST) * 2  # 0.18% gesamt Ein+Ausstieg
+
 # ── Bitget Handelsparameter ──────────────────────────────────────────────────
 LEVERAGE     = 5
 MARGIN_MODE  = "isolated"
@@ -148,7 +179,7 @@ ASIAN_FADE_MAX_RISK_PCT   = 0.02
 # ── Squeeze Breakout ────────────────────────────────────────────────────────
 # Champion-Parameter (Auto-Lab 2026-04-27): OOS n=1924, PF=1.14, AvgR=+0.095
 SQUEEZE_ENABLED      = True
-SQUEEZE_ASSETS       = ["ETH", "BTC", "SOL"]
+SQUEEZE_ASSETS       = ["ETH"]  # BTC/SOL entfernt: SL-Distanz > $56 Balance → execution_aborted
 SQUEEZE_PERIOD       = 20      # TTM Squeeze BB/KC Periode
 SQUEEZE_EMA_PERIOD   = 25      # EMA Richtungs-Filter (Champion: EMA_PERIOD=25)
 SQUEEZE_SL_ATR_MULT  = 1.5     # SL = entry ± ATR(14) × 1.5 (Champion)

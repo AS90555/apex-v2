@@ -174,6 +174,24 @@ CREATE TABLE IF NOT EXISTS lab_window_results (
 
 CREATE INDEX IF NOT EXISTS idx_wres_discovery ON lab_window_results(discovery_id);
 CREATE INDEX IF NOT EXISTS idx_wres_window    ON lab_window_results(window_idx, passed);
+
+CREATE TABLE IF NOT EXISTS live_vs_backtest_drift (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    checked_at      TEXT    NOT NULL,
+    deployment_id   INTEGER NOT NULL REFERENCES active_deployments(id),
+    strategy_key    TEXT    NOT NULL,
+    asset           TEXT    NOT NULL,
+    mode            TEXT    NOT NULL,
+    n_live          INTEGER NOT NULL,
+    pf_live         REAL,
+    pf_oos          REAL    NOT NULL,
+    drift_pct       REAL,
+    status          TEXT    NOT NULL DEFAULT 'ok',
+    action_taken    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_drift_deployment ON live_vs_backtest_drift(deployment_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drift_status     ON live_vs_backtest_drift(status, checked_at DESC);
 """
 
 
@@ -210,6 +228,8 @@ def run_migrations():
     ld_cols = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
     if "cooldown_bars" not in ld_cols:
         conn.execute("ALTER TABLE lab_discoveries ADD COLUMN cooldown_bars INTEGER DEFAULT 0")
+    if "pf_test_netto" not in ld_cols:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN pf_test_netto REAL")
     sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
     if "signal_key" not in sig_cols:
         conn.execute("ALTER TABLE signals ADD COLUMN signal_key TEXT")
@@ -230,6 +250,28 @@ def run_migrations():
                 note         TEXT
             );
         """)
+    # live_vs_backtest_drift — idempotent via DDL
+    drift_cols = {row[1] for row in conn.execute("PRAGMA table_info(live_vs_backtest_drift)").fetchall()}
+    if not drift_cols:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS live_vs_backtest_drift (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                checked_at      TEXT    NOT NULL,
+                deployment_id   INTEGER NOT NULL REFERENCES active_deployments(id),
+                strategy_key    TEXT    NOT NULL,
+                asset           TEXT    NOT NULL,
+                mode            TEXT    NOT NULL,
+                n_live          INTEGER NOT NULL,
+                pf_live         REAL,
+                pf_oos          REAL    NOT NULL,
+                drift_pct       REAL,
+                status          TEXT    NOT NULL DEFAULT 'ok',
+                action_taken    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_drift_deployment ON live_vs_backtest_drift(deployment_id, checked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_drift_status     ON live_vs_backtest_drift(status, checked_at DESC);
+        """)
+
     # lab_window_results — idempotent via DDL (CREATE TABLE IF NOT EXISTS)
     wres_cols = {row[1] for row in conn.execute("PRAGMA table_info(lab_window_results)").fetchall()}
     if not wres_cols:

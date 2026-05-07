@@ -22,7 +22,7 @@ from core.state import get_hwm, get_daily_pnl, get_regime, get_live_balance
 from core.utils import log
 from config.settings import (
     DRAWDOWN_KILL_PCT, MIN_BALANCE_USD,
-    DAILY_DD_KILL_R,
+    DAILY_DD_HALF_R, DAILY_DD_KILL_R,
     SIGNAL_EXPIRY_MINUTES,
 )
 from governance.gate import BaseGovernanceCheck
@@ -66,7 +66,10 @@ class DrawdownKillCheck(BaseGovernanceCheck):
 
 
 class DailyDrawdownCheck(BaseGovernanceCheck):
-    """Tages-PnL-Breaker: wenn pnl_r <= DAILY_DD_KILL_R → Stop."""
+    """Tages-PnL-Breaker: zweistufig.
+    pnl_r <= DAILY_DD_KILL_R (-2.0R)  → kein Trade.
+    pnl_r <= DAILY_DD_HALF_R (-1.5R)  → Trade erlaubt, aber halbe Größe (HALF_SIZE-Flag).
+    """
 
     @property
     def name(self) -> str:
@@ -77,6 +80,8 @@ class DailyDrawdownCheck(BaseGovernanceCheck):
         pnl_r = daily.get("pnl_r", 0.0)
         if pnl_r <= DAILY_DD_KILL_R:
             return False, f"daily_dd_kill: pnl_r={pnl_r:.2f} <= {DAILY_DD_KILL_R}"
+        if pnl_r <= DAILY_DD_HALF_R:
+            return True, f"daily_dd_half: pnl_r={pnl_r:.2f} — HALF_SIZE"
         return True, f"daily_pnl_r={pnl_r:.2f}"
 
 
@@ -264,3 +269,43 @@ class CrossAssetRegimeCheck(BaseGovernanceCheck):
             return True, reason   # Phase 1: durchlassen, aber markieren
 
         return True, f"btc_cross_asset=aligned(btc={btc_regime} signal={direction})"
+
+
+class HMMRegimeCheck(BaseGovernanceCheck):
+    """
+    3-State HMM Regime-Filter (P-02).
+
+    Soft-Warning Modus bis HMM Live-Track-Record nach 30 Trades
+    validiert ist. Dann auf Hard-Block umstellen via:
+    STRATEGY_ALLOWED_REGIMES + return False statt True bei HMM_WARN.
+    Kein Modell vorhanden → durchlassen (fail-open).
+    """
+
+    @property
+    def name(self) -> str:
+        return "hmm_regime"
+
+    def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        from config.settings import STRATEGY_ALLOWED_REGIMES
+        allowed = STRATEGY_ALLOWED_REGIMES.get(
+            signal.strategy, ["TREND", "SIDEWAYS", "HIGH_VOL"]
+        )
+        try:
+            from research.train_hmm import get_current_regime
+            conn = get_connection()
+            regime = get_current_regime(signal.asset, conn)
+            conn.close()
+        except FileNotFoundError:
+            return True, f"hmm_regime=skip(kein_modell_{signal.asset})"
+        except Exception as exc:
+            log(f"[HMMRegimeCheck] Fehler bei {signal.asset}: {exc}")
+            return True, "hmm_regime=skip(error)"
+
+        if regime not in allowed:
+            return True, f"HMM_WARN: regime={regime} not in {allowed}"
+
+        if regime == "SIDEWAYS" and signal.strategy in STRATEGY_ALLOWED_REGIMES:
+            return True, f"HMM_WARN: regime=SIDEWAYS — REGIME_HALF"
+        if regime == "HIGH_VOL":
+            return True, f"hmm_regime=HIGH_VOL — REGIME_HALF"
+        return True, f"hmm_regime={regime} OK"

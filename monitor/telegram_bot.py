@@ -49,11 +49,13 @@ from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RISK_USDT
 
 
 def _is_authorized(update) -> bool:
-    """Nur der konfigurierte Chat darf Commands ausführen."""
-    allowed = str(os.getenv("TELEGRAM_CHAT_ID", ""))
+    """Nur der konfigurierte Chat darf Commands ausführen.
+    Fail-CLOSED: leere/fehlende CHAT_ID blockiert ALLE Zugriffe.
+    """
+    allowed = str(TELEGRAM_CHAT_ID).strip()
     if not allowed:
-        return True  # Kein Filter wenn nicht konfiguriert
-    chat_id = str(update.effective_chat.id)
+        return False  # fail-CLOSED — kein Zugriff ohne konfigurierte CHAT_ID
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
     user_id = str(update.effective_user.id) if update.effective_user else ""
     return chat_id == allowed or user_id == allowed
 
@@ -780,6 +782,9 @@ HEARTBEAT_MAX_AGE_MIN = {
     "intake": 10, "features": 10,
     "strategies": 30, "governance": 30,
     "executor": 30, "monitor": 30,
+    "drift_check":    1500,   # Daily-Job (Cron 06:00) — 25h Puffer für Cron-Verzögerungen
+    "hmm_retrain":   10080,   # Wöchentlicher Job (So 05:00) — 7 Tage Puffer
+    "regime_monitor":  250,   # 4h-Timer — 10 Min Puffer über 4h (=240 Min)
 }
 
 
@@ -1695,6 +1700,35 @@ def build_status_text() -> str:
                 f"  {icon} {t['asset']} {t['direction'].capitalize()}"
                 f"  *{pnl_usd}*  ·  {reason}"
             )
+
+    # ── Drift-Warnungen ───────────────────────────────────────────────────────
+    try:
+        _conn = get_connection()
+        drift_rows = _conn.execute("""
+            SELECT strategy_key, asset, mode, n_live, pf_live, pf_oos, drift_pct, status, action_taken
+            FROM live_vs_backtest_drift
+            WHERE status IN ('warning', 'critical')
+              AND checked_at = (
+                  SELECT MAX(checked_at) FROM live_vs_backtest_drift d2
+                  WHERE d2.deployment_id = live_vs_backtest_drift.deployment_id
+              )
+            ORDER BY drift_pct ASC
+        """).fetchall()
+        _conn.close()
+        if drift_rows:
+            lines += ["", "*══ DRIFT MONITOR ═════════════════*"]
+            for dr in drift_rows:
+                icon = "🔴" if dr["status"] == "critical" else "⚠️"
+                pf_live_str = f"{dr['pf_live']:.2f}" if dr["pf_live"] else "n/a"
+                drift_str   = f"{dr['drift_pct']:.1f}%" if dr["drift_pct"] else "n/a"
+                action_str  = " → shadow" if dr["action_taken"] == "shadow_downgrade" else ""
+                lines.append(
+                    f"  {icon} {dr['strategy_key']} ({dr['asset']})"
+                    f"  PF-live={pf_live_str} OOS={dr['pf_oos']:.2f}"
+                    f"  Drift={drift_str} n={dr['n_live']}{action_str}"
+                )
+    except Exception:
+        pass   # Drift-Tabelle fehlt oder leer — kein Fehler im Status-Screen
 
     return _p("\n".join(lines))
 
@@ -2650,6 +2684,20 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _status_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔬 Lab starten",  callback_data="lab_run_now"),
+            InlineKeyboardButton("📊 Audit",        callback_data="audit_now"),
+            InlineKeyboardButton("📈 Regime",       callback_data="regime_now"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Aktualisieren", callback_data="status"),
+            InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
+        ],
+    ])
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("⛔ Nicht autorisiert.")
@@ -2657,10 +2705,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = build_status_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Aktualisieren", callback_data="status"),
-            InlineKeyboardButton("◀️ Menü", callback_data="back_menu"),
-        ]]),
+        reply_markup=_status_keyboard(),
     )
 
 
@@ -2680,6 +2725,9 @@ def _dashboard_keyboard() -> InlineKeyboardMarkup:
 
 
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     text = build_dashboard_text()
     await update.message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN_V2,
@@ -2693,6 +2741,9 @@ async def cmd_lab(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Startet einen On-Demand Squeeze-Backtest im Thread-Pool.
     Antwort kommt als neue Nachricht sobald der Test fertig ist.
     """
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     args  = (ctx.args or [])
     asset = args[0].upper() if args else None
     days  = int(args[1]) if len(args) >= 2 and args[1].isdigit() else 365
@@ -2789,6 +2840,9 @@ async def cmd_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Lädt historische Kerzen via ccxt/Binance in die DB.
     Läuft im Thread-Pool damit der Bot nicht blockiert.
     """
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     args  = ctx.args or []
     asset = args[0].upper() if len(args) >= 1 else None
     days  = int(args[1]) if len(args) >= 2 and args[1].isdigit() else None
@@ -2929,6 +2983,9 @@ async def cmd_api_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     /api_test — prüft API-Verbindung und gibt Futures-Balance zurück.
     Diagnostiziert häufige Fehler: falscher Key, IP-Whitelist, Futures inaktiv.
     """
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
     await update.message.reply_text(
         "🔌 Teste API\\-Verbindung \\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -2991,6 +3048,103 @@ async def cmd_api_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=persistent_keyboard(),
     )
+
+
+async def cmd_promote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/promote <deployment_id> — Promotiert ein dry_run-Deployment zu live."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Nutzung: `/promote 8`\n"
+            "Die ID findest du im `/status`\\-Screen unter Deployments\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    dep_id = int(args[0])
+    import asyncio
+
+    def _load_promote_data():
+        conn = get_connection()
+        try:
+            dep = conn.execute(
+                "SELECT id, strategy_key, base_strategy, asset, mode, active "
+                "FROM active_deployments WHERE id=?",
+                (dep_id,),
+            ).fetchone()
+            if not dep:
+                return {"error": f"Deployment \\#{dep_id} nicht gefunden\\."}
+            dep = dict(dep)
+            if dep["mode"] != "dry_run":
+                return {"error": f"Nur dry\\_run\\-Deployments können promoted werden \\(aktuell: {dep['mode']}\\)\\."}
+            if not dep["active"]:
+                return {"error": f"Deployment \\#{dep_id} ist nicht aktiv\\."}
+
+            # Trades
+            rows = conn.execute(
+                "SELECT pnl_r FROM trades WHERE strategy=? AND asset=? AND exit_ts IS NOT NULL",
+                (dep["strategy_key"], dep["asset"]),
+            ).fetchall()
+            n = len(rows)
+            gross_win  = sum(r[0] for r in rows if r[0] and r[0] > 0)
+            gross_loss = abs(sum(r[0] for r in rows if r[0] and r[0] < 0))
+            pf_live = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+            # Drift
+            drift_row = conn.execute(
+                "SELECT status FROM live_vs_backtest_drift "
+                "WHERE strategy_key=? ORDER BY checked_at DESC LIMIT 1",
+                (dep["strategy_key"],),
+            ).fetchone()
+            drift = drift_row[0] if drift_row else "unbekannt"
+
+            # HMM-Regime
+            try:
+                from research.train_hmm import get_current_regime
+                regime = get_current_regime(dep["asset"], conn)
+            except Exception:
+                regime = "UNKNOWN"
+
+            return {
+                "dep": dep, "n": n, "pf_live": pf_live,
+                "drift": drift, "regime": regime,
+            }
+        finally:
+            conn.close()
+
+    data = await asyncio.get_event_loop().run_in_executor(None, _load_promote_data)
+
+    if "error" in data:
+        await update.message.reply_text(data["error"], parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    dep    = data["dep"]
+    n      = data["n"]
+    pf_s   = f"{data['pf_live']:.2f}" if data["pf_live"] is not None else "n/a"
+    drift  = data["drift"]
+    regime = data["regime"]
+    sk     = _escape_md(dep["strategy_key"])
+    asset  = _escape_md(dep["asset"])
+
+    msg = (
+        f"🔬 *Promote Deployment \\#{dep_id}*\n\n"
+        f"Strategie: `{sk}`\n"
+        f"Asset: `{asset}`\n\n"
+        f"📊 n\\_trades: `{n}`\n"
+        f"📈 Live\\-PF: `{pf_s}`\n"
+        f"📡 Drift: `{_escape_md(drift)}`\n"
+        f"🧠 HMM\\-Regime: `{_escape_md(regime)}`\n\n"
+        f"⚠️ *Dieses Deployment handelt ab sofort mit echtem Kapital\\.*"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Zu Live promoten", callback_data=f"promote_confirm_{dep_id}")],
+        [InlineKeyboardButton("❌ Abbrechen",         callback_data="back_menu")],
+    ])
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
 
 
 async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3318,6 +3472,9 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer(text="⛔ Nicht autorisiert.", show_alert=True)
+        return
     action = query.data
 
     # ── Glossar-Pop-ups (show_alert=True) ────────────────────────────────────
@@ -3451,7 +3608,123 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             build_status_text(),
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=back_btn,
+            reply_markup=_status_keyboard(),
+        )
+
+    elif action == "lab_run_now":
+        import subprocess as _sp
+        _sp.Popen(
+            ["python3", "research/auto_lab_daemon.py", "--single-pass"],
+            cwd="/root/apex-v2",
+            stdout=open("/root/apex-v2/logs/lab_daemon.log", "a"),
+            stderr=_sp.STDOUT,
+        )
+        await query.edit_message_text(
+            "🔬 *Lab Single\\-Pass gestartet*\n\n"
+            "_Läuft im Hintergrund \\(\\~5 min\\)\\. Ergebnisse in logs/lab\\_daemon\\.log_",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Lab-Status", callback_data="lab_main"),
+                InlineKeyboardButton("◀️ Menü",       callback_data="back_menu"),
+            ]]),
+        )
+
+    elif action == "audit_now":
+        import subprocess as _sp2
+        _res = _sp2.run(
+            ["python3", "-m", "pytest", "tests/governance_invariants.py",
+             "tests/parity_test.py", "-v", "--tb=short", "-q"],
+            cwd="/root/apex-v2", capture_output=True, text=True, timeout=120,
+        )
+        out  = (_res.stdout + _res.stderr).strip()[-2800:]
+        icon = "✅" if _res.returncode == 0 else "❌"
+        await query.edit_message_text(
+            f"{icon} *Audit\\-Ergebnis*\n\n```\n{_escape_md(out)}\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Nochmal",  callback_data="audit_now"),
+                InlineKeyboardButton("◀️ Status",   callback_data="status"),
+            ]]),
+        )
+
+    elif action == "regime_now":
+        from research.train_hmm import get_current_regime
+        _conn = get_connection()
+        _assets = [r[0] for r in _conn.execute(
+            "SELECT DISTINCT asset FROM active_deployments WHERE active=1"
+        ).fetchall()]
+        _emoji = {"TREND": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL": "🔴"}
+        _lines = ["📈 *Aktuelles Regime aller Assets*", ""]
+        for _a in _assets:
+            try:
+                _reg = get_current_regime(_a, _conn)
+            except Exception:
+                _reg = "?"
+            _lines.append(f"  {_emoji.get(_reg, '⚪')} `{_escape_md(_a)}`: {_escape_md(_reg)}")
+        _conn.close()
+        await query.edit_message_text(
+            "\n".join(_lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="regime_now"),
+                InlineKeyboardButton("◀️ Status",        callback_data="status"),
+            ]]),
+        )
+
+    elif action == "portfolio_overview":
+        _conn = get_connection()
+        from research.train_hmm import get_current_regime
+        _deps = _conn.execute(
+            """SELECT d.strategy_key, d.base_strategy, d.asset, d.mode,
+                      ld.pf_test_netto, COUNT(t.id) n
+               FROM active_deployments d
+               LEFT JOIN lab_discoveries ld ON ld.id = d.discovery_id
+               LEFT JOIN trades t ON t.strategy = d.strategy_key AND t.exit_ts IS NOT NULL
+               WHERE d.active=1
+               GROUP BY d.strategy_key
+               ORDER BY d.mode DESC, d.asset"""
+        ).fetchall()
+        _lines = ["📋 *Portfolio — Aktive Deployments*", ""]
+        _emoji = {"TREND": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL": "🔴"}
+        for _d in _deps:
+            try:
+                _reg = get_current_regime(_d["asset"], _conn)
+            except Exception:
+                _reg = "?"
+            _pf = f"{_d['pf_test_netto']:.2f}" if _d["pf_test_netto"] else "—"
+            _mode_ico = "🔴" if _d["mode"] == "live" else "🔬"
+            _lines.append(
+                f"{_mode_ico} `{_escape_md(_d['asset'])}/{_escape_md(_d['base_strategy'])}` "
+                f"\\| n\\=`{_d['n']}` \\| PF\\=`{_escape_md(_pf)}` "
+                f"\\| {_emoji.get(_reg, '⚪')}`{_escape_md(_reg)}`"
+            )
+        _conn.close()
+        await query.edit_message_text(
+            "\n".join(_lines),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="portfolio_overview"),
+                InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
+            ]]),
+        )
+
+    elif action.startswith("trade_pause_confirm_"):
+        _disc_id = int(action[len("trade_pause_confirm_"):])
+        _conn = get_connection()
+        _row  = _conn.execute(
+            "SELECT asset, base_strategy FROM active_deployments WHERE discovery_id=? LIMIT 1",
+            (_disc_id,),
+        ).fetchone()
+        _conn.close()
+        _label = f"{_row['asset']}/{_row['base_strategy']}" if _row else f"#{_disc_id}"
+        await query.edit_message_text(
+            f"⏸ *Deployment pausieren?*\n\n`{_escape_md(_label)}`\n\n"
+            "_Das Deployment wird auf active\\=0 gesetzt und sammelt keine neuen Signale mehr\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ja, pausieren", callback_data=f"deploy_pause_{_disc_id}")],
+                [InlineKeyboardButton("❌ Abbrechen",     callback_data="dashboard")],
+            ]),
         )
 
     elif action == "help":
@@ -3972,6 +4245,62 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]]),
         )
 
+    elif action.startswith("promote_confirm_"):
+        dep_id = int(action[len("promote_confirm_"):])
+        import asyncio
+        from datetime import datetime, timezone as _tz
+
+        def _do_promote():
+            conn = get_connection()
+            try:
+                dep = conn.execute(
+                    "SELECT strategy_key, base_strategy, asset, mode, active "
+                    "FROM active_deployments WHERE id=?",
+                    (dep_id,),
+                ).fetchone()
+                if not dep:
+                    return {"error": f"Deployment \\#{dep_id} nicht gefunden\\."}
+                dep = dict(dep)
+                if dep["mode"] != "dry_run" or not dep["active"]:
+                    return {"error": "Deployment ist nicht im dry\\_run\\-Modus oder inaktiv\\."}
+                now = datetime.now(_tz.utc).isoformat()
+                conn.execute(
+                    "UPDATE active_deployments SET mode='live' WHERE id=?",
+                    (dep_id,),
+                )
+                conn.execute(
+                    "INSERT INTO heartbeats (ts, component, status, message, latency_ms) "
+                    "VALUES (?,?,?,?,?)",
+                    (now, "promote", "ok",
+                     f"promoted dep_id={dep_id} {dep['strategy_key']}/{dep['asset']} dry_run→live",
+                     0),
+                )
+                conn.commit()
+                return {"ok": True, "strategy_key": dep["strategy_key"], "asset": dep["asset"]}
+            finally:
+                conn.close()
+
+        result = await asyncio.get_event_loop().run_in_executor(None, _do_promote)
+
+        if result.get("ok"):
+            sk    = _escape_md(result["strategy_key"])
+            asset = _escape_md(result["asset"])
+            msg   = (
+                f"🔴 *LIVE: {asset}*\n\n"
+                f"`{sk}` ist ab sofort aktiv\\.\n"
+                f"Deployment \\#{dep_id} auf `live` gesetzt\\."
+            )
+        else:
+            msg = f"⚠️ {result.get('error', 'Promote fehlgeschlagen\\.')}"
+
+        await query.edit_message_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 Portfolio", callback_data="pm_main"),
+                InlineKeyboardButton("◀️ Menü",      callback_data="back_menu"),
+            ]]),
+        )
+
     elif action.startswith("cio_all_live_execute:"):
         ids     = [int(x) for x in action.split(":", 1)[1].split(",") if x]
         import asyncio
@@ -4002,6 +4331,47 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Push-Jobs (job_queue)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _trade_edge_info(strategy: str, asset: str, trade_id: int) -> dict:
+    """Lädt Regime, OOS-PF (netto), DSR und Size-Modifier für einen abgeschlossenen Trade."""
+    from research.train_hmm import get_current_regime
+    conn = get_connection()
+
+    # Regime live aus HMM
+    try:
+        regime = get_current_regime(asset, conn)
+    except Exception:
+        regime = "?"
+
+    # pf_test_netto + dsr aus active_deployments JOIN lab_discoveries
+    row = conn.execute(
+        """SELECT ld.pf_test_netto, ld.dsr
+           FROM active_deployments ad
+           JOIN lab_discoveries ld ON ld.id = ad.discovery_id
+           WHERE ad.strategy_key = ? AND ad.active = 1
+           LIMIT 1""",
+        (strategy,),
+    ).fetchone()
+    pf_netto = row["pf_test_netto"] if row and row["pf_test_netto"] else None
+    dsr      = row["dsr"]           if row and row["dsr"]           else None
+
+    # REGIME_HALF aus governance_log für diesen Trade (signal derselben Strategie)
+    gl_row = conn.execute(
+        """SELECT reason FROM governance_log
+           WHERE signal_id IN (
+               SELECT id FROM signals
+               WHERE strategy = ? AND asset = ?
+               ORDER BY created_at DESC LIMIT 5
+           )
+           AND reason LIKE '%REGIME_HALF%'
+           ORDER BY created_at DESC LIMIT 1""",
+        (strategy, asset),
+    ).fetchone()
+    size_mod = "HALF" if gl_row else "FULL"
+
+    conn.close()
+    return {"regime": regime, "pf_netto": pf_netto, "dsr": dsr, "size_mod": size_mod}
+
+
 async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
     """Alle 2 Minuten: prüfe auf neue abgeschlossene Trades → Push."""
     since_key = "push_last_trade_ts"
@@ -4017,6 +4387,7 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
         ctx.bot_data[since_key] = now_iso
         # Tages-PnL für Kontext-Zeile
         d_summary = _db_pnl_summary()
+        _regime_emoji = {"TREND": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL": "🔴"}
         for t in new:
             r_val     = t["pnl_r"] or 0
             pnl_usd   = _r_to_usd(r_val)
@@ -4024,19 +4395,49 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
             dir_label = "Long" if t["direction"] == "long" else "Short"
             mode_lbl  = _mode_label(t["mode"])
             reason    = _exit_label(t["exit_reason"] or "")
+
+            edge      = _trade_edge_info(t["strategy"], t["asset"], t["id"])
+            reg_ico   = _regime_emoji.get(edge["regime"], "⚪")
+            pf_line   = (
+                f"📊 OOS\\-PF \\(Netto\\): `{edge['pf_netto']:.2f}`"
+                if edge["pf_netto"] else "📊 OOS\\-PF \\(Netto\\): `—`"
+            )
+            dsr_line  = (
+                f"🎯 Edge\\-Confidence: `{edge['dsr']:.3f}`"
+                if edge["dsr"] else "🎯 Edge\\-Confidence: `—`"
+            )
             msg = (
                 f"{icon} *Trade abgeschlossen*  ·  {mode_lbl}\n\n"
-                f"{t['asset']} {dir_label}\n"
+                f"{_escape_md(t['asset'])} {dir_label}\n"
                 f"Ergebnis: *{pnl_usd}*  \\({_fmt_r(r_val)}\\)  —  {reason}\n"
-                f"Einstieg: `{t['entry_price']}`  →  Ausstieg: `{t['exit_price']}`\n\n"
-                f"_Heute: {_r_to_usd(d_summary['today_r'])}  ·  {d_summary['total_n']} Trades gesamt_"
+                f"Einstieg: `{_escape_md(str(t['entry_price']))}`  →  "
+                f"Ausstieg: `{_escape_md(str(t['exit_price']))}`\n\n"
+                f"📍 Regime: {_escape_md(edge['regime'])} {reg_ico}\n"
+                f"{pf_line}\n"
+                f"⚖️ Size\\-Modifier: `{edge['size_mod']}`\n"
+                f"{dsr_line}\n\n"
+                f"_Heute: {_r_to_usd(d_summary['today_r'])}  ·  "
+                f"{d_summary['total_n']} Trades gesamt_"
             )
+            # discovery_id für Pause-Button aus active_deployments
+            _conn = get_connection()
+            _dep_row = _conn.execute(
+                "SELECT discovery_id FROM active_deployments WHERE strategy_key=? AND active=1 LIMIT 1",
+                (t["strategy"],),
+            ).fetchone()
+            _conn.close()
+            _disc_id = _dep_row["discovery_id"] if _dep_row else None
+            trade_kb_rows = [[InlineKeyboardButton("📊 Details", callback_data="dashboard")]]
+            if _disc_id:
+                trade_kb_rows.insert(0, [
+                    InlineKeyboardButton(
+                        f"⏸ Pause {t['asset']}", callback_data=f"trade_pause_confirm_{_disc_id}"
+                    ),
+                ])
             await ctx.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, text=msg,
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"),
-                ]]),
+                reply_markup=InlineKeyboardMarkup(trade_kb_rows),
             )
 
 
@@ -4142,6 +4543,135 @@ async def push_daily_status(ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📊 Dashboard",  callback_data="dashboard"),
             InlineKeyboardButton("🏆 Top Setups", callback_data="alpha"),
+        ]]),
+    )
+
+
+async def push_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
+    """Täglich 08:00 CEST: kompakter Daily Digest mit Regime, Lab und Alerts."""
+    from zoneinfo import ZoneInfo
+    now    = datetime.now(ZoneInfo("Europe/Berlin"))
+    datum  = _escape_md(now.strftime("%d.%m.%Y"))
+    heute  = now.strftime("%Y-%m-%d")
+
+    conn = get_connection()
+
+    # ── Live & Dry-Run Deployments ────────────────────────────────────────────
+    deps = conn.execute(
+        "SELECT id, strategy_key, base_strategy, asset, mode "
+        "FROM active_deployments WHERE active=1 ORDER BY mode DESC"
+    ).fetchall()
+
+    live_lines    = []
+    dry_lines     = []
+    best_dry_pf   = 0.0
+    best_dry_asset = "—"
+
+    for dep in deps:
+        dep = dict(dep)
+        sk  = dep["strategy_key"]
+        ast = dep["asset"]
+
+        today_rows = conn.execute(
+            "SELECT pnl_r FROM trades "
+            "WHERE strategy=? AND asset=? AND exit_ts IS NOT NULL "
+            "AND exit_ts >= ?",
+            (sk, ast, heute),
+        ).fetchall()
+        today_r = round(sum(r[0] for r in today_rows if r[0]), 2)
+
+        all_rows = conn.execute(
+            "SELECT pnl_r FROM trades WHERE strategy=? AND asset=? AND exit_ts IS NOT NULL",
+            (sk, ast),
+        ).fetchall()
+        n = len(all_rows)
+        gross_win  = sum(r[0] for r in all_rows if r[0] and r[0] > 0)
+        gross_loss = abs(sum(r[0] for r in all_rows if r[0] and r[0] < 0))
+        pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+        sign = "+" if today_r >= 0 else ""
+        r_str = _escape_md(f"{sign}{today_r:.2f}R")
+
+        if dep["mode"] == "live":
+            live_lines.append(
+                f"🔴 Live: `{_escape_md(ast)}/{_escape_md(dep['base_strategy'])}` "
+                f"\\| n\\=`{n}` \\| PnL heute: `{r_str}`"
+            )
+        else:
+            if pf and pf > best_dry_pf:
+                best_dry_pf   = pf
+                best_dry_asset = ast
+            dry_lines.append(dep)
+
+    # ── HMM-Regime (live aus Modell) ──────────────────────────────────────────
+    from research.train_hmm import get_current_regime
+    dep_assets = list(dict.fromkeys(dict(d)["asset"] for d in deps))
+    regime_emoji = {"TREND": "🟢", "SIDEWAYS": "🟡", "HIGH_VOL": "🔴"}
+    regime_lines = []
+    for ast in dep_assets:
+        try:
+            reg = get_current_regime(ast, conn)
+        except Exception:
+            reg = "?"
+        ico = regime_emoji.get(reg, "⚪")
+        regime_lines.append(f"  {ico} `{_escape_md(ast)}`: {_escape_md(reg)}")
+
+    # ── Lab-Stats ─────────────────────────────────────────────────────────────
+    disc_heute = conn.execute(
+        "SELECT COUNT(*) FROM lab_discoveries WHERE discovered_at >= ?",
+        (heute,),
+    ).fetchone()[0]
+    promoted_heute = conn.execute(
+        "SELECT COUNT(*) FROM lab_discoveries "
+        "WHERE deployment_status IN ('dry','live') AND deployed_at >= ?",
+        (heute,),
+    ).fetchone()[0]
+
+    # ── Alerts: DD-Warns + HMM_WARNs heute ───────────────────────────────────
+    alert_rows = conn.execute(
+        "SELECT COUNT(*) FROM governance_log "
+        "WHERE (reason LIKE '%HALF_SIZE%' OR reason LIKE '%HMM_WARN%') "
+        "AND ts >= ?",
+        (heute,),
+    ).fetchone()[0]
+
+    conn.close()
+
+    # ── Nachricht zusammenbauen ───────────────────────────────────────────────
+    lines = [f"📊 *APEX V2 — Daily Digest {datum}*", ""]
+
+    if live_lines:
+        lines += live_lines
+    else:
+        lines.append("🔴 Live: _kein aktives Live\\-Deployment_")
+
+    n_dry = len(dry_lines)
+    lines.append(
+        f"🔬 Dry\\-Run: `{n_dry}` aktive Deployments"
+        + (f" \\| beste: `{_escape_md(best_dry_asset)}`" if best_dry_asset != "—" else "")
+    )
+
+    lines += ["", "📡 *Regime:*"]
+    lines += regime_lines if regime_lines else ["  _keine Daten_"]
+    lines.append("_🟢 TREND \\| 🟡 SIDEWAYS \\| 🔴 HIGH\\_VOL_")
+
+    lines += [
+        "",
+        f"⚗️ *Lab:* `{disc_heute}` neue Discoveries \\| `{promoted_heute}` promoted",
+    ]
+
+    if alert_rows:
+        lines.append(f"⚠️ *Alerts:* `{alert_rows}` DD\\-Warn/HMM\\_WARN heute")
+    else:
+        lines.append("✅ *Alerts:* keine")
+
+    await ctx.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text="\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Portfolio", callback_data="portfolio_overview"),
+            InlineKeyboardButton("⚙️ Status",    callback_data="status"),
         ]]),
     )
 
@@ -4267,6 +4797,7 @@ def main():
     app.add_handler(CommandHandler("alpha",     cmd_alpha))
     app.add_handler(CommandHandler("lab_stats", cmd_lab_stats))
     app.add_handler(CommandHandler("deploy",   cmd_deploy))
+    app.add_handler(CommandHandler("promote",  cmd_promote))
     app.add_handler(CommandHandler("api_test",  cmd_api_test))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -4293,6 +4824,14 @@ def main():
 
     # Tagesstatus: täglich 08:00 UTC
     jq.run_daily(push_daily_status, time=datetime.strptime("08:00", "%H:%M").time())
+
+    # Daily Digest: täglich 08:00 CEST (Europe/Berlin)
+    from zoneinfo import ZoneInfo as _ZI
+    import datetime as _dt
+    jq.run_daily(
+        push_daily_digest,
+        time=_dt.time(8, 0, tzinfo=_ZI("Europe/Berlin")),
+    )
 
     # Go-Live Check: alle 15 Minuten
     jq.run_repeating(push_go_live_check, interval=900, first=60)

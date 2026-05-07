@@ -8,17 +8,28 @@ Ein vollständig automatisiertes Algorithmic-Trading-System für Bitget Futures 
 
 ## Aktueller Betriebsstatus (Stand: Mai 2026)
 
-| Asset | Modus | Strategie | MS | PF | WR | Regime |
-|-------|-------|-----------|-----|-----|-----|--------|
-| SOL | 💰 **LIVE** | donchian_breakout | 22.8 | 2.37 | 64% | SIDEWAYS |
-| XRP | ⚙️ Dry-Run | inside_bar_breakout | 21.7 | 2.40 | 66% | SIDEWAYS |
-| BTC | ⚙️ Dry-Run | donchian_breakout | 12.6 | 1.96 | 57% | SIDEWAYS |
-| LINK | 👁️ Shadow | donchian_breakout | 26.7 | 2.51 | 63% | SIDEWAYS |
-| AVAX | 👁️ Shadow | donchian_breakout | 22.6 | 2.60 | 68% | SIDEWAYS |
-| ADA | 👁️ Shadow | donchian_breakout | 31.7 | 2.85 | 70% | SIDEWAYS |
-| ETH | ⏸️ Pausiert | — | — | — | — | — |
+### OOS-Backtest-Ergebnisse (Walk-Forward, Brutto ohne Kosten)
 
-Alle Deployments basieren auf Lab-Discoveries mit `cooldown_bars=8` (8h Mindestabstand zwischen Trades) und bestandenem Walk-Forward-OOS-Test.
+| Asset | Modus | Strategie | MS | OOS-PF (Brutto) | Netto-PF (nach Kosten) | WR | Regime |
+|-------|-------|-----------|-----|-----------------|------------------------|----|--------|
+| SOL | 💰 **LIVE** | donchian_breakout | 22.8 | 2.37 | 1.78 | 64% | SIDEWAYS |
+| XRP | ⚙️ Dry-Run | inside_bar_breakout | 21.7 | 2.40 | 1.52 | 66% | SIDEWAYS |
+| BTC | ⚙️ Dry-Run | donchian_breakout | 12.6 | 1.96 | — | 57% | SIDEWAYS |
+| LINK | 👁️ Shadow | donchian_breakout | 26.7 | 2.51 | 1.44 | 63% | SIDEWAYS |
+| AVAX | 👁️ Shadow | donchian_breakout | 22.6 | 2.60 | 1.39 | 68% | SIDEWAYS |
+| ADA | 👁️ Shadow | donchian_breakout | 31.7 | 2.85 | 1.48 | 70% | SIDEWAYS |
+| ETH | ⏸️ Pausiert | — | — | — | — | — | — |
+
+> **OOS-PF (Brutto):** Backtest-Ergebnis ohne Slippage, Fees und Funding.
+> **Netto-PF (nach Kosten):** Backtest mit ROUND_TRIP=0.18% + Funding=0.01%/8h (Schätzwert, 180-Tage-Fenster).
+> BTC-Netto-PF noch nicht berechnet (Deployment zu neu).
+
+### Live Track Record
+
+> **Live seit 2026-05-06** — Track Record noch < 30 Trades. OOS-Zahlen sind Backtest-Prognosen, kein Live-Ergebnis.
+> Drift-Monitor (tägl. 06:00 UTC) vergleicht Live-PF mit OOS-PF — Auto-Pause bei Einbruch > 30%.
+
+Alle Deployments basieren auf Lab-Discoveries mit `cooldown_bars=8` (8h Mindestabstand zwischen Trades) und bestandenem Walk-Forward-OOS-Test (3 Fenster, gesamt n ≥ 100).
 
 ---
 
