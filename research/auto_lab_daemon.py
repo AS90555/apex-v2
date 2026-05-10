@@ -228,6 +228,14 @@ RANGES = {
         "SL_ATR_MULT":[0.5, 2.0, False],
         "TP_R":       [1.5, 5.0, False],
     },
+    "orb": {
+        "breakout_threshold_pct":  [0.0005, 0.005,  False],
+        "min_box_range_pct":       [0.002,  0.015,  False],
+        "max_box_age_bars":        [2,      12,     True],
+        "volume_ratio_min":        [1.0,    3.0,    False],
+        "max_breakout_dist_ratio": [1.0,    3.0,    False],
+        "sl_buffer_pct":           [0.0005, 0.003,  False],
+    },
 }
 
 GRIDS = {
@@ -377,6 +385,13 @@ SEARCH_SPACE = [
     ("supertrend",          "ADA"),
     ("supertrend",          "LINK"),
     ("supertrend",          "AVAX"),
+    ("orb",                 "BTC"),
+    ("orb",                 "ETH"),
+    ("orb",                 "SOL"),
+    ("orb",                 "XRP"),
+    ("orb",                 "ADA"),
+    ("orb",                 "LINK"),
+    ("orb",                 "AVAX"),
 ]
 
 def _load_requested_targets() -> list[tuple[str, str]]:
@@ -1136,6 +1151,14 @@ OPTUNA_SPACES: dict[str, dict[str, tuple]] = {
         "ST3_MULT":   (2.5, 5.0, False),
         "SL_ATR_MULT":(0.5, 2.0, False),
         "TP_R":       (1.5, 5.0, False),
+    },
+    "orb": {
+        "breakout_threshold_pct":  (0.0005, 0.005,  False),
+        "min_box_range_pct":       (0.002,  0.015,  False),
+        "max_box_age_bars":        (2,      12,     True),
+        "volume_ratio_min":        (1.0,    3.0,    False),
+        "max_breakout_dist_ratio": (1.0,    3.0,    False),
+        "sl_buffer_pct":           (0.0005, 0.003,  False),
     },
 }
 

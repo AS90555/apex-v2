@@ -188,6 +188,28 @@ class Executor:
         log(f"[EXECUTOR] Signal #{signal.id} {signal.strategy}/{signal.asset} "
             f"{signal.direction.upper()} — Modus: {signal.mode} — Lock (processing)")
 
+        # ── Dedup-Check: bereits heute ausgeführt? ────────────────────────────
+        _dup = conn.execute(
+            """SELECT id FROM signals
+               WHERE strategy=? AND asset=? AND mode=?
+                 AND DATE(created_at)=DATE(?)
+                 AND status='executed'
+                 AND id != ?
+               LIMIT 1""",
+            (signal.strategy, signal.asset, signal.mode, signal.created_at, signal.id),
+        ).fetchone()
+        if _dup:
+            log(f"[EXECUTOR] Signal #{signal.id} {signal.strategy}/{signal.asset}: "
+                f"Dedup — bereits heute ausgeführt (Signal #{_dup[0]}) → rejected")
+            conn.execute(
+                "UPDATE signals SET status='rejected', "
+                "reject_reason='dedup_executor: already_executed_today' WHERE id=?",
+                (signal.id,),
+            )
+            conn.commit()
+            conn.close()
+            return None
+
         # ── Schritt 2: Execution je nach Modus ───────────────────────────────
         # Shadow-Signale haben Status 'approved_shadow' und werden nie geladen.
         # Nur 'approved' (dry_run / live) gelangt hierher.

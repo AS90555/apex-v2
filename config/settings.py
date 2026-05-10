@@ -58,6 +58,7 @@ STRATEGY_ALLOWED_REGIMES: dict[str, list[str]] = {
     "ema_pullback":       ["TREND"],
     "inside_bar_breakout":["TREND"],
     "supertrend":         ["TREND", "HIGH_VOL"],
+    "orb":                ["TREND", "HIGH_VOL"],
     # Alle anderen (vaa, kdt, weekend_momo, asian_fade, vwap_bounce) → kein Filter
 }
 

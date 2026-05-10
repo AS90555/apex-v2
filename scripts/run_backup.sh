@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export RESTIC_REPOSITORY=/root/apex-v2/data/backups/restic-repo
-export RESTIC_PASSWORD=$(grep RESTIC_PASSWORD /root/apex-v2/.env | cut -d= -f2)
+export RESTIC_PASSWORD=$(grep RESTIC_PASSWORD /root/apex-v2/config/.env | cut -d= -f2)
 
 echo "[BACKUP] $(date -u +%Y-%m-%dT%H:%M:%SZ) — Starte restic Backup"
 

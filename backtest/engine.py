@@ -20,6 +20,7 @@ from typing import Optional
 from core.db import get_connection
 from core.utils import log
 from features.indicators import atr_wilder, ema, sma, bollinger_bands, vol_sma, body_sma, rsi as calc_rsi, is_squeeze
+from strategies.orb_signal_fn import orb_engine_adapter
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
@@ -1060,6 +1061,7 @@ SIGNAL_FNS = {
     "dual_donchian":      _dual_donchian_signal,
     "bb_kc_squeeze":      _bb_kc_squeeze_signal,
     "supertrend":         _supertrend_signal,
+    "orb":                orb_engine_adapter,
 }
 
 STRATEGY_INTERVAL = {
@@ -1076,6 +1078,7 @@ STRATEGY_INTERVAL = {
     "dual_donchian":      "1h",
     "bb_kc_squeeze":      "1h",
     "supertrend":         "1h",
+    "orb":                "1h",
 }
 
 EXIT_INTERVAL = {
@@ -1092,6 +1095,7 @@ EXIT_INTERVAL = {
     "dual_donchian":      "1h",
     "bb_kc_squeeze":      "1h",
     "supertrend":         "1h",
+    "orb":                "1h",
 }
 
 

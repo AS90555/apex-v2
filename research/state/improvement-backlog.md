@@ -32,16 +32,13 @@
 | B-07 | --max-targets N Flag für schnelle Smoke-Tests ohne vollen 65-Target-Run | Claude Code (Mess-Run Befund) | Klein | N_TRIALS_DAEMON implementiert |
 | B-10 | DSR-Verteilung im Lab-Pool analysieren: AVG/MIN/MAX nach deployment_status — sicherstellen dass deployten Strategies DSR-top sind | weekly-report 2026-05-07 | Klein | — |
 
-## OPEN — Intake & Datenqualität
-| ID | Idee | Quelle | Aufwand | Abhängigkeit |
-|----|------|--------|---------|--------------|
-| B-09 | ETH/4h Gap-Warnung: fetched=0 für Lücke 1775534400000→1775577600000 persistent — Intake-Bug oder Binance-Datenlücke diagnostizieren | weekly-report 2026-05-07 | Klein | — |
-
 ---
 
 ## DONE — Infrastruktur
 | ID | Idee | Abgeschlossen | Ergebnis |
 |----|------|---------------|---------|
+| B-13 | Executor-Dedup: WS-Intake erzeugte Phantom-Signals (signal_key=None) → 34 failed ETH/squeeze in 24h | DONE 2026-05-09 | Dedup-Check in executor.py vor Execution: wenn (strategy, asset, mode, DATE) bereits 'executed', → rejected mit reason 'dedup_executor: already_executed_today' |
+| B-09 | ETH/4h Gap-Warnung: fetched=0 Lücke diagnostizieren | DONE 2026-05-08 | Kein Bug — historische Binance-Datenlücke 07./08.04. (36h); Alert-Schwellwert false-positive; keine Aktion erforderlich |
 | B-02 | Backup-Staleness-Alert: Telegram-Warnung wenn letzter Snapshot > 25h | DONE 2026-05-07 | Staleness-Check am Ende von run_backup.sh; curl an Telegram-API wenn AGE_MIN > 1500 |
 | B-03 | governance_invariants.py erstellen + in GitHub Actions einbinden | DONE 2026-05-07 | tests/governance_invariants.py; 2 Checks (approved-Signals + live-Deployments); in test-gate.yml als dritter Step |
 
