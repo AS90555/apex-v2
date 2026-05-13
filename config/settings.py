@@ -87,6 +87,9 @@ V6_GATES_ENFORCED   = os.getenv("V6_GATES_ENFORCED",   "true").lower()  == "true
 # v7 Phase 2: DSR aus Block-Bootstrap statt direkter Schätzung
 V7_MC_DSR_ENFORCED  = os.getenv("V7_MC_DSR_ENFORCED",  "false").lower() == "true"
 
+# v7.0 (2026-05-13): initiale Versionierung; Gewichte unverändert zu v6.
+# Änderungen: PR + Changelog in backtest/composite_score.py + Re-Backtest erforderlich.
+COMPOSITE_WEIGHTS_VERSION = "v7.0"
 COMPOSITE_WEIGHTS = {
     "sharpe":    0.30,
     "dsr":       0.25,

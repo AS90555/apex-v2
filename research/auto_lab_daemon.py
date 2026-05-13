@@ -45,6 +45,7 @@ from features.indicators import (
     ema, atr_wilder, sma, detect_regime as _detect_regime_fn,
     REGIME_EMA_PERIOD, REGIME_SLOPE_PCT,
 )
+from research.lab_search_config import LAB_SEARCH_CFG
 
 
 # ── Logging mit Rotation ─────────────────────────────────────────────────────
@@ -840,15 +841,15 @@ def _save_discovery(conn, h: str, strategy: str, asset: str, regime: str,
             n_train, pf_train, avg_r_train,
             n_test,  pf_test,  avg_r_test,  wr_test,
             fitness_score, max_dd_r, micro_score, signals_per_week, notified, cooldown_bars,
-            cost_model_applied, dsr)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,1,?)""",
+            cost_model_applied, dsr, framework_version, lab_config_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,1,?,?,?)""",
         (
             datetime.now(timezone.utc).isoformat(), h, strategy, asset, regime,
             json.dumps(_round_params(params), sort_keys=True),
             tr["n"], tr["pf"], tr["avg_r"],
             te["n"], te["pf"], te["avg_r"], te["wr"],
             fitness, max_dd_r, micro_score, te.get("spw", 0.0), COOLDOWN_BARS,
-            dsr,
+            dsr, "v7", LAB_SEARCH_CFG.hash(),
         ),
     )
     disc_id = cur.lastrowid
@@ -1244,9 +1245,10 @@ def _run_optuna_target(strategy: str, asset: str,
     start_ms = now_ms - DAYS * 86_400_000
 
     study = optuna.create_study(
+        study_name=f"{strategy}_{asset}_{LAB_SEARCH_CFG.short_hash()}",
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+        sampler=LAB_SEARCH_CFG.build_sampler(),
+        pruner=LAB_SEARCH_CFG.build_pruner(),
     )
     study.optimize(
         lambda trial: _optuna_objective(trial, strategy, asset, now_ms, start_ms, conn),

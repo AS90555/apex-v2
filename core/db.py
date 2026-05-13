@@ -413,6 +413,31 @@ def run_migrations():
     # pf_test_netto Bug-Fix: Spalte existiert, aber INSERT in auto_lab_daemon
     # populiert sie nicht — bereits als ALTER oben gesichert; hier nur dokumentiert.
 
+    # ── V7 Schema-Migrationen ────────────────────────────────────────────────
+    ld_cols_v7 = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    _ld_v7 = {
+        "lab_config_hash":       "TEXT",
+        "composite_weights_hash": "TEXT",
+    }
+    for col, typedef in _ld_v7.items():
+        if col not in ld_cols_v7:
+            conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {typedef}")
+
+    trade_cols_v7 = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    if "signal_to_fill_ms" not in trade_cols_v7:
+        conn.execute("ALTER TABLE trades ADD COLUMN signal_to_fill_ms REAL")
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS asset_execution_calibration (
+            asset                       TEXT PRIMARY KEY,
+            slippage_slope_bps_per_ms   REAL,
+            r_squared                   REAL,
+            recommended_tolerance_bps   REAL,
+            n_samples                   INTEGER,
+            updated_at                  TEXT DEFAULT (datetime('now'))
+        );
+    """)
+
     conn.commit()
     conn.close()
 
