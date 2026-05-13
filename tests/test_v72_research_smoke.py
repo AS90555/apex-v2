@@ -72,17 +72,17 @@ def _patch_objective(eval_result=None):
     return _fake_objective_v72
 
 
-def test_dry_run_no_db_write(isolated_live_db, isolated_staging_db, monkeypatch):
+def test_dry_run_no_db_write(isolated_live_db, isolated_staging_db, monkeypatch, tmp_path):
     """--dry-run erzeugt keinen Staging-Eintrag."""
     monkeypatch.setattr(
         sys, "argv",
         ["run_v72_research.py", "--strategy", "donchian_breakout",
          "--asset", "BTC", "--n-trials", "3", "--dry-run"],
     )
-
-    with patch("scripts.run_v72_research.objective_v72", side_effect=_patch_objective()):
-        from scripts.run_v72_research import main
-        study = main()
+    import scripts.run_v72_research as _mod
+    with patch.object(_mod, "objective_v72", side_effect=_patch_objective()), \
+         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")):
+        study = _mod.main()
 
     conn = sqlite3.connect(isolated_staging_db)
     count = conn.execute("SELECT COUNT(*) FROM lab_discoveries WHERE framework_version='v7.2'").fetchone()[0]
@@ -90,7 +90,7 @@ def test_dry_run_no_db_write(isolated_live_db, isolated_staging_db, monkeypatch)
     assert count == 0
 
 
-def test_dry_run_report_created(isolated_live_db, isolated_staging_db, monkeypatch):
+def test_dry_run_report_created(isolated_live_db, isolated_staging_db, monkeypatch, tmp_path):
     """--dry-run erstellt trotzdem die korrekte Anzahl Trials."""
     monkeypatch.setattr(
         sys, "argv",
@@ -98,13 +98,14 @@ def test_dry_run_report_created(isolated_live_db, isolated_staging_db, monkeypat
          "--asset", "BTC", "--n-trials", "3", "--dry-run"],
     )
     import scripts.run_v72_research as _mod
-    with patch.object(_mod, "objective_v72", side_effect=_patch_objective()):
+    with patch.object(_mod, "objective_v72", side_effect=_patch_objective()), \
+         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")):
         study = _mod.main()
 
     assert len(study.trials) == 3
 
 
-def test_no_dry_run_writes_staging(isolated_live_db, isolated_staging_db, monkeypatch):
+def test_no_dry_run_writes_staging(isolated_live_db, isolated_staging_db, monkeypatch, tmp_path):
     """Ohne --dry-run: 3 Trials → 3 Staging-Einträge mit framework_version='v7.2'."""
     monkeypatch.setattr(
         sys, "argv",
@@ -118,7 +119,8 @@ def test_no_dry_run_writes_staging(isolated_live_db, isolated_staging_db, monkey
     import scripts.run_v72_research as _mod
     with patch.object(_mod, "V72_RESEARCH_ENABLED", True), \
          patch.object(_mod, "get_staging_connection", return_value=staging_conn), \
-         patch.object(_mod, "objective_v72", side_effect=_patch_objective()):
+         patch.object(_mod, "objective_v72", side_effect=_patch_objective()), \
+         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")):
         study = _mod.main()
 
     # main() schliesst staging_conn — neue Verbindung zum Lesen
@@ -131,7 +133,7 @@ def test_no_dry_run_writes_staging(isolated_live_db, isolated_staging_db, monkey
     assert count >= 1
 
 
-def test_disabled_without_dry_run_exits(monkeypatch):
+def test_disabled_without_dry_run_exits(monkeypatch, tmp_path):
     """V72_RESEARCH_ENABLED=false ohne --dry-run → sys.exit(1)."""
     monkeypatch.setattr(
         sys, "argv",
@@ -139,6 +141,7 @@ def test_disabled_without_dry_run_exits(monkeypatch):
     )
     import scripts.run_v72_research as _mod
     with patch.object(_mod, "V72_RESEARCH_ENABLED", False), \
+         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")), \
          pytest.raises(SystemExit) as exc_info:
         _mod.main()
     assert exc_info.value.code == 1

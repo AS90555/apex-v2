@@ -247,6 +247,16 @@ def get_staging_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.row_factory = sqlite3.Row
     conn.executescript(STAGING_DDL)
+    # Additive Staging-Migrationen für bestehende DBs
+    _st_cols = {r[1] for r in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    for _col, _typedef in [
+        ("source_discovery_id", "INTEGER"),
+        ("study_hash",          "TEXT"),
+        ("objective_version",   "TEXT"),
+    ]:
+        if _col not in _st_cols:
+            conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {_col} {_typedef}")
+    conn.commit()
     return conn
 
 
