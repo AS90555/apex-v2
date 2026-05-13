@@ -1323,11 +1323,18 @@ def _apply_trade_costs(trade: BtTrade, conn=None) -> BtTrade:
     Zieht Transaktionskosten vom abgeschlossenen Trade ab.
     Kostenmodell: Round-Trip-Fee+Slippage + Funding (Point-in-Time wenn verfügbar).
     """
-    from config.settings import ROUND_TRIP, FUNDING_8H
+    from config.settings import ROUND_TRIP, FUNDING_8H, MAKER_FEE, TAKER_FEE, SLIPPAGE_EST, V7_MAKER_TAKER_SPLIT
     sig      = trade.signal
     notional = sig.entry_price * sig.size
 
-    rt_cost  = notional * ROUND_TRIP
+    if V7_MAKER_TAKER_SPLIT:
+        # IOC-Limit → Maker-Fee bei Fill; sonst Taker-Fee (konservativ immer Taker Exit)
+        order_type = getattr(sig, "order_type_used", "ioc_limit")
+        entry_fee  = MAKER_FEE if order_type == "ioc_limit" else TAKER_FEE
+        exit_fee   = TAKER_FEE  # Exits via Market/SL → immer Taker
+        rt_cost = notional * (entry_fee + SLIPPAGE_EST + exit_fee + SLIPPAGE_EST)
+    else:
+        rt_cost  = notional * ROUND_TRIP
 
     # Point-in-Time Funding aus DB; Fallback auf statisches Modell
     if conn is not None and trade.exit_ts:

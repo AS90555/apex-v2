@@ -91,6 +91,11 @@ V7_MC_DSR_ENFORCED  = os.getenv("V7_MC_DSR_ENFORCED",  "false").lower() == "true
 FUNDING_SIZE_K  = 1.0   # Skalierungsfaktor für Funding-Drag-Adjustment in sizing.py
 V7_FUNDING_SIZING = os.getenv("V7_FUNDING_SIZING", "true").lower() == "true"
 
+# ── v7 Phase 7 — Maker-Taker-Kostendifferenzierung ──────────────────────────
+# False: bisheriges ROUND_TRIP-Modell (alle Orders = Taker). True: IOC-Limit
+# → Maker-Fee wenn Fill; Market-Order / Timeout → Taker-Fee.
+V7_MAKER_TAKER_SPLIT = os.getenv("V7_MAKER_TAKER_SPLIT", "false").lower() == "true"
+
 # ── v7 Phase 6 — Re-Evaluation Gate ─────────────────────────────────────────
 # Initial False: bestehende Discoveries nicht automatisch demoten.
 # Manuell auf True setzen (via Telegram-Workflow) nach erfolgreicher Re-Eval.
