@@ -16,6 +16,7 @@ from typing import Optional
 
 from backtest.engine import run_backtest, BtResult
 from backtest.metrics import sharpe, sortino, max_drawdown, calmar, dsr
+from features.registry import compute_max_lookback
 from core.utils import log
 
 
@@ -96,7 +97,7 @@ def run_walk_forward(
     is_bars:      int   = 4320,   # ~6 Monate bei 1h
     oos_bars:     int   = 720,    # ~1 Monat bei 1h
     step_bars:    int   = 720,    # Walk-Forward-Step
-    purge_bars:   int   = 200,    # Feature-Lookback-Puffer
+    purge_bars:   int   | None = None,  # None → compute_max_lookback(strategy)
     embargo_bars: int   = 8,      # Ø Trade-Haltedauer
     interval_ms:  int   = 3_600_000,
     cooldown_bars: int  = 8,
@@ -113,6 +114,9 @@ def run_walk_forward(
     Jeder Fold schreitet um step_bars vor.
     """
     result = WalkForwardResult(strategy=strategy, asset=asset)
+
+    if purge_bars is None:
+        purge_bars = compute_max_lookback(strategy)
 
     purge_ms   = purge_bars   * interval_ms
     embargo_ms = embargo_bars * interval_ms
