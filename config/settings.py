@@ -81,7 +81,8 @@ DSR_MIN_DRY_RUN   = 0.50   # Hard-Gate: DSR ≥ 0.50 für dry_run
 DSR_MIN_LIVE      = 0.65   # Hard-Gate: DSR ≥ 0.65 für live
 PBO_MAX           = 0.30   # Hard-Gate: PBO ≤ 0.30
 STABILITY_MIN     = 0.50   # Hard-Gate: stability_score ≥ 0.50
-MAX_DD_GATE       = 0.30   # Hard-Gate: |MaxDD| ≤ 30 % des Kapitals (in R: ≤ -15R bei 5R/Trade)
+MAX_DD_GATE       = 5.0    # Hard-Gate: |MaxDD| ≤ 5R kumulativer Drawdown im schlechtesten OOS-Fold.
+                           # max_drawdown() gibt R-Einheiten (kumulativ); 5R ≈ 30% Kapital bei ~2% Sizing/Trade.
 V6_STATS_ENFORCED   = os.getenv("V6_STATS_ENFORCED",   "false").lower() == "true"
 V6_GATES_ENFORCED   = os.getenv("V6_GATES_ENFORCED",   "true").lower()  == "true"
 # v7 Phase 2: DSR aus Block-Bootstrap statt direkter Schätzung
@@ -279,3 +280,8 @@ ATR_TP_MULTIPLIER     = 3.0
 
 # ── Telegram Shadow-Prefix ────────────────────────────────────────────────────
 TELEGRAM_V2_PREFIX = "[V2·SHADOW]"
+
+# ── v7.2 Research (2026-05-13) ───────────────────────────────────────────────
+RANDOM_SEED           = 42       # globaler Determinismus für Optuna/MC/Bootstrap
+OBJECTIVE_V72_VERSION = "v72.0"  # Bump bei Änderung der Objective-Funktion
+V72_RESEARCH_ENABLED  = os.getenv("V72_RESEARCH_ENABLED", "false").lower() == "true"

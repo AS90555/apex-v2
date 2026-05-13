@@ -73,6 +73,25 @@ def _check_integrity(row) -> tuple[bool, str]:
         if row["intrabar_model"] == "static":
             return False, "intrabar_model=static (nicht erlaubt im v6-enforced Modus)"
 
+    # ── v7.2-spezifische Integrität ──────────────────────────────────────────
+    _fw = row["framework_version"] if "framework_version" in row.keys() else None
+    if _fw == "v7.2":
+        _sh = row["study_hash"] if "study_hash" in row.keys() else None
+        if not _sh:
+            return False, "v7.2: study_hash missing"
+        _ov = row["objective_version"] if "objective_version" in row.keys() else None
+        if not _ov:
+            return False, "v7.2: objective_version missing"
+        dsr_v72 = (row["dsr_value"] if "dsr_value" in row.keys() else None) or 0
+        if dsr_v72 < DSR_MIN:
+            return False, f"v7.2: dsr_value={dsr_v72:.3f} < {DSR_MIN}"
+        pbo_v72 = (row["pbo_value"] if "pbo_value" in row.keys() else None) or 1.0
+        if pbo_v72 > PBO_MAX:
+            return False, f"v7.2: pbo_value={pbo_v72:.3f} > {PBO_MAX}"
+        stab_v72 = (row["stability_score"] if "stability_score" in row.keys() else None) or 0
+        if stab_v72 < STABILITY_MIN:
+            return False, f"v7.2: stability_score={stab_v72:.3f} < {STABILITY_MIN}"
+
     return True, "ok"
 
 

@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS lab_discoveries (
     backtest_slippage_assumption REAL,
     backtest_funding_model      TEXT DEFAULT 'static',
     intrabar_model              TEXT DEFAULT 'static',
+    -- V7.1-Spalten
+    source_discovery_id         INTEGER,
+    -- V7.2-Spalten
+    study_hash                  TEXT,
+    objective_version           TEXT,
     -- Staging-Status
     sync_status                 TEXT DEFAULT 'pending',
     -- pending → synced | rejected_integrity

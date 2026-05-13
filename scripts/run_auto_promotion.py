@@ -119,7 +119,7 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
     # v7 Re-Eval-Gate: Discovery muss unter v7-Framework bewertet sein
     if V7_REEVAL_REQUIRED:
         fw_version = disc.get("framework_version")
-        if fw_version != "v7":
+        if fw_version not in ("v7", "v7.1", "v7.2"):
             failed.append(f"v7-Re-Eval ausstehend (framework_version={fw_version})")
 
     # Kein aktives Duplikat (gleiche base_strategy + asset + mode='dry_run')

@@ -453,6 +453,18 @@ def run_migrations():
         );
     """)
 
+    # ── V7.1 Schema-Migrationen ──────────────────────────────────────────────
+    ld_cols_v71 = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    if "source_discovery_id" not in ld_cols_v71:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN source_discovery_id INTEGER")
+
+    # ── V7.2 Schema-Migrationen ──────────────────────────────────────────────
+    ld_cols_v72 = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    if "study_hash" not in ld_cols_v72:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN study_hash TEXT")
+    if "objective_version" not in ld_cols_v72:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN objective_version TEXT")
+
     conn.commit()
     conn.close()
 
