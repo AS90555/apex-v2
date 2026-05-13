@@ -91,6 +91,12 @@ V7_MC_DSR_ENFORCED  = os.getenv("V7_MC_DSR_ENFORCED",  "false").lower() == "true
 FUNDING_SIZE_K  = 1.0   # Skalierungsfaktor für Funding-Drag-Adjustment in sizing.py
 V7_FUNDING_SIZING = os.getenv("V7_FUNDING_SIZING", "true").lower() == "true"
 
+# ── v7 Phase 6 — Re-Evaluation Gate ─────────────────────────────────────────
+# Initial False: bestehende Discoveries nicht automatisch demoten.
+# Manuell auf True setzen (via Telegram-Workflow) nach erfolgreicher Re-Eval.
+V7_REEVAL_REQUIRED  = os.getenv("V7_REEVAL_REQUIRED", "false").lower() == "true"
+OOS_FOLDS_MIN_V7    = 3   # Minimum OOS-Folds für v7-Re-Eval
+
 # v7.0 (2026-05-13): initiale Versionierung; Gewichte unverändert zu v6.
 # Änderungen: PR + Changelog in backtest/composite_score.py + Re-Backtest erforderlich.
 COMPOSITE_WEIGHTS_VERSION = "v7.0"

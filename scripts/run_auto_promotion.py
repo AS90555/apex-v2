@@ -70,6 +70,7 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
     """
     from config.settings import (
         DSR_MIN_DRY_RUN, DSR_MIN_LIVE, PBO_MAX, STABILITY_MIN, V6_GATES_ENFORCED,
+        V7_REEVAL_REQUIRED,
     )
     failed: list[str] = []
 
@@ -114,6 +115,12 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
         fw_version = disc.get("framework_version")
         if fw_version != "v6":
             failed.append(f"framework_version={fw_version} != v6 (v6 Hard-Gate)")
+
+    # v7 Re-Eval-Gate: Discovery muss unter v7-Framework bewertet sein
+    if V7_REEVAL_REQUIRED:
+        fw_version = disc.get("framework_version")
+        if fw_version != "v7":
+            failed.append(f"v7-Re-Eval ausstehend (framework_version={fw_version})")
 
     # Kein aktives Duplikat (gleiche base_strategy + asset + mode='dry_run')
     dup = conn.execute(

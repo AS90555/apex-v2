@@ -168,8 +168,9 @@ def run_walk_forward(
             pf_oos     = _pf(rs_oos),
             wr_oos     = round(_wr(rs_oos), 4),
         )
-        # Versteckte Liste für all_oos_pnl_rs
+        # Versteckte Listen für PBO und all_oos_pnl_rs
         fold._oos_pnl_rs = rs_oos  # type: ignore[attr-defined]
+        fold._is_pnl_rs  = rs_is   # type: ignore[attr-defined]
 
         result.folds.append(fold)
         fold_idx  += 1
