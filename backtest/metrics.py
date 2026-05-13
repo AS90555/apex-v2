@@ -139,32 +139,57 @@ def dsr(pnl_rs: list[float], n_tested: int = 1) -> float:
 
 def pbo(is_returns: list[list[float]], oos_returns: list[list[float]]) -> float:
     """
-    Probability of Backtest Overfitting (Bailey et al. 2017).
-    Vereinfachte CSCV-Variante: vergleicht IS-Rang mit OOS-Performance.
+    Probability of Backtest Overfitting via CSCV (Bailey et al. 2017, v7 Phase 2).
 
-    is_returns:  Liste von IS-R-Listen pro Fold/Kombination.
-    oos_returns: korrespondierende OOS-R-Listen.
+    Combinatorial Symmetric Cross-Validation:
+      - N Fold-Paare (IS, OOS) aus Walk-Forward oder Optuna-Trials.
+      - Bildet alle Kombinationen von N//2 Folds als "IS-Subsets".
+      - Pro Kombination: identifiziere IS-bestes Fold, prüfe ob dessen OOS-
+        Performance ≤ Median aller OOS-Sharpes (= Overfitting).
+      - PBO = P(IS-beste Auswahl ist im OOS unterdurchschnittlich).
 
-    Gibt P(OOS-Performance ≤ Median der OOS-Verteilung | IS-Beste ausgewählt).
+    Gibt Wert in [0, 1] zurück; niedrig = kein Overfitting-Signal.
+    Bei < 4 Folds: Rückgabe 0.5 (neutral — zu wenig Daten).
     """
     n = len(is_returns)
-    if n < 2:
+    if n < 4:
         return 0.5
 
     is_sharpes  = [sharpe(r) for r in is_returns]
     oos_sharpes = [sharpe(r) for r in oos_returns]
 
-    # IS-Beste Strategie per Fold ermitteln
-    best_is_idx = is_sharpes.index(max(is_sharpes))
-    oos_median  = sorted(oos_sharpes)[n // 2]
+    # Median aller OOS-Sharpes (Gesamt-Benchmark)
+    oos_sorted = sorted(oos_sharpes)
+    oos_median = oos_sorted[n // 2]
 
-    # PBO = Anteil der Folds wo IS-Beste im OOS unter dem Median liegt
-    # Vereinfacht: 1 Fold → binär
-    dominated = sum(
-        1 for i in range(n)
-        if i == best_is_idx and oos_sharpes[i] <= oos_median
-    )
-    return round(dominated / 1, 4)  # 0.0 oder 1.0 bei 1 Fold
+    # Alle Kombinationen von n//2 Fold-Indizes als "IS-Subset"
+    # Kombinatorisch: C(n, n//2) — für n≤16 praktikabel (max C(16,8)=12870)
+    from itertools import combinations
+    half = n // 2
+    dominated_count = 0
+    total_combos    = 0
+
+    for is_idx in combinations(range(n), half):
+        oos_idx = [i for i in range(n) if i not in is_idx]
+
+        # IS-bestes Fold in diesem Subset
+        best_local_is = max(is_idx, key=lambda i: is_sharpes[i])
+
+        # OOS-Sharpe des IS-besten Folds
+        oos_of_best = oos_sharpes[best_local_is]
+
+        # OOS-Median dieses Subsets
+        local_oos_sharpes = sorted(oos_sharpes[i] for i in oos_idx)
+        local_median = local_oos_sharpes[len(local_oos_sharpes) // 2]
+
+        if oos_of_best < local_median:
+            dominated_count += 1
+        total_combos += 1
+
+    if total_combos == 0:
+        return 0.5
+
+    return round(dominated_count / total_combos, 4)
 
 
 def stability_score(

@@ -1,7 +1,11 @@
 """
-Monte-Carlo-Permutationen für Backtest-Validierung (Phase 4).
+Monte-Carlo-Permutationen für Backtest-Validierung (Phase 4 / v7 Phase 2).
 
 Block-Bootstrap der Returns → 1000 Equity-Kurven → Perzentile + Ruin-Wahrscheinlichkeit.
+
+v7 Ergänzung:
+  bootstrap_dsr() — DSR-Verteilung aus Block-Bootstrap; liefert stabilen
+  Median statt Single-Sample-Schätzung. Pflicht-Basis für Composite-Score.
 """
 
 from __future__ import annotations
@@ -91,3 +95,51 @@ def run_monte_carlo(
         ruin_probability = round(ruin_count / n_paths, 4),
         median_sharpe    = round(sharpes_s[n // 2], 4),
     )
+
+
+def bootstrap_dsr(
+    pnl_rs:     list[float],
+    n_tested:   int = 1,
+    n_iter:     int = 1000,
+    block_size: int = 10,
+    seed:       int = 42,
+) -> tuple[float, float]:
+    """
+    Schätzt DSR via Block-Bootstrap (v7 Phase 2).
+
+    Zieht n_iter Block-Bootstrap-Stichproben aus pnl_rs und berechnet
+    für jede DSR nach Bailey & López de Prado (inkl. γ3/γ4-Korrektur).
+    Gibt (median_dsr, std_dsr) zurück.
+
+    Verwendet als Pflicht-Basis für Composite-Score wenn
+    V7_MC_DSR_ENFORCED=True (config/settings.py).
+    """
+    from backtest.metrics import dsr as calc_dsr
+
+    T = len(pnl_rs)
+    if T < 10:
+        return 0.0, 0.0
+
+    rng = random.Random(seed)
+    dsr_values: list[float] = []
+
+    for _ in range(n_iter):
+        path: list[float] = []
+        while len(path) < T:
+            start = rng.randint(0, T - 1)
+            path.extend(pnl_rs[start:start + block_size])
+        path = path[:T]
+        dsr_values.append(calc_dsr(path, n_tested=n_tested))
+
+    dsr_values.sort()
+    n = len(dsr_values)
+    median = dsr_values[n // 2]
+
+    if n >= 2:
+        mean = sum(dsr_values) / n
+        variance = sum((x - mean) ** 2 for x in dsr_values) / (n - 1)
+        std = math.sqrt(variance)
+    else:
+        std = 0.0
+
+    return round(median, 6), round(std, 6)

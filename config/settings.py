@@ -82,8 +82,10 @@ DSR_MIN_LIVE      = 0.65   # Hard-Gate: DSR ≥ 0.65 für live
 PBO_MAX           = 0.30   # Hard-Gate: PBO ≤ 0.30
 STABILITY_MIN     = 0.50   # Hard-Gate: stability_score ≥ 0.50
 MAX_DD_GATE       = 0.30   # Hard-Gate: |MaxDD| ≤ 30 % des Kapitals (in R: ≤ -15R bei 5R/Trade)
-V6_STATS_ENFORCED = os.getenv("V6_STATS_ENFORCED", "false").lower() == "true"
-V6_GATES_ENFORCED = os.getenv("V6_GATES_ENFORCED", "true").lower() == "true"
+V6_STATS_ENFORCED   = os.getenv("V6_STATS_ENFORCED",   "false").lower() == "true"
+V6_GATES_ENFORCED   = os.getenv("V6_GATES_ENFORCED",   "true").lower()  == "true"
+# v7 Phase 2: DSR aus Block-Bootstrap statt direkter Schätzung
+V7_MC_DSR_ENFORCED  = os.getenv("V7_MC_DSR_ENFORCED",  "false").lower() == "true"
 
 COMPOSITE_WEIGHTS = {
     "sharpe":    0.30,
