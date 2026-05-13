@@ -69,6 +69,70 @@ SLIPPAGE_EST = 0.0003   # 0.03% geschätzte Markt-Slippage
 FUNDING_8H   = 0.0001   # 0.01% Funding-Rate per 8h-Periode
 ROUND_TRIP   = (TAKER_FEE + SLIPPAGE_EST) * 2  # 0.18% gesamt Ein+Ausstieg
 
+# ── Backtest Intrabar-Modell (v6) ────────────────────────────────────────────
+# 'static'   — High/Low-Check pro Bar (konservativ, kein Intrabar-Pfad)
+# '1m_zoom'  — 1m-Kerzen wenn vorhanden, sonst GBM-Fallback
+INTRABAR_MODEL         = os.getenv("INTRABAR_MODEL", "static")
+GBM_N_PATHS            = 500
+N_CALIBRATION_CANDLES  = 200
+
+# ── Walk-Forward & Statistische Härtung (v6 Phase 4) ─────────────────────────
+DSR_MIN_DRY_RUN   = 0.50   # Hard-Gate: DSR ≥ 0.50 für dry_run
+DSR_MIN_LIVE      = 0.65   # Hard-Gate: DSR ≥ 0.65 für live
+PBO_MAX           = 0.30   # Hard-Gate: PBO ≤ 0.30
+STABILITY_MIN     = 0.50   # Hard-Gate: stability_score ≥ 0.50
+MAX_DD_GATE       = 0.30   # Hard-Gate: |MaxDD| ≤ 30 % des Kapitals (in R: ≤ -15R bei 5R/Trade)
+V6_STATS_ENFORCED = os.getenv("V6_STATS_ENFORCED", "false").lower() == "true"
+V6_GATES_ENFORCED = os.getenv("V6_GATES_ENFORCED", "false").lower() == "true"
+
+COMPOSITE_WEIGHTS = {
+    "sharpe":    0.30,
+    "dsr":       0.25,
+    "max_dd":    0.20,
+    "stability": 0.15,
+    "pbo":       0.10,
+}
+
+# ── Governance v2 (v6 Phase 6) ───────────────────────────────────────────────
+STALE_CANDLE_TOLERANCE_SECONDS = 900          # 15 min — Kerze älter → stale_market_data
+FUNDING_RATE_WARN_THRESHOLD    = 0.0005       # 0.05% per 8h → Warning
+FUNDING_RATE_BLOCK_THRESHOLD   = 0.002        # 0.20% per 8h → Block wenn gegen Signal-Richtung
+ATR_SIZING_PERIOD              = 14           # ATR-Periode für Vol-Targeting
+TARGET_VOLATILITY_PCT          = 0.02         # 2% Tages-Vol-Ziel
+V6_VOL_TARGETING               = os.getenv("V6_VOL_TARGETING", "false").lower() == "true"
+REGIME_SIZE_MULTIPLIERS: dict[str, float] = {
+    "TREND":    1.0,
+    "SIDEWAYS": 0.75,
+    "HIGH_VOL": 0.50,
+    "UNDEFINED": 0.25,
+}
+# Portfolio-Exposure-Grenzen
+PORTFOLIO_MAX_EXPOSURE_USDT  = float(os.getenv("PORTFOLIO_MAX_EXPOSURE_USDT", "500"))
+PORTFOLIO_MAX_CLUSTER_USDT   = float(os.getenv("PORTFOLIO_MAX_CLUSTER_USDT",  "800"))
+PORTFOLIO_CORR_LIMIT         = float(os.getenv("PORTFOLIO_CORR_LIMIT",        "600"))
+# Asset-Cluster-Mapping für Korrelations-Budget
+CLUSTER_MAP: dict[str, str] = {
+    "BTC": "l1_btc", "ETH": "l1_eth",
+    "SOL": "l1_alt", "AVAX": "l1_alt",
+    "XRP": "l1_xrp", "ADA": "l1_xrp",
+    "LINK": "defi",  "AAVE": "defi",
+    "DOGE": "meme",  "SUI":  "l1_alt",
+}
+
+# ── Market Impact + Liquidität (v6 Phase 7) ──────────────────────────────────
+MARKET_IMPACT_THRESHOLD       = 0.10   # Order ≤ 10% von L1-Depth → Market Order
+IOC_SLIPPAGE_TOLERANCE_BASE   = 5.0    # Basis-IOC-Toleranz in bps
+WORST_CASE_TOLERANCE          = 25.0   # Max IOC-Toleranz bei Stale-Daten / Degradation
+LIQUIDITY_DEGRADATION_THRESHOLD = 0.50 # Score < 0.5 → Stress-Modus
+LIQUIDITY_STRESS_MULTIPLIER   = 2.0    # Toleranz × 2 bei Degradation
+V6_MARKET_IMPACT_GUARD        = os.getenv("V6_MARKET_IMPACT_GUARD", "false").lower() == "true"
+
+# ── Execution-Härtung (v6 Phase 5) ──────────────────────────────────────────
+SLIPPAGE_ALERT_THRESHOLD_BPS  = 8      # Median-Slippage > 8bps → shadow + Alert
+DEAD_MANS_TIMEOUT_SECONDS     = 300    # Heartbeat-Alter > 5min → DMS-Aktivierung
+DEAD_MANS_RETRY_WAIT_SECONDS  = 120    # Wartezeit vor zweitem DMS-Check
+RECONCILE_SIZE_TOLERANCE      = 0.001  # Toleranz für Positions-Größenvergleich
+
 # ── Bitget Handelsparameter ──────────────────────────────────────────────────
 LEVERAGE     = 5
 MARGIN_MODE  = "isolated"

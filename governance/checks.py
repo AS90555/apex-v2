@@ -10,6 +10,8 @@ Reihenfolge (in gate.py registriert):
   6. check_position_open      — Asset bereits in offener Position
   7. check_session_traded     — Bereits in dieser Session gehandelt
   8. check_btc_cross_asset    — Soft-Filter: BTC-Regime als Markt-Kontext (Phase 1: nur logging)
+  9. stale_candle             — Kerze älter als STALE_CANDLE_TOLERANCE_SECONDS → rejected (v6)
+ 10. funding_rate             — Hohe Funding-Rate gegen Signal-Richtung → warn/block (v6)
 """
 
 import json
@@ -24,6 +26,9 @@ from config.settings import (
     DRAWDOWN_KILL_PCT, MIN_BALANCE_USD,
     DAILY_DD_HALF_R, DAILY_DD_KILL_R,
     SIGNAL_EXPIRY_MINUTES,
+    STALE_CANDLE_TOLERANCE_SECONDS,
+    FUNDING_RATE_WARN_THRESHOLD,
+    FUNDING_RATE_BLOCK_THRESHOLD,
 )
 from governance.gate import BaseGovernanceCheck
 
@@ -309,3 +314,91 @@ class HMMRegimeCheck(BaseGovernanceCheck):
         if regime == "HIGH_VOL":
             return True, f"hmm_regime=HIGH_VOL — REGIME_HALF"
         return True, f"hmm_regime={regime} OK"
+
+
+class StaleCandleCheck(BaseGovernanceCheck):
+    """
+    Prüft ob die jüngste Kerze für das Asset zu alt ist (v6 Phase 6).
+    Stale Marktdaten → Signal ist auf falscher Basis erzeugt worden.
+    """
+
+    @property
+    def name(self) -> str:
+        return "stale_candle"
+
+    def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        from datetime import datetime, timezone
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                """SELECT ts FROM candles
+                   WHERE asset=? ORDER BY ts DESC LIMIT 1""",
+                (signal.asset,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return True, f"stale_candle=skip(keine_candle_{signal.asset})"
+
+        try:
+            ts_ms  = int(row["ts"])
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            age_s  = (now_ms - ts_ms) / 1000
+        except Exception:
+            return True, "stale_candle=skip(parse_error)"
+
+        if age_s > STALE_CANDLE_TOLERANCE_SECONDS:
+            return False, (
+                f"stale_market_data: {signal.asset} letzte Kerze "
+                f"{age_s:.0f}s alt > {STALE_CANDLE_TOLERANCE_SECONDS}s"
+            )
+        return True, f"stale_candle=ok({age_s:.0f}s)"
+
+
+class FundingRateCheck(BaseGovernanceCheck):
+    """
+    Blockiert/warnt bei hoher Funding-Rate gegen Signal-Richtung (v6 Phase 6).
+
+    |rate| > WARN  → durchlassen, aber in reason markieren
+    |rate| > BLOCK und rate-Vorzeichen gegen Signal → rejected
+    """
+
+    @property
+    def name(self) -> str:
+        return "funding_rate"
+
+    def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                """SELECT funding_rate FROM funding_rates
+                   WHERE asset=? ORDER BY funding_time DESC LIMIT 1""",
+                (signal.asset,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return True, f"funding_rate=skip(keine_daten_{signal.asset})"
+
+        rate = float(row["funding_rate"])
+        direction = signal.direction  # 'long' oder 'short'
+
+        # Funding positiv → Long zahlt → nachteilig für Longs, vorteilhaft für Shorts
+        funding_hurts_long  = rate > 0 and direction == "long"
+        funding_hurts_short = rate < 0 and direction == "short"
+        funding_against = funding_hurts_long or funding_hurts_short
+
+        abs_rate = abs(rate)
+        if abs_rate > FUNDING_RATE_BLOCK_THRESHOLD and funding_against:
+            return False, (
+                f"funding_rate: rate={rate:.5f} gegen {direction} "
+                f"> block_threshold={FUNDING_RATE_BLOCK_THRESHOLD:.4f}"
+            )
+        if abs_rate > FUNDING_RATE_WARN_THRESHOLD:
+            return True, (
+                f"FUNDING_WARN: rate={rate:.5f} direction={direction} "
+                f"(warn_threshold={FUNDING_RATE_WARN_THRESHOLD:.4f})"
+            )
+        return True, f"funding_rate=ok({rate:.5f})"

@@ -1,7 +1,8 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "apex_v2.db")
+DB_PATH         = os.path.join(os.path.dirname(__file__), "..", "data", "apex_v2.db")
+STAGING_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "research_staging.db")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS candles (
@@ -197,11 +198,40 @@ CREATE INDEX IF NOT EXISTS idx_drift_status     ON live_vs_backtest_drift(status
 
 def get_connection() -> sqlite3.Connection:
     db_path = os.path.abspath(DB_PATH)
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30,
+                           isolation_level="IMMEDIATE")
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_readonly_connection() -> sqlite3.Connection:
+    """Read-only-Verbindung für Research-Daemons (kein IMMEDIATE-Lock)."""
+    db_path = os.path.abspath(DB_PATH)
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_staging_connection() -> sqlite3.Connection:
+    """Verbindung zur Research-Staging-Sidecar-DB (separates File, kein Lock auf Haupt-DB)."""
+    from core.staging_schema import STAGING_DDL
+    db_path = os.path.abspath(STAGING_DB_PATH)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30,
+                           isolation_level="IMMEDIATE")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(STAGING_DDL)
     return conn
 
 
@@ -296,6 +326,90 @@ def run_migrations():
             CREATE INDEX IF NOT EXISTS idx_wres_discovery ON lab_window_results(discovery_id);
             CREATE INDEX IF NOT EXISTS idx_wres_window    ON lab_window_results(window_idx, passed);
         """)
+    # ── V6 Schema-Migrationen ────────────────────────────────────────────────
+    ld_cols = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    _ld_v6 = {
+        "framework_version":            "TEXT DEFAULT 'v1'",
+        "dsr_value":                    "REAL",
+        "pbo_value":                    "REAL",
+        "max_drawdown":                 "REAL",
+        "calmar_ratio":                 "REAL",
+        "stability_score":              "REAL",
+        "composite_score":              "REAL",
+        "oos_folds_n":                  "INTEGER",
+        "re_evaluated_at":              "TEXT",
+        "backtest_slippage_assumption": "REAL",
+        "backtest_funding_model":       "TEXT DEFAULT 'static'",
+        "intrabar_model":               "TEXT DEFAULT 'static'",
+    }
+    for col, typedef in _ld_v6.items():
+        if col not in ld_cols:
+            conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {typedef}")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_disc_idempotent
+           ON lab_discoveries(strategy, framework_version, re_evaluated_at)
+           WHERE re_evaluated_at IS NOT NULL"""
+    )
+
+    trade_cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    _trade_v6 = {
+        "signal_price":                "REAL",
+        "fill_price":                  "REAL",
+        "slippage_bps":                "REAL",
+        "slippage_measured_at":        "TEXT",
+        "funding_cost_actual":         "REAL",
+        "market_impact_check":         "TEXT",
+        "spread_at_execution_bps":     "REAL",
+        "order_type_used":             "TEXT",
+        "ioc_fill_ratio":              "REAL",
+        "ioc_tolerance_used_bps":      "REAL",
+        "liquidity_score_at_execution":"REAL",
+    }
+    for col, typedef in _trade_v6.items():
+        if col not in trade_cols:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
+
+    # Neue Tabellen (idempotent via CREATE TABLE IF NOT EXISTS)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS funding_rates (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset        TEXT NOT NULL,
+            funding_rate REAL NOT NULL,
+            funding_time TEXT NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_funding_asset_time
+            ON funding_rates(asset, funding_time DESC);
+
+        CREATE TABLE IF NOT EXISTS asset_liquidity_metrics (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset                TEXT NOT NULL,
+            avg_spread_bps       REAL NOT NULL,
+            avg_depth_level1_usd REAL NOT NULL,
+            avg_depth_level3_usd REAL NOT NULL,
+            liquidity_score      REAL NOT NULL,
+            measured_at          TEXT NOT NULL,
+            created_at           TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_liquidity_asset_time
+            ON asset_liquidity_metrics(asset, measured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS execution_audit_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id    INTEGER NOT NULL,
+            cl_ord_id    TEXT NOT NULL,
+            state_from   TEXT,
+            state_to     TEXT NOT NULL,
+            payload_json TEXT,
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_signal
+            ON execution_audit_log(signal_id, created_at);
+    """)
+
+    # pf_test_netto Bug-Fix: Spalte existiert, aber INSERT in auto_lab_daemon
+    # populiert sie nicht — bereits als ALTER oben gesichert; hier nur dokumentiert.
+
     conn.commit()
     conn.close()
 

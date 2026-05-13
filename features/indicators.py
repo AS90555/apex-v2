@@ -1,10 +1,17 @@
 """
 Primitive Indikator-Funktionen — zentralisiert aus V1 (vaa_bot, kdt_bot, autonomous_trade).
-Pure Python, kein numpy/pandas.
+NumPy-Fast-Path verfügbar (v6 Phase 8): stdev, atr_wilder, bollinger_bands nutzen
+numpy wenn vorhanden (>10× Speedup bei großen Serien), sonst Pure-Python-Fallback.
 Alle Funktionen arbeiten auf rohen Candle-Listen: [{"time", "open", "high", "low", "close", "volume"}, ...]
 """
 
 import math
+
+try:
+    import numpy as _np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 
 
 # ── Mittelwerte ───────────────────────────────────────────────────────────────
@@ -32,12 +39,14 @@ def ema(values: list[float], period: int) -> float:
 
 
 def stdev(values: list[float], period: int) -> float:
-    """Standardabweichung (Populationsformel) der letzten `period` Werte."""
-    if len(values) < period:
+    """Standardabweichung (Bessel-Korrektur, ddof=1) der letzten `period` Werte."""
+    if len(values) < period or period < 2:
         return 0.0
+    if _HAS_NUMPY:
+        return float(_np.std(values[-period:], ddof=1))
     subset   = values[-period:]
     mean_val = sum(subset) / period
-    variance = sum((x - mean_val) ** 2 for x in subset) / period
+    variance = sum((x - mean_val) ** 2 for x in subset) / (period - 1)
     return math.sqrt(variance)
 
 
@@ -52,6 +61,23 @@ def atr_wilder(candles: list[dict], period: int = 14) -> float:
     """
     if len(candles) < period + 1:
         return 0.0
+    if _HAS_NUMPY:
+        highs  = _np.array([c["high"]  for c in candles], dtype=float)
+        lows   = _np.array([c["low"]   for c in candles], dtype=float)
+        closes = _np.array([c["close"] for c in candles], dtype=float)
+        tr = _np.maximum(
+            highs[1:] - lows[1:],
+            _np.maximum(
+                _np.abs(highs[1:] - closes[:-1]),
+                _np.abs(lows[1:]  - closes[:-1]),
+            ),
+        )
+        if len(tr) < period:
+            return 0.0
+        atr_val = float(tr[:period].mean())
+        for val in tr[period:]:
+            atr_val = (atr_val * (period - 1) + float(val)) / period
+        return atr_val
     trs = []
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]

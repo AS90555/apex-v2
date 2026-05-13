@@ -34,7 +34,10 @@ from governance.checks import (
     PositionOpenCheck,
     SessionTradedCheck,
     CrossAssetRegimeCheck,
+    StaleCandleCheck,
+    FundingRateCheck,
 )
+from governance.portfolio_risk import PortfolioExposureCheck
 
 
 def _load_pending_signals(conn) -> list[Signal]:
@@ -121,12 +124,15 @@ def main():
         SignalExpiryCheck(),
         DrawdownKillCheck(),
         DailyDrawdownCheck(),
+        StaleCandleCheck(),       # v6: Stale-Market-Data-Guard (vor HMM, da Daten-Qualität)
         HMMRegimeCheck(),
         RegimeCheck(),
         SizingSanityCheck(),
         PositionOpenCheck(),
         SessionTradedCheck(),
         CrossAssetRegimeCheck(),
+        FundingRateCheck(),       # v6: Funding-Rate-Guard
+        PortfolioExposureCheck(), # v6: Portfolio-Exposure-Guard
     ])
 
     conn = get_connection()

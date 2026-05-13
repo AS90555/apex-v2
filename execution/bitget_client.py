@@ -239,14 +239,16 @@ class BitgetClient:
     def place_market_order(self, coin: str, is_buy: bool, size: float,
                            reduce_only: bool = False,
                            stop_loss: Optional[float] = None,
-                           take_profit: Optional[float] = None) -> OrderResult:
+                           take_profit: Optional[float] = None,
+                           client_order_id: Optional[str] = None) -> OrderResult:
         side       = "buy" if is_buy else "sell"
         trade_side = "close" if reduce_only else "open"
 
         if self.dry_run:
             price = self.get_price(coin)
             return OrderResult(
-                success=True, order_id=f"DRY-{int(time.time())}",
+                success=True,
+                order_id=client_order_id or f"DRY-{int(time.time())}",
                 filled_size=size, avg_price=price,
             )
 
@@ -261,6 +263,9 @@ class BitgetClient:
             "side": side, "tradeSide": trade_side,
             "orderType": "market", "force": "ioc",
         }
+        # Deterministische clOrdId VOR dem API-Call setzen (Idempotenz)
+        if client_order_id:
+            body["clientOid"] = client_order_id
         if stop_loss:
             body["presetStopLossPrice"] = f"{round(stop_loss, p_dec):.{p_dec}f}"
             body["presetStopLossTriggerType"] = "mark_price"
@@ -270,6 +275,9 @@ class BitgetClient:
         try:
             result = self._post("/api/v2/mix/order/place-order", body)
             order_id = result.get("orderId", "") if isinstance(result, dict) else ""
+            # Fallback: wenn Exchange keine orderId zurückgibt, clOrdId nutzen
+            if not order_id and client_order_id:
+                order_id = client_order_id
             time.sleep(1.0)
             fill_price = self.get_price(coin)
             return OrderResult(success=True, order_id=order_id, filled_size=size, avg_price=fill_price)

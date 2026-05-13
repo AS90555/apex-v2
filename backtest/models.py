@@ -26,9 +26,15 @@ class BtTrade:
     entry_ts:    int
     exit_ts:     Optional[int]   = None
     exit_price:  Optional[float] = None
-    exit_reason: Optional[str]   = None   # 'sl', 'tp1', 'tp2', 'timeout'
+    exit_reason: Optional[str]   = None   # 'sl', 'tp1', 'tp1_be_sl', 'tp2', 'timeout'
     pnl_usd:     float           = 0.0
     pnl_r:       float           = 0.0
+    # Partial-TP-Felder (v6)
+    tp1_hit:          bool           = False
+    remaining_size:   float          = 0.0
+    realized_pnl_tp1: float          = 0.0
+    be_sl_active:     bool           = False
+    intrabar_model_used: str         = "static"   # 'static' | '1m_zoom' | 'gbm'
 
     @property
     def closed(self) -> bool:

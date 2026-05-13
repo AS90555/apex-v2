@@ -45,9 +45,15 @@ class BtTrade:
     entry_ts:    int
     exit_ts:     Optional[int]    = None
     exit_price:  Optional[float]  = None
-    exit_reason: Optional[str]    = None   # 'sl', 'tp1', 'tp2', 'timeout'
+    exit_reason: Optional[str]    = None   # 'sl', 'tp1', 'tp1_be_sl', 'tp2', 'timeout'
     pnl_usd:     float            = 0.0
     pnl_r:       float            = 0.0
+    # Partial-TP-Felder (v6)
+    tp1_hit:             bool  = False
+    remaining_size:      float = 0.0
+    realized_pnl_tp1:   float = 0.0
+    be_sl_active:        bool  = False
+    intrabar_model_used: str   = "static"
 
     @property
     def closed(self) -> bool:
@@ -115,74 +121,252 @@ def _feature(conn, asset: str, interval: str, as_of_ts: int, name: str) -> Optio
 
 # ── Exit-Simulation ───────────────────────────────────────────────────────────
 
+def _get_1m_bars(conn, asset: str, bar_ts: int, bar_ms: int) -> list[tuple]:
+    """Lädt 1m-Kerzen innerhalb eines Bars [bar_ts, bar_ts+bar_ms)."""
+    return conn.execute(
+        """SELECT ts, high, low, open, close FROM candles
+           WHERE asset=? AND interval='1m' AND ts >= ? AND ts < ?
+           ORDER BY ts ASC""",
+        (asset, bar_ts, bar_ts + bar_ms),
+    ).fetchall()
+
+
+def _exit_within_bar(
+    direction: str, open_: float, high: float, low: float,
+    sl: float, tp1: float, tp2: float,
+    sub_bars: list[tuple],       # (ts, high, low, open, close) — ggf. leer
+    history_candles: list[dict], # für GBM-Kalibrierung
+    be_sl: Optional[float],      # wenn not None: BE-Stop statt sl
+) -> tuple[Optional[str], float, str]:
+    """
+    Bestimmt Exit innerhalb eines Bars via 1m-Zoom oder GBM.
+    Gibt (exit_reason, exit_price, model_used) zurück.
+    exit_reason None = kein Hit in diesem Bar.
+    """
+    effective_sl = be_sl if be_sl is not None else sl
+
+    if sub_bars:
+        # 1m-Zoom: deterministisch
+        for _, sh, sl_val, so, sc in sub_bars:
+            if direction == "long":
+                if sl_val <= effective_sl:
+                    return "sl" if be_sl is None else "tp1_be_sl", effective_sl, "1m_zoom"
+                if tp2 and tp2 > 0 and sh >= tp2:
+                    return "tp2", tp2, "1m_zoom"
+                if sh >= tp1:
+                    return "tp1", tp1, "1m_zoom"
+            else:
+                if sh >= effective_sl:
+                    return "sl" if be_sl is None else "tp1_be_sl", effective_sl, "1m_zoom"
+                if tp2 and tp2 > 0 and sl_val <= tp2:
+                    return "tp2", tp2, "1m_zoom"
+                if sl_val <= tp1:
+                    return "tp1", tp1, "1m_zoom"
+        return None, 0.0, "1m_zoom"
+
+    # GBM-Fallback
+    from backtest.intrabar_gbm import simulate_intrabar
+    reason, price = simulate_intrabar(
+        entry_price=open_,
+        stop_loss=effective_sl,
+        take_profit_1=tp1,
+        take_profit_2=tp2,
+        direction=direction,
+        bar_open=open_, bar_high=high, bar_low=low,
+        candles_history=history_candles,
+    )
+    if reason == "sl" and be_sl is not None:
+        reason = "tp1_be_sl"
+    return reason, price, "gbm"
+
+
 def _simulate_exit(conn, trade: BtTrade, asset: str, interval: str,
-                   max_bars: int = 48) -> BtTrade:
+                   max_bars: int = 48, history_candles: list[dict] = None) -> BtTrade:
     """
-    Iteriert die nächsten Bars nach Entry und prüft SL/TP-Hits.
-    Nutzt High/Low der Bars für konservative Simulation (kein Look-ahead).
+    Iteriert die nächsten Bars nach Entry, prüft SL/TP-Hits mit Partial-TP-Logik.
+
+    Partial-TP (spiegelt Live-Verhalten in position_monitor.py):
+      - Bei TP1-Hit: 50 % der Position schließen, pnl_r anteilig buchen.
+      - Rest-Position läuft mit BE-Stop (= entry_price) weiter bis TP2 oder BE-SL.
+      - Gesamt-pnl_r = 0.5 * R_TP1 + 0.5 * R_Remainder.
+
+    Intrabar-Reihenfolge via:
+      1. 1m-Zoom falls 1m-Daten vorhanden (deterministisch).
+      2. GBM-Simulation (N_PATHS=500) als Fallback.
+      Falls nur static möglich (High/Low-Check), nutzen wir das weiterhin
+      als schnellstes Verfahren wenn weder 1m noch GBM verfügbar sind.
     """
+    from config.settings import INTRABAR_MODEL
     sig = trade.signal
     sl_dist = abs(sig.entry_price - sig.stop_loss)
     if sl_dist <= 0:
         trade.exit_reason = "invalid_sl"
         return trade
 
+    interval_ms = INTERVAL_MS.get(interval, 3_600_000)
+    tp2_valid = sig.take_profit_2 and sig.take_profit_2 > 0 and sig.take_profit_2 != sig.take_profit_1
+
     rows = conn.execute(
-        """SELECT ts, high, low, close FROM candles
+        """SELECT ts, high, low, open, close FROM candles
            WHERE asset=? AND interval=? AND ts > ?
            ORDER BY ts ASC LIMIT ?""",
         (asset, interval, trade.entry_ts, max_bars),
     ).fetchall()
 
-    for bar_ts, high, low, close in rows:
+    if not rows:
+        return trade
+
+    # Geschichte für GBM-Kalibrierung
+    hist = history_candles or []
+    be_sl: Optional[float] = None   # None = original SL, float = BE-Stop aktiv
+
+    for bar_ts, high, low, open_, close in rows:
+        current_sl = be_sl if be_sl is not None else sig.stop_loss
+        tp2_level  = sig.take_profit_2 if tp2_valid else 0.0
+
+        # Schnell-Check: Trifft der Bar überhaupt ein Level?
         if sig.direction == "long":
-            if low <= sig.stop_loss:
+            bar_hits_sl  = low  <= current_sl
+            bar_hits_tp1 = high >= sig.take_profit_1 and not trade.tp1_hit
+            bar_hits_tp2 = tp2_valid and high >= tp2_level and trade.tp1_hit
+        else:
+            bar_hits_sl  = high >= current_sl
+            bar_hits_tp1 = low  <= sig.take_profit_1 and not trade.tp1_hit
+            bar_hits_tp2 = tp2_valid and low <= tp2_level and trade.tp1_hit
+
+        if not (bar_hits_sl or bar_hits_tp1 or bar_hits_tp2):
+            continue  # kein Hit in diesem Bar
+
+        # Intrabar-Auflösung
+        if INTRABAR_MODEL == "static":
+            sub_bars = []
+            use_model = "static"
+        else:
+            sub_bars = _get_1m_bars(conn, asset, bar_ts, interval_ms)
+            use_model = "1m_zoom" if sub_bars else "gbm"
+
+        # ── Phase A: TP1 noch nicht erreicht ──────────────────────────────────
+        if not trade.tp1_hit:
+            if INTRABAR_MODEL == "static":
+                # Statisch: SL-Priorität vor TP (konservativ)
+                if bar_hits_sl and bar_hits_tp1:
+                    # Beide im selben Bar → SL gewinnt (konservativ)
+                    reason, price, model = "sl", current_sl, "static"
+                elif bar_hits_sl:
+                    reason, price, model = "sl", current_sl, "static"
+                elif bar_hits_tp1:
+                    reason, price, model = "tp1", sig.take_profit_1, "static"
+                else:
+                    continue
+            else:
+                reason, price, model = _exit_within_bar(
+                    sig.direction, open_, high, low,
+                    sig.stop_loss, sig.take_profit_1, tp2_level,
+                    sub_bars, hist, be_sl,
+                )
+                if reason is None:
+                    continue
+
+            trade.intrabar_model_used = model
+
+            if reason == "sl":
                 trade.exit_ts    = bar_ts
-                trade.exit_price = sig.stop_loss
+                trade.exit_price = price
                 trade.exit_reason = "sl"
                 break
-            if high >= sig.take_profit_2:
-                trade.exit_ts    = bar_ts
-                trade.exit_price = sig.take_profit_2
-                trade.exit_reason = "tp2"
-                break
-            if high >= sig.take_profit_1:
-                trade.exit_ts    = bar_ts
-                trade.exit_price = sig.take_profit_1
-                trade.exit_reason = "tp1"
-                break
-        else:  # short
-            if high >= sig.stop_loss:
-                trade.exit_ts    = bar_ts
-                trade.exit_price = sig.stop_loss
-                trade.exit_reason = "sl"
-                break
-            if low <= sig.take_profit_2:
-                trade.exit_ts    = bar_ts
-                trade.exit_price = sig.take_profit_2
-                trade.exit_reason = "tp2"
-                break
-            if low <= sig.take_profit_1:
-                trade.exit_ts    = bar_ts
-                trade.exit_price = sig.take_profit_1
-                trade.exit_reason = "tp1"
-                break
+
+            if reason == "tp1":
+                # Partial-TP: 50 % Exit
+                trade.tp1_hit = True
+                trade.realized_pnl_tp1 = _calc_r(sig, price, 0.5)
+                trade.remaining_size   = sig.size * 0.5
+                be_sl = sig.entry_price   # BE-Stop aktivieren
+                # Falls TP2 auch in diesem Bar:
+                if sig.direction == "long":
+                    if tp2_valid and high >= tp2_level:
+                        trade.exit_ts    = bar_ts
+                        trade.exit_price = tp2_level
+                        trade.exit_reason = "tp2"
+                        break
+                else:
+                    if tp2_valid and low <= tp2_level:
+                        trade.exit_ts    = bar_ts
+                        trade.exit_price = tp2_level
+                        trade.exit_reason = "tp2"
+                        break
+                # Kein TP2 in diesem Bar → weiter zum nächsten Bar mit BE-Stop
+                continue
+
+        # ── Phase B: TP1 bereits erreicht, läuft mit BE-Stop ──────────────────
+        else:
+            if INTRABAR_MODEL == "static":
+                if sig.direction == "long":
+                    if bar_hits_sl:
+                        reason, price, model = "tp1_be_sl", current_sl, "static"
+                    elif bar_hits_tp2:
+                        reason, price, model = "tp2", tp2_level, "static"
+                    else:
+                        continue
+                else:
+                    if bar_hits_sl:
+                        reason, price, model = "tp1_be_sl", current_sl, "static"
+                    elif bar_hits_tp2:
+                        reason, price, model = "tp2", tp2_level, "static"
+                    else:
+                        continue
+            else:
+                reason, price, model = _exit_within_bar(
+                    sig.direction, open_, high, low,
+                    sig.stop_loss, sig.take_profit_1, tp2_level,
+                    sub_bars, hist, be_sl,
+                )
+                if reason is None:
+                    continue
+
+            trade.intrabar_model_used = model
+            trade.exit_ts    = bar_ts
+            trade.exit_price = price
+            trade.exit_reason = reason
+            break
+
     else:
-        # Timeout: letzten Close nehmen
+        # Timeout
         if rows:
             trade.exit_ts    = rows[-1][0]
-            trade.exit_price = rows[-1][3]
+            trade.exit_price = rows[-1][4]   # close
             trade.exit_reason = "timeout"
 
+    # ── PnL-Berechnung ────────────────────────────────────────────────────────
     if trade.exit_price is not None:
-        if sig.direction == "long":
-            raw_pnl = (trade.exit_price - sig.entry_price) * sig.size
+        denom = sl_dist * sig.size
+        if trade.tp1_hit:
+            # Partial: TP1 (50 %) + Rest-Exit (50 %)
+            r_remainder = _calc_r(sig, trade.exit_price, 0.5)
+            total_pnl_r = trade.realized_pnl_tp1 + r_remainder
+            trade.pnl_r   = round(total_pnl_r, 3)
+            trade.pnl_usd = round(total_pnl_r * denom, 4)
         else:
-            raw_pnl = (sig.entry_price - trade.exit_price) * sig.size
-        trade.pnl_usd = round(raw_pnl, 4)
-        trade.pnl_r   = round(raw_pnl / (sl_dist * sig.size), 3) if sl_dist * sig.size > 0 else 0.0
+            if sig.direction == "long":
+                raw = (trade.exit_price - sig.entry_price) * sig.size
+            else:
+                raw = (sig.entry_price - trade.exit_price) * sig.size
+            trade.pnl_usd = round(raw, 4)
+            trade.pnl_r   = round(raw / denom, 3) if denom > 0 else 0.0
 
     return trade
+
+
+def _calc_r(sig: "BtSignal", exit_price: float, fraction: float) -> float:
+    """Berechnet pnl_r für einen Partial-Exit (fraction der Position)."""
+    sl_dist = abs(sig.entry_price - sig.stop_loss)
+    denom   = sl_dist * sig.size
+    if denom <= 0:
+        return 0.0
+    if sig.direction == "long":
+        raw = (exit_price - sig.entry_price) * sig.size * fraction
+    else:
+        raw = (sig.entry_price - exit_price) * sig.size * fraction
+    return raw / (denom * fraction) * fraction   # = raw / denom
 
 
 # ── Strategie-Signalgeneratoren (point-in-time) ───────────────────────────────
@@ -220,13 +404,15 @@ def _vaa_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal
     if sl_dist <= 0:
         return None
 
-    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
-    tp_r     = cfg.get("TP_R", 3.0)
+    direction = cfg.get("DIRECTION", "short")
+    risk_usd  = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    tp_r      = cfg.get("TP_R", 3.0)
+    sign      = -1 if direction == "short" else 1
     return BtSignal(
-        ts=ts, strategy="vaa", asset=asset, direction="short",
+        ts=ts, strategy="vaa", asset=asset, direction=direction,
         entry_price=entry, stop_loss=sl,
-        take_profit_1=round(entry - sl_dist * 1.0, 6),
-        take_profit_2=round(entry - sl_dist * tp_r, 6),
+        take_profit_1=round(entry + sign * sl_dist * 1.0, 6),
+        take_profit_2=round(entry + sign * sl_dist * tp_r, 6),
         size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
     )
 
@@ -264,13 +450,15 @@ def _kdt_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal
     if not all([cond_trend, cond_green, cond_bodies, cond_vols, cond_sl]):
         return None
 
-    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
-    tp_r     = cfg.get("TP_R", 3.0)
+    direction = cfg.get("DIRECTION", "short")
+    risk_usd  = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    tp_r      = cfg.get("TP_R", 3.0)
+    sign      = -1 if direction == "short" else 1
     return BtSignal(
-        ts=ts_last, strategy="kdt", asset=asset, direction="short",
+        ts=ts_last, strategy="kdt", asset=asset, direction=direction,
         entry_price=round(entry, 4), stop_loss=round(sl_price, 4),
-        take_profit_1=round(entry - sl_dist * 1.0, 4),
-        take_profit_2=round(entry - sl_dist * tp_r, 4),
+        take_profit_1=round(entry + sign * sl_dist * 1.0, 4),
+        take_profit_2=round(entry + sign * sl_dist * tp_r, 4),
         size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
     )
 
@@ -367,10 +555,14 @@ def _squeeze_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSi
         tp = entry - sl_dist * cfg.get("TP_R", 3.0)
 
     risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    # TP1 = 50 % des TP-Abstands, TP2 = 100 % (TP1 ≠ TP2 für Partial-Exit)
+    sign = 1 if direction == "long" else -1
+    tp1  = entry + sign * sl_dist * cfg.get("TP_R", 3.0) * 0.5
+    tp2  = entry + sign * sl_dist * cfg.get("TP_R", 3.0)
     return BtSignal(
         ts=as_of_ts, strategy="squeeze", asset=asset, direction=direction,
         entry_price=round(entry, 4), stop_loss=round(sl, 4),
-        take_profit_1=round(tp, 4), take_profit_2=round(tp, 4),
+        take_profit_1=round(tp1, 4), take_profit_2=round(tp2, 4),
         size=round(risk_usd / sl_dist, 4) if sl_dist > 0 else 0.0,
         risk_usd=round(risk_usd, 4),
     )
@@ -433,10 +625,15 @@ def _asian_fade_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[B
         tp = entry + sl_dist * cfg.get("TP_MULT", 1.5)
 
     risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    # TP1 = halber TP-Abstand (Partial-Exit), TP2 = voller TP-Abstand
+    tp_mult = cfg.get("TP_MULT", 1.5)
+    sign    = -1 if direction == "short" else 1
+    tp1     = entry + sign * sl_dist * tp_mult * 0.5
+    tp2     = entry + sign * sl_dist * tp_mult
     return BtSignal(
         ts=as_of_ts, strategy="asian_fade", asset=asset, direction=direction,
         entry_price=round(entry, 4), stop_loss=round(sl, 4),
-        take_profit_1=round(tp, 4), take_profit_2=round(tp, 4),
+        take_profit_1=round(tp1, 4), take_profit_2=round(tp2, 4),
         size=round(risk_usd / sl_dist, 4) if sl_dist > 0 else 0.0,
         risk_usd=round(risk_usd, 4),
     )
@@ -1106,21 +1303,48 @@ INTERVAL_MS = {
 }
 
 
-def _apply_trade_costs(trade: BtTrade) -> BtTrade:
+def _lookup_funding_pit(conn, asset: str, start_ts: int, end_ts: int) -> float:
+    """
+    Point-in-Time Funding aus funding_rates-Tabelle.
+    Summiert alle Funding-Zahlungen im Haltezeitraum.
+    Fallback: 0.0 (FUNDING_8H wird separat als Konstante angewendet wenn keine Daten).
+    """
+    rows = conn.execute(
+        """SELECT funding_rate FROM funding_rates
+           WHERE asset=? AND funding_time >= ? AND funding_time < ?
+           ORDER BY funding_time ASC""",
+        (asset, str(start_ts), str(end_ts)),
+    ).fetchall()
+    return sum(r[0] for r in rows) if rows else 0.0
+
+
+def _apply_trade_costs(trade: BtTrade, conn=None) -> BtTrade:
     """
     Zieht Transaktionskosten vom abgeschlossenen Trade ab.
-    Kostenmodell: Round-Trip-Fee+Slippage + Funding proportional zur Haltedauer.
+    Kostenmodell: Round-Trip-Fee+Slippage + Funding (Point-in-Time wenn verfügbar).
     """
     from config.settings import ROUND_TRIP, FUNDING_8H
     sig      = trade.signal
-    notional = sig.entry_price * sig.size          # Positionsgröße in USD
-    rt_cost  = notional * ROUND_TRIP               # Ein- + Ausstiegskosten
+    notional = sig.entry_price * sig.size
 
-    periods  = (trade.exit_ts - trade.entry_ts) / (8 * 3_600_000) if trade.exit_ts else 0
-    funding  = notional * FUNDING_8H * periods     # Funding proportional zur Dauer
+    rt_cost  = notional * ROUND_TRIP
 
-    total_cost = rt_cost + funding
-    sl_dist    = abs(sig.entry_price - sig.stop_loss)
+    # Point-in-Time Funding aus DB; Fallback auf statisches Modell
+    if conn is not None and trade.exit_ts:
+        pit_funding_rate = _lookup_funding_pit(conn, sig.asset, trade.entry_ts, trade.exit_ts)
+        if pit_funding_rate != 0.0:
+            funding = notional * abs(pit_funding_rate)
+            trade.intrabar_model_used = trade.intrabar_model_used  # unverändertes Flag
+        else:
+            # Kein PIT-Funding → statisches Modell als Fallback
+            periods = (trade.exit_ts - trade.entry_ts) / (8 * 3_600_000)
+            funding = notional * FUNDING_8H * periods
+    else:
+        periods = (trade.exit_ts - trade.entry_ts) / (8 * 3_600_000) if trade.exit_ts else 0
+        funding = notional * FUNDING_8H * periods
+
+    total_cost  = rt_cost + funding
+    sl_dist     = abs(sig.entry_price - sig.stop_loss)
     denominator = sl_dist * sig.size
 
     trade.pnl_usd = round(trade.pnl_usd - total_cost, 4)
@@ -1138,6 +1362,7 @@ def run_backtest(
     cooldown_bars: int = 0,
     verbose: bool = False,
     apply_costs: bool = True,
+    candles_override: list[dict] | None = None,
 ) -> BtResult:
     """
     Führt einen Backtest für eine Strategie auf einem Asset durch.
@@ -1170,15 +1395,21 @@ def run_backtest(
     interval_ms      = INTERVAL_MS.get(interval, 3_600_000)
     cooldown_until_ts: int = 0   # kein Cooldown aktiv am Start
 
-    # Alle Timestamps im Bereich laden
-    timestamps = [
-        r[0] for r in conn.execute(
-            """SELECT DISTINCT ts FROM candles
-               WHERE asset=? AND interval=? AND ts >= ? AND ts <= ?
-               ORDER BY ts ASC""",
-            (asset, interval, start_ts, end_ts),
-        ).fetchall()
-    ]
+    # Timestamps aus Override oder DB laden
+    if candles_override is not None:
+        timestamps = sorted(c["time"] for c in candles_override)
+        # Override-Kerzen in temporäre Lookup-Struktur einlesen
+        _candle_cache: dict[int, dict] = {c["time"]: c for c in candles_override}
+    else:
+        timestamps = [
+            r[0] for r in conn.execute(
+                """SELECT DISTINCT ts FROM candles
+                   WHERE asset=? AND interval=? AND ts >= ? AND ts <= ?
+                   ORDER BY ts ASC""",
+                (asset, interval, start_ts, end_ts),
+            ).fetchall()
+        ]
+        _candle_cache = None
 
     log(f"[BACKTEST] {strategy}/{asset}: {len(timestamps)} Bars von "
         f"{datetime.fromtimestamp(start_ts/1000, tz=timezone.utc).date()} bis "
@@ -1193,7 +1424,7 @@ def run_backtest(
             open_trade = _simulate_exit(conn, open_trade, asset, exit_intv, max_exit_bars)
             if open_trade.closed:
                 if apply_costs:
-                    open_trade = _apply_trade_costs(open_trade)
+                    open_trade = _apply_trade_costs(open_trade, conn=conn)
                 result.trades.append(open_trade)
                 if verbose:
                     log(f"[BACKTEST]   EXIT {open_trade.exit_reason} "

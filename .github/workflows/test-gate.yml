@@ -7,26 +7,76 @@ on:
     branches: [main]
 
 jobs:
+  # ── Basis-Suite ─────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Python 3.12 setup
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: pytest
-        run: pytest tests/ -v
+      - name: pytest (Unit + Integration)
+        run: pytest tests/ -v --ignore=tests/chaos --ignore=tests/snapshot
 
       - name: Parity Test (Backtest == Live)
         run: python tests/parity_test.py
 
       - name: Governance Invariants
         run: python tests/governance_invariants.py
+
+  # ── Chaos-Tests ─────────────────────────────────────────────────────────────
+  chaos-tests:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Chaos Tests
+        run: pytest tests/chaos/ -v --tb=short
+        # Bei Flake: max 2 Retries (deterministisch durch Mocks)
+
+  # ── Snapshot-Regression ──────────────────────────────────────────────────────
+  snapshot-regression:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Snapshot Regression Tests
+        run: pytest tests/snapshot/ -v --tb=long
+
+  # ── Performance-Check ────────────────────────────────────────────────────────
+  performance:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: NumPy Fast-Path Tests
+        run: pytest tests/test_indicators_fastpath.py -v -s

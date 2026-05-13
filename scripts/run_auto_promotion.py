@@ -62,7 +62,15 @@ def _write_heartbeat(conn, status: str, message: str, latency_ms: float) -> None
 
 
 def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
-    """Gibt (passed, failed_gates) zurück."""
+    """
+    Gibt (passed, failed_gates) zurück.
+
+    V6_GATES_ENFORCED=False (default): Legacy-Gates wie bisher.
+    V6_GATES_ENFORCED=True (nach Phase 4): DSR/PBO/Stability/MaxDD Hard-Gates aktiv.
+    """
+    from config.settings import (
+        DSR_MIN_DRY_RUN, PBO_MAX, STABILITY_MIN, V6_GATES_ENFORCED,
+    )
     failed: list[str] = []
 
     if not disc["cost_model_applied"]:
@@ -80,6 +88,28 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
 
     if disc["deployment_status"] in ("dry", "live"):
         failed.append(f"deployment_status={disc['deployment_status']}")
+
+    # V6 Hard-Gates (nur wenn enforced)
+    if V6_GATES_ENFORCED:
+        dsr_val = disc.get("dsr_value") or disc.get("dsr")
+        if dsr_val is None or dsr_val < DSR_MIN_DRY_RUN:
+            failed.append(f"dsr_value={dsr_val} < {DSR_MIN_DRY_RUN} (v6 Hard-Gate)")
+
+        pbo_val = disc.get("pbo_value")
+        if pbo_val is not None and pbo_val > PBO_MAX:
+            failed.append(f"pbo_value={pbo_val} > {PBO_MAX} (v6 Hard-Gate)")
+
+        stab = disc.get("stability_score")
+        if stab is not None and stab < STABILITY_MIN:
+            failed.append(f"stability_score={stab} < {STABILITY_MIN} (v6 Hard-Gate)")
+
+        oos_folds = disc.get("oos_folds_n")
+        if oos_folds is not None and oos_folds < 1:
+            failed.append(f"oos_folds_n={oos_folds} < 1 (v6 Hard-Gate)")
+
+        fw_version = disc.get("framework_version")
+        if fw_version != "v6":
+            failed.append(f"framework_version={fw_version} != v6 (v6 Hard-Gate)")
 
     # Kein aktives Duplikat (gleiche base_strategy + asset + mode='dry_run')
     dup = conn.execute(

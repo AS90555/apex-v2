@@ -30,9 +30,50 @@ from config.settings import (
     RISK_USDT, MIN_NOTIONAL, TARGET_NOTIONAL, MAX_LEVERAGE,
     SIZE_DECIMALS, MAX_OPEN_RISK_USDT,
 )
-from core.db import get_connection
+from core.db import get_connection, set_state, get_state
 from core.models import Signal, Trade
 from core.utils import log, now_iso
+
+_CIRCUIT_BREAKER_THRESHOLD = 3   # API-Fehler pro Asset → Soft-Kill
+
+
+# ── Circuit-Breaker ───────────────────────────────────────────────────────────
+
+def _increment_circuit_breaker(conn_or_none, asset: str) -> None:
+    """Erhöht Fehler-Counter und setzt Soft-Kill wenn Schwelle überschritten."""
+    key = f"circuit_errors_{asset}"
+    current = int(get_state(key, "0"))
+    current += 1
+    set_state(key, str(current))
+    if current >= _CIRCUIT_BREAKER_THRESHOLD:
+        kill_key = f"kill_mode_{asset}"
+        set_state(kill_key, "soft")
+        log(f"[EXECUTOR] ⚡ Circuit-Breaker: {asset} auf Soft-Kill gesetzt "
+            f"({current} Fehler ≥ {_CIRCUIT_BREAKER_THRESHOLD})")
+
+
+def _is_circuit_broken(asset: str) -> bool:
+    return get_state(f"kill_mode_{asset}", "ok") != "ok"
+
+
+# ── Audit-Log ─────────────────────────────────────────────────────────────────
+
+def _write_audit_log(signal_id: int, cl_ord_id: str,
+                     state_from: Optional[str], state_to: str,
+                     payload: Optional[dict] = None) -> None:
+    try:
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO execution_audit_log
+               (signal_id, cl_ord_id, state_from, state_to, payload_json)
+               VALUES (?,?,?,?,?)""",
+            (signal_id, cl_ord_id, state_from, state_to,
+             json.dumps(payload) if payload else None),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[EXECUTOR] Audit-Log Fehler (nicht kritisch): {e}")
 
 
 # ── Position Sizing & Leverage-Berechnung ────────────────────────────────────
@@ -220,8 +261,15 @@ class Executor:
                 raise ValueError(f"Unbekannter Modus im Executor: {signal.mode} — Shadow-Signale dürfen hier nicht ankommen")
         except Exception as e:
             log(f"[EXECUTOR] Signal #{signal.id}: FEHLER bei Execution — {e}")
-            log(f"[EXECUTOR] Signal #{signal.id} bleibt auf 'processing' "
-                f"(manuelles Aufräumen erforderlich)")
+            # v6: Status 'error' statt hängenbleiben auf 'processing'
+            conn.execute(
+                "UPDATE signals SET status='failed', "
+                "reject_reason=? WHERE id=?",
+                (f"execution_error: {str(e)[:200]}", signal.id),
+            )
+            conn.commit()
+            # Circuit-Breaker: Asset-spezifischer Fehler-Counter
+            _increment_circuit_breaker(conn, signal.asset)
             conn.close()
             return None
 
@@ -241,14 +289,27 @@ class Executor:
         cur2 = conn.execute(
             """INSERT INTO trades
                (signal_id, strategy, asset, direction, entry_price, entry_ts,
-                size, stop_loss, take_profit_1, take_profit_2, mode, session, context_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                size, stop_loss, take_profit_1, take_profit_2, mode, session, context_json,
+                signal_price, fill_price, slippage_bps, slippage_measured_at,
+                market_impact_check, spread_at_execution_bps, order_type_used,
+                ioc_tolerance_used_bps, liquidity_score_at_execution)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (signal.id, signal.strategy, signal.asset, signal.direction,
              trade.entry_price, ts_now,
              trade.size, trade.stop_loss, trade.take_profit_1, trade.take_profit_2,
              signal.mode, signal.session,
              json.dumps({"order_id": trade.order_id, "mode": signal.mode,
-                         "leverage": getattr(trade, "_leverage", None)})),
+                         "leverage": getattr(trade, "_leverage", None),
+                         "cl_ord_id": getattr(trade, "_cl_ord_id", None)}),
+             getattr(trade, "_signal_price", None),
+             getattr(trade, "_fill_price", None),
+             getattr(trade, "_slippage_bps", None),
+             ts_now if getattr(trade, "_slippage_bps", None) is not None else None,
+             getattr(trade, "_market_impact_check", None),
+             getattr(trade, "_spread_at_execution_bps", None),
+             getattr(trade, "_order_type_used", None),
+             getattr(trade, "_ioc_tolerance_used_bps", None),
+             getattr(trade, "_liquidity_score", None)),
         )
         trade.id = cur2.lastrowid
 
@@ -260,7 +321,8 @@ class Executor:
         conn.close()
 
         log(f"[EXECUTOR] Signal #{signal.id} → Trade #{trade.id} geschrieben "
-            f"(order_id={trade.order_id}, entry={trade.entry_price})")
+            f"(order_id={trade.order_id}, entry={trade.entry_price}, "
+            f"slippage={getattr(trade, '_slippage_bps', 0):.1f}bps)")
         return trade
 
     # ── Live/Dry-Run-Execution ────────────────────────────────────────────────
@@ -269,36 +331,48 @@ class Executor:
         """
         Echter API-Call mit dynamischer Positionsgröße und Hebel-Berechnung.
 
-          1. Aktuellen Preis holen (für Notional-Berechnung)
-          2. _calc_sizing(): Coins, Hebel, Notional
-          3. set_leverage() API-Call (beide Seiten bei isolated)
-          4. place_market_order() mit berechneter Size
+          0. Circuit-Breaker prüfen
+          1. Deterministische clOrdId VOR API-Call generieren (Idempotenz)
+          2. Aktuellen Preis holen (signal_price für Slippage-Tracking)
+          3. _calc_sizing(): Coins, Hebel, Notional
+          4. set_leverage() API-Call
+          5. place_market_order() mit clOrdId
+          6. Slippage messen + in Audit-Log schreiben
         """
         from execution.bitget_client import BitgetClient
         client = BitgetClient(dry_run=dry_run)
+
+        # Schritt 0: Circuit-Breaker
+        if _is_circuit_broken(signal.asset):
+            log(f"[EXECUTOR] Circuit-Breaker aktiv für {signal.asset} → abbrechen")
+            return None
 
         if not client.is_ready and not dry_run:
             log(f"[EXECUTOR] BitgetClient nicht bereit (fehlende Credentials) → abbrechen")
             return None
 
-        # Schritt 1: aktuellen Preis für Notional-Schätzung
+        # Schritt 1: clOrdId deterministisch VOR API-Call
+        cl_ord_id = f"APEX-V2-SIG-{signal.id}-E1"
+        _write_audit_log(signal.id, cl_ord_id, None, "created")
+
+        # Schritt 2: aktuellen Preis für Notional-Schätzung + Slippage-Baseline
         current_price = client.get_price(signal.asset)
+        signal_price  = current_price   # vor Order = Signal-Preis
         if current_price <= 0 and not dry_run:
             log(f"[EXECUTOR] Kein gültiger Preis für {signal.asset} → abbrechen")
             return None
         if current_price <= 0:
-            current_price = signal.entry_price or 1.0   # Dry-Run Fallback
+            current_price = signal.entry_price or 1.0
 
-        # Schritt 2: Positionsgröße und Hebel berechnen
+        # Schritt 3: Positionsgröße und Hebel berechnen
         sizing = _calc_sizing(signal, current_price)
         if sizing is None:
-            # _calc_sizing hat bereits den Grund geloggt (Hebel-Limit etc.)
             return None
 
         size     = sizing["size"]
         leverage = sizing["leverage"]
 
-        # Schritt 2b: Daily-DD Half-Size — Governance-Flag aus governance_log lesen
+        # Daily-DD Half-Size
         _conn = get_connection()
         _row = _conn.execute(
             "SELECT reason FROM governance_log WHERE signal_id=? ORDER BY ts DESC LIMIT 1",
@@ -309,44 +383,65 @@ class Executor:
             s_dec = SIZE_DECIMALS.get(signal.asset, 2)
             size  = round(size * 0.5, s_dec)
             log(f"[EXECUTOR] Half-size wegen Daily-DD -1.5R: neue Größe {size}")
-
         if _row and _row[0] and "REGIME_HALF" in _row[0]:
             s_dec = SIZE_DECIMALS.get(signal.asset, 2)
             size  = round(size * 0.5, s_dec)
             regime_tag = "SIDEWAYS" if "SIDEWAYS" in _row[0] else "HIGH_VOL"
             log(f"[EXECUTOR] Regime-Half-Size: {size} (Regime: {regime_tag})")
 
-        # Schritt 3: Hebel setzen (beide Seiten, isolated margin)
+        # Schritt 4: Hebel setzen
         hold_side = "long" if signal.direction == "long" else "short"
-        for side in (hold_side,):   # nur aktive Seite setzen
-            ok = client.set_leverage(signal.asset, leverage, hold_side=side)
-            if not ok and not dry_run:
-                log(f"[EXECUTOR] set_leverage {signal.asset}×{leverage} fehlgeschlagen → abbrechen")
-                return None
+        ok = client.set_leverage(signal.asset, leverage, hold_side=hold_side)
+        if not ok and not dry_run:
+            log(f"[EXECUTOR] set_leverage {signal.asset}×{leverage} fehlgeschlagen → abbrechen")
+            return None
+
+        # Schritt 4b: Market-Impact-Guard (v6 Phase 7)
+        from execution.market_impact_guard import evaluate as _mig_evaluate
+        _mig = _mig_evaluate(
+            asset=signal.asset,
+            order_size_usd=sizing["notional"],
+            client=client if not dry_run else None,
+        )
 
         log(f"[EXECUTOR] {'DRY' if dry_run else 'LIVE'}: {signal.asset} "
-            f"{signal.direction.upper()} | "
-            f"size={size} | leverage={leverage}x | "
-            f"notional=${sizing['notional']:.2f}")
+            f"{signal.direction.upper()} | size={size} | leverage={leverage}x | "
+            f"notional=${sizing['notional']:.2f} | clOrdId={cl_ord_id} | "
+            f"order_type={_mig.order_type} tol={_mig.ioc_tolerance_bps:.1f}bps")
 
-        # Schritt 4: Market Order platzieren
+        # Schritt 5: Market Order mit clOrdId
+        _write_audit_log(signal.id, cl_ord_id, None, "sent")
         result = client.place_market_order(
             coin=signal.asset,
             is_buy=(signal.direction == "long"),
             size=size,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit_1,
+            client_order_id=cl_ord_id,
         )
 
         if not result.success:
             log(f"[EXECUTOR] place_market_order fehlgeschlagen: {result.error}")
+            _write_audit_log(signal.id, cl_ord_id, "sent", "error",
+                             payload={"error": result.error})
+            _increment_circuit_breaker(None, signal.asset)
             return None
 
-        entry_price = result.avg_price if result.avg_price > 0 else signal.entry_price
-        order_id    = result.order_id or f"{'DRY' if dry_run else 'LIVE'}-{int(time.time())}"
+        _write_audit_log(signal.id, cl_ord_id, "sent", "acked",
+                         payload={"order_id": result.order_id})
 
-        # TP2: separater TPSL-Order nach Entry (TP1 war preset im Market-Order)
+        entry_price = result.avg_price if result.avg_price > 0 else signal.entry_price
+        order_id    = result.order_id or cl_ord_id
+
+        # Schritt 6: Slippage messen
+        fill_price   = entry_price
+        slippage_bps = 0.0
+        if signal_price and signal_price > 0 and fill_price and fill_price > 0:
+            slippage_bps = abs(fill_price - signal_price) / signal_price * 10000
+
+        # TP2: separater TPSL-Order
         if signal.take_profit_2 and signal.take_profit_2 > 0:
+            tp2_cl_ord = f"APEX-V2-SIG-{signal.id}-TP2"
             tp2_result = client.place_take_profit(
                 coin=signal.asset,
                 trigger_price=signal.take_profit_2,
@@ -366,5 +461,14 @@ class Executor:
             take_profit_1=signal.take_profit_1, take_profit_2=signal.take_profit_2,
             mode=signal.mode, order_id=order_id,
         )
-        t._leverage = leverage   # für context_json
+        t._leverage              = leverage
+        t._signal_price          = signal_price
+        t._fill_price            = fill_price
+        t._slippage_bps          = slippage_bps
+        t._cl_ord_id             = cl_ord_id
+        t._market_impact_check   = _mig.market_impact_check
+        t._spread_at_execution_bps = _mig.spread_at_snapshot_bps
+        t._order_type_used       = _mig.order_type
+        t._ioc_tolerance_used_bps = _mig.ioc_tolerance_bps
+        t._liquidity_score       = _mig.liquidity_score
         return t
