@@ -85,10 +85,19 @@ FEATURE_DEFS: list[tuple[str, str, int, callable]] = [
 ]
 
 
-def _load_candles(conn, asset: str, interval: str, up_to_ts: int, limit: int) -> list[dict]:
+def _load_candles(
+    conn, asset: str, interval: str, up_to_ts: int, limit: int,
+    embargo_mode: bool = False,
+    embargo_cutoff_ts: int | None = None,
+) -> list[dict]:
     """
     Lädt bis zu `limit` Candles für (asset, interval) mit ts <= up_to_ts.
     Point-in-Time: ausschließlich Daten die zu diesem Zeitpunkt bekannt waren.
+
+    embargo_mode=True (für Walk-Forward Zero-Leakage):
+      - Lädt zusätzlich Kerzen VOR embargo_cutoff_ts für Indikator-Warmup.
+      - Schneidet den Output am exakten embargo_cutoff_ts ab — Indikatoren
+        erhalten die volle History, aber der OOS-Zeitraum beginnt sauber.
     """
     rows = conn.execute(
         """SELECT ts, open, high, low, close, volume
@@ -98,11 +107,14 @@ def _load_candles(conn, asset: str, interval: str, up_to_ts: int, limit: int) ->
            LIMIT ?""",
         (asset, interval, up_to_ts, limit),
     ).fetchall()
-    # Umkehren: älteste zuerst (wie Indikatoren es erwarten)
-    return [
+    candles = [
         {"time": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
         for r in reversed(rows)
     ]
+    # Zero-Leakage-Schnitt: Kerzen ab OOS-Start entfernen
+    if embargo_mode and embargo_cutoff_ts is not None:
+        candles = [c for c in candles if c["time"] < embargo_cutoff_ts]
+    return candles
 
 
 def _upsert_feature(conn, asset: str, interval: str, ts: int, name: str, value: float):

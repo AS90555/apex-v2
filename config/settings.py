@@ -83,7 +83,7 @@ PBO_MAX           = 0.30   # Hard-Gate: PBO ≤ 0.30
 STABILITY_MIN     = 0.50   # Hard-Gate: stability_score ≥ 0.50
 MAX_DD_GATE       = 0.30   # Hard-Gate: |MaxDD| ≤ 30 % des Kapitals (in R: ≤ -15R bei 5R/Trade)
 V6_STATS_ENFORCED = os.getenv("V6_STATS_ENFORCED", "false").lower() == "true"
-V6_GATES_ENFORCED = os.getenv("V6_GATES_ENFORCED", "false").lower() == "true"
+V6_GATES_ENFORCED = os.getenv("V6_GATES_ENFORCED", "true").lower() == "true"
 
 COMPOSITE_WEIGHTS = {
     "sharpe":    0.30,

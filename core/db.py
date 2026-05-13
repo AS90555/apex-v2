@@ -345,6 +345,9 @@ def run_migrations():
     for col, typedef in _ld_v6.items():
         if col not in ld_cols:
             conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {col} {typedef}")
+    # Re-Eval-Idempotenz: verhindert doppelte Re-Eval-Einträge (re_evaluated_at IS NOT NULL)
+    # Original-Insert-Idempotenz wird durch params_hash UNIQUE im DDL (auto_lab_daemon.py:431)
+    # garantiert — kein zusätzlicher Index nötig.
     conn.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_disc_idempotent
            ON lab_discoveries(strategy, framework_version, re_evaluated_at)

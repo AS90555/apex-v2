@@ -69,7 +69,7 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
     V6_GATES_ENFORCED=True (nach Phase 4): DSR/PBO/Stability/MaxDD Hard-Gates aktiv.
     """
     from config.settings import (
-        DSR_MIN_DRY_RUN, PBO_MAX, STABILITY_MIN, V6_GATES_ENFORCED,
+        DSR_MIN_DRY_RUN, DSR_MIN_LIVE, PBO_MAX, STABILITY_MIN, V6_GATES_ENFORCED,
     )
     failed: list[str] = []
 
@@ -89,11 +89,15 @@ def _check_gates(disc: dict, conn) -> tuple[bool, list[str]]:
     if disc["deployment_status"] in ("dry", "live"):
         failed.append(f"deployment_status={disc['deployment_status']}")
 
-    # V6 Hard-Gates (nur wenn enforced)
+    # V6 Hard-Gates — immer aktiv wenn V6_GATES_ENFORCED (default: True seit v6-Upgrade)
     if V6_GATES_ENFORCED:
         dsr_val = disc.get("dsr_value") or disc.get("dsr")
-        if dsr_val is None or dsr_val < DSR_MIN_DRY_RUN:
-            failed.append(f"dsr_value={dsr_val} < {DSR_MIN_DRY_RUN} (v6 Hard-Gate)")
+
+        # DSR-Schwelle abhängig vom Ziel-Mode: dry_run → 0.50, live → 0.65
+        target_mode = disc.get("target_mode", "dry_run")
+        dsr_min = DSR_MIN_LIVE if target_mode == "live" else DSR_MIN_DRY_RUN
+        if dsr_val is None or dsr_val < dsr_min:
+            failed.append(f"dsr_value={dsr_val} < {dsr_min} (v6 Hard-Gate, mode={target_mode})")
 
         pbo_val = disc.get("pbo_value")
         if pbo_val is not None and pbo_val > PBO_MAX:
