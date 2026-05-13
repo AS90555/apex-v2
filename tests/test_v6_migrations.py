@@ -1,11 +1,28 @@
 """
 Phase-2-Test: V6 Schema-Migrationen — alle Spalten und Tabellen vorhanden.
+
+Alle Schema-Checks laufen gegen eine isolierte tmp-DB, niemals gegen
+die Live-DB data/apex_v2.db.
 """
 
 from __future__ import annotations
 
+import sqlite3
 import pytest
+import core.db as _db_mod
 from core.db import get_connection, get_staging_connection, run_migrations
+
+
+@pytest.fixture()
+def isolated_db(tmp_path, monkeypatch):
+    """Setzt DB_PATH auf tmp-Datei, führt run_migrations() aus."""
+    db_file = str(tmp_path / "apex_test.db")
+    monkeypatch.setattr(_db_mod, "DB_PATH", db_file)
+    run_migrations()
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    yield conn
+    conn.close()
 
 
 V6_LAB_DISC_COLS = {
@@ -25,43 +42,37 @@ V6_TRADE_COLS = {
 NEW_TABLES = {"funding_rates", "asset_liquidity_metrics", "execution_audit_log"}
 
 
-def test_lab_discoveries_v6_cols():
-    conn = get_connection()
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
-    conn.close()
+def test_lab_discoveries_v6_cols(isolated_db):
+    cols = {r[1] for r in isolated_db.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
     missing = V6_LAB_DISC_COLS - cols
     assert not missing, f"Fehlende lab_discoveries-Spalten: {missing}"
 
 
-def test_trades_v6_cols():
-    conn = get_connection()
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
-    conn.close()
+def test_trades_v6_cols(isolated_db):
+    cols = {r[1] for r in isolated_db.execute("PRAGMA table_info(trades)").fetchall()}
     missing = V6_TRADE_COLS - cols
     assert not missing, f"Fehlende trades-Spalten: {missing}"
 
 
-def test_new_tables_exist():
-    conn = get_connection()
-    tables = {r[0] for r in conn.execute(
+def test_new_tables_exist(isolated_db):
+    tables = {r[0] for r in isolated_db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()}
-    conn.close()
     missing = NEW_TABLES - tables
     assert not missing, f"Fehlende Tabellen: {missing}"
 
 
-def test_idempotency_index_exists():
-    conn = get_connection()
-    indexes = {r[1] for r in conn.execute(
+def test_idempotency_index_exists(isolated_db):
+    indexes = {r[1] for r in isolated_db.execute(
         "SELECT * FROM sqlite_master WHERE type='index'"
     ).fetchall()}
-    conn.close()
     assert "idx_lab_disc_idempotent" in indexes
 
 
-def test_migrations_idempotent():
-    """run_migrations() darf kein Error beim zweiten Aufruf werfen."""
+def test_migrations_idempotent(tmp_path, monkeypatch):
+    """run_migrations() darf kein Error beim zweiten Aufruf werfen (isoliert)."""
+    db_file = str(tmp_path / "apex_idem.db")
+    monkeypatch.setattr(_db_mod, "DB_PATH", db_file)
     run_migrations()
     run_migrations()
 

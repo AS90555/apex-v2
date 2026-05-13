@@ -155,6 +155,21 @@ CREATE TABLE IF NOT EXISTS asset_requests (
     note         TEXT
 );
 
+CREATE TABLE IF NOT EXISTS lab_discoveries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    discovered_at TEXT NOT NULL,
+    params_hash   TEXT NOT NULL UNIQUE,
+    strategy      TEXT NOT NULL,
+    asset         TEXT NOT NULL,
+    params_json   TEXT NOT NULL,
+    n_train       INTEGER, pf_train REAL, avg_r_train REAL,
+    n_test        INTEGER, pf_test  REAL, avg_r_test  REAL, wr_test REAL,
+    fitness_score REAL,
+    max_dd_r      REAL,
+    micro_score   REAL,
+    notified      INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS lab_window_results (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     discovery_id INTEGER NOT NULL REFERENCES lab_discoveries(id),

@@ -39,7 +39,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.db import get_connection, run_migrations
+from core.db import get_connection, get_readonly_connection, run_migrations
 from backtest.engine import run_backtest
 from features.indicators import (
     ema, atr_wilder, sma, detect_regime as _detect_regime_fn,
@@ -402,7 +402,7 @@ def _load_requested_targets() -> list[tuple[str, str]]:
     Gibt leere Liste zurück wenn keine Anfragen vorhanden oder DB-Fehler.
     """
     try:
-        conn = get_connection()
+        conn = get_readonly_connection()
         rows = conn.execute(
             "SELECT asset FROM asset_requests WHERE status='pending'"
         ).fetchall()
@@ -516,7 +516,7 @@ def _ensure_schema():
 def _detect_regime(asset: str, start_ms: int, end_ms: int) -> str:
     """Ermittelt das dominante Markt-Regime im historischen Testzeitraum."""
     try:
-        conn = get_connection()
+        conn = get_readonly_connection()
         rows = conn.execute(
             """SELECT open, high, low, close, volume FROM candles
                WHERE asset=? AND interval='1h' AND ts >= ? AND ts <= ?
@@ -903,7 +903,7 @@ def _stat_inc(_conn_unused, key: str, delta: int = 1) -> None:
 
 def get_lab_stats() -> dict:
     """Liest alle Lab-Stats aus der DB — wird vom Telegram-Bot genutzt."""
-    conn = get_connection()
+    conn = get_readonly_connection()
     rows = conn.execute("SELECT key, value FROM lab_stats").fetchall()
     total_disc = conn.execute("SELECT COUNT(*) FROM lab_discoveries").fetchone()[0]
 
@@ -1502,7 +1502,7 @@ def main(single_pass: bool = False):
             # Sortierung mit kurzlebiger Verbindung — sofort schließen
             def _sort_key(target):
                 _, asset = target
-                c = get_connection()
+                c = get_readonly_connection()
                 has_disc = c.execute(
                     "SELECT 1 FROM lab_discoveries WHERE asset=? LIMIT 1", (asset,)
                 ).fetchone() is not None
@@ -1552,7 +1552,7 @@ def main(single_pass: bool = False):
                 except Exception as e:
                     log(f"[LAB-DAEMON] asset_requests update fehler: {e}")
 
-            c2 = get_connection()
+            c2 = get_readonly_connection()
             disc_total = _count_discoveries(c2)
             c2.close()
 
@@ -1565,7 +1565,7 @@ def main(single_pass: bool = False):
 
             # 6h-Heartbeat
             if time.time() - _last_heartbeat >= _HEARTBEAT_INTERVAL:
-                c_hb = get_connection()
+                c_hb = get_readonly_connection()
                 hb_disc = _count_discoveries(c_hb)
                 c_hb.close()
                 _send_telegram(
