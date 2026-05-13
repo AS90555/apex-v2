@@ -87,6 +87,10 @@ V6_GATES_ENFORCED   = os.getenv("V6_GATES_ENFORCED",   "true").lower()  == "true
 # v7 Phase 2: DSR aus Block-Bootstrap statt direkter Schätzung
 V7_MC_DSR_ENFORCED  = os.getenv("V7_MC_DSR_ENFORCED",  "false").lower() == "true"
 
+# ── v7 Phase 4 — Funding-Sizing + Latenz-Slippage ───────────────────────────
+FUNDING_SIZE_K  = 1.0   # Skalierungsfaktor für Funding-Drag-Adjustment in sizing.py
+V7_FUNDING_SIZING = os.getenv("V7_FUNDING_SIZING", "true").lower() == "true"
+
 # v7.0 (2026-05-13): initiale Versionierung; Gewichte unverändert zu v6.
 # Änderungen: PR + Changelog in backtest/composite_score.py + Re-Backtest erforderlich.
 COMPOSITE_WEIGHTS_VERSION = "v7.0"

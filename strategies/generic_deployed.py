@@ -18,7 +18,8 @@ from core.db import get_connection
 from core.models import Signal
 from core.utils import log, now_iso
 from strategies.base import BaseStrategy
-from config.settings import RISK_USDT, SIZE_DECIMALS, PRICE_DECIMALS
+from config.settings import RISK_USDT, SIZE_DECIMALS, PRICE_DECIMALS, V7_FUNDING_SIZING
+from governance.sizing import get_latest_funding_rate
 
 
 def _current_session() -> str:
@@ -181,7 +182,23 @@ class GenericDeployedStrategy(BaseStrategy):
             take_profit_2 = round(entry_price - tp2_dist, dec_price)
 
         sl_dist = abs(entry_price - stop_loss)
-        size    = round(RISK_USDT / sl_dist, dec_size) if sl_dist > 0 else 0
+
+        if V7_FUNDING_SIZING and sl_dist > 0:
+            from governance.sizing import compute_position_size
+            funding_rate = get_latest_funding_rate(self._asset)
+            size = round(
+                compute_position_size(
+                    asset=self._asset,
+                    entry_price=entry_price,
+                    sl_distance=sl_dist,
+                    capital=RISK_USDT * 20,  # Proxy-Kapital; RISK_USDT bleibt Cap
+                    expected_funding_8h=funding_rate,
+                ),
+                dec_size,
+            )
+        else:
+            size = round(RISK_USDT / sl_dist, dec_size) if sl_dist > 0 else 0
+
         if size <= 0:
             conn.close()
             return []
