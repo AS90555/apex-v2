@@ -116,8 +116,10 @@ COMPOSITE_WEIGHTS = {
 
 # ── Governance v2 (v6 Phase 6) ───────────────────────────────────────────────
 STALE_CANDLE_TOLERANCE_SECONDS = 900          # 15 min — Kerze älter → stale_market_data
-FUNDING_RATE_WARN_THRESHOLD    = 0.0005       # 0.05% per 8h → Warning
+FUNDING_RATE_WARN_THRESHOLD    = 0.0005       # 0.05% per 8h → Warning (beide Richtungen)
 FUNDING_RATE_BLOCK_THRESHOLD   = 0.002        # 0.20% per 8h → Block wenn gegen Signal-Richtung
+# Bitget zahlt Funding alle 8h. Nach 2h ohne Update gilt Rate als stale (fail-open: warn, kein Block).
+FUNDING_RATE_STALE_MIN         = 120          # Funding-Daten älter als N Minuten → stale
 ATR_SIZING_PERIOD              = 14           # ATR-Periode für Vol-Targeting
 TARGET_VOLATILITY_PCT          = 0.02         # 2% Tages-Vol-Ziel
 V6_VOL_TARGETING               = os.getenv("V6_VOL_TARGETING", "false").lower() == "true"

@@ -29,6 +29,7 @@ from config.settings import (
     STALE_CANDLE_TOLERANCE_SECONDS,
     FUNDING_RATE_WARN_THRESHOLD,
     FUNDING_RATE_BLOCK_THRESHOLD,
+    FUNDING_RATE_STALE_MIN,
     MAX_DAILY_TRADES,
 )
 from governance.gate import BaseGovernanceCheck
@@ -359,10 +360,24 @@ class StaleCandleCheck(BaseGovernanceCheck):
 
 class FundingRateCheck(BaseGovernanceCheck):
     """
-    Blockiert/warnt bei hoher Funding-Rate gegen Signal-Richtung (v6 Phase 6).
+    C.4 — Blockiert/warnt bei hoher Funding-Rate gegen Signal-Richtung.
 
-    |rate| > WARN  → durchlassen, aber in reason markieren
-    |rate| > BLOCK und rate-Vorzeichen gegen Signal → rejected
+    Schwellen (konfigurierbar in config/settings.py):
+      FUNDING_RATE_WARN_THRESHOLD  = 0.0005  → 0.05%/8h: immer markieren, nie blockieren
+      FUNDING_RATE_BLOCK_THRESHOLD = 0.002   → 0.20%/8h: blockieren wenn gegen Signalrichtung
+      FUNDING_RATE_STALE_MIN       = 120     → Daten älter als 2h gelten als stale
+
+    Semantik:
+      Funding positiv → Long zahlt → nachteilig für Longs
+      Funding negativ → Short zahlt → nachteilig für Shorts
+
+    Fail-Open-Policy:
+      Keine Daten oder stale Daten → Signal durchgelassen mit FUNDING_SKIP/FUNDING_STALE.
+      Begründung: ein ausgefallener Intake-Job soll nicht alle Trades blockieren.
+
+    Warum diese Schwellen:
+      0.05%/8h = 0.15%/Tag = ~55%/Jahr Funding-Kosten bei permanent-long — Warnschwelle sinnvoll.
+      0.20%/8h = 0.60%/Tag — überschreitet typische Trade-Rendite-Erwartung, Block gerechtfertigt.
     """
 
     @property
@@ -373,7 +388,7 @@ class FundingRateCheck(BaseGovernanceCheck):
         conn = get_connection()
         try:
             row = conn.execute(
-                """SELECT funding_rate FROM funding_rates
+                """SELECT funding_rate, funding_time FROM funding_rates
                    WHERE asset=? ORDER BY funding_time DESC LIMIT 1""",
                 (signal.asset,),
             ).fetchone()
@@ -382,6 +397,23 @@ class FundingRateCheck(BaseGovernanceCheck):
 
         if not row:
             return True, f"funding_rate=skip(keine_daten_{signal.asset})"
+
+        # Stale-Prüfung — Funding-Datum parsen und Alter berechnen
+        funding_time_str = row["funding_time"] if row["funding_time"] else ""
+        if funding_time_str:
+            try:
+                ft = datetime.fromisoformat(funding_time_str.replace("Z", "+00:00"))
+                if ft.tzinfo is None:
+                    ft = ft.replace(tzinfo=timezone.utc)
+                age_min = (datetime.now(timezone.utc) - ft).total_seconds() / 60.0
+                if age_min > FUNDING_RATE_STALE_MIN:
+                    return True, (
+                        f"FUNDING_STALE: funding_time={funding_time_str} "
+                        f"age={age_min:.0f}min > {FUNDING_RATE_STALE_MIN}min "
+                        f"(fail-open)"
+                    )
+            except (ValueError, TypeError):
+                return True, "funding_rate=skip(funding_time_parse_error)"
 
         rate = float(row["funding_rate"])
         direction = signal.direction  # 'long' oder 'short'
@@ -394,7 +426,7 @@ class FundingRateCheck(BaseGovernanceCheck):
         abs_rate = abs(rate)
         if abs_rate > FUNDING_RATE_BLOCK_THRESHOLD and funding_against:
             return False, (
-                f"funding_rate: rate={rate:.5f} gegen {direction} "
+                f"funding_rate_block: rate={rate:.5f} gegen {direction} "
                 f"> block_threshold={FUNDING_RATE_BLOCK_THRESHOLD:.4f}"
             )
         if abs_rate > FUNDING_RATE_WARN_THRESHOLD:
