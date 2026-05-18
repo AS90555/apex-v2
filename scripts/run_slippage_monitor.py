@@ -29,17 +29,8 @@ def _now_iso() -> str:
 
 
 def _send_telegram(text: str) -> None:
-    if not _TG_BOT or not _TG_CHAT:
-        return
-    try:
-        import requests
-        requests.post(
-            f"https://api.telegram.org/bot{_TG_BOT}/sendMessage",
-            json={"chat_id": _TG_CHAT, "text": text},
-            timeout=10,
-        )
-    except Exception as e:
-        log(f"[SLIPPAGE] Telegram-Fehler: {e}")
+    from core.telegram_dispatcher import dispatch
+    dispatch(text)
 
 
 def _median(values: list[float]) -> float:

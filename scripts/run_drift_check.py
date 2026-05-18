@@ -27,7 +27,6 @@ from core.db import get_connection
 from core.utils import log, now_iso
 from config.settings import (
     DRIFT_WARNING_PCT, DRIFT_CRITICAL_PCT, DRIFT_MIN_TRADES,
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
 )
 
 
@@ -36,17 +35,8 @@ def _now() -> str:
 
 
 def _send_telegram(msg: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("[DRIFT] Telegram nicht konfiguriert — Push übersprungen")
-        return
-    try:
-        import urllib.request
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        log(f"[DRIFT] Telegram-Push fehlgeschlagen: {e}")
+    from core.telegram_dispatcher import dispatch
+    dispatch(msg)
 
 
 def _load_deployments(conn) -> list[dict]:

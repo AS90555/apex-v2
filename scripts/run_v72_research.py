@@ -22,6 +22,13 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", ".env")
+    _load_dotenv(_env_path)
+except ImportError:
+    pass
+
 import optuna
 import requests
 
@@ -52,16 +59,8 @@ def _eval_window() -> tuple[int, int]:
 
 
 def _send_telegram(text: str) -> None:
-    if not _TG_BOT or not _TG_CHAT:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{_TG_BOT}/sendMessage",
-            json={"chat_id": _TG_CHAT, "text": text, "parse_mode": "MarkdownV2"},
-            timeout=10,
-        )
-    except Exception as e:
-        log(f"[v72] Telegram-Fehler: {e}")
+    from core.telegram_dispatcher import dispatch
+    dispatch(text)
 
 
 def _write_report(
@@ -142,18 +141,70 @@ def _send_telegram_summary(
     _send_telegram("\n".join(lines))
 
 
+def _governance_pre_check(
+    strategy: str, asset: str,
+    skip_check: bool = False,
+    db_path: str | None = None,
+) -> None:
+    """
+    Prüft Negative-Control-Sperre vor Run-Start.
+    Exit-Code 2 = Governance-Block (unterscheidet sich von technischen Fehlern).
+    Kein Lab-Gesamtlogik-Entscheider — nur Guard.
+    """
+    if skip_check:
+        log("[v72] WARNUNG: --skip-nc-check aktiv — Governance-Guard übersprungen")
+        return
+    try:
+        from core.lab_negative_controls import check_negative_control
+        result = check_negative_control(strategy, asset, db_path=db_path) if db_path else check_negative_control(strategy, asset)
+        if result.blocked:
+            nc = result.nc
+            log(f"[v72] GOVERNANCE-BLOCK: {strategy}/{asset} ist als Negative Control gesperrt.")
+            log(f"[v72]   Grund: {nc.no_go_reason}")
+            log(f"[v72]   Diagnose: {nc.structural_diagnosis or '—'}")
+            log(f"[v72]   Wiederöffnung: {nc.reopen_condition_type or 'manual_only'}")
+            log(f"[v72]   Gesperrt seit: {nc.created_at}")
+            log("[v72]   Kein Run gestartet. Exit-Code 2.")
+            sys.exit(2)
+        if result.reopen_available:
+            log(f"[v72] INFO: Negative Control für {strategy}/{asset} wurde automatisch "
+                f"entsperrt ({result.reopen_reason}). Run kann fortfahren.")
+    except ImportError:
+        log("[v72] WARNUNG: lab_negative_controls nicht verfügbar — NC-Check übersprungen")
+
+
 def main() -> optuna.Study:
     parser = argparse.ArgumentParser(description="v7.2 Research — OOS-Optimierter Optuna-Run")
-    parser.add_argument("--strategy",   type=str, required=True, help="Strategie-Name")
-    parser.add_argument("--asset",      type=str, required=True, help="Asset (z.B. BTC)")
-    parser.add_argument("--n-trials",   type=int, default=50,    help="Anzahl Optuna-Trials (default: 50)")
-    parser.add_argument("--batch-size", type=int, default=10,    help="Staging-Batch-Größe (default: 10)")
-    parser.add_argument("--dry-run",    action="store_true",      help="Kein DB-Write, nur Report")
+    parser.add_argument("--strategy",      type=str, required=True, help="Strategie-Name")
+    parser.add_argument("--asset",         type=str, required=True, help="Asset (z.B. BTC)")
+    parser.add_argument("--n-trials",      type=int, default=50,    help="Anzahl Optuna-Trials (default: 50)")
+    parser.add_argument("--batch-size",    type=int, default=10,    help="Staging-Batch-Größe (default: 10)")
+    parser.add_argument("--dry-run",       action="store_true",     help="Kein DB-Write, nur Report")
+    parser.add_argument("--pre-scan",      action="store_true",     help="Nur 20-Trial Pre-Scan (kein voller Run)")
+    parser.add_argument("--skip-nc-check", action="store_true",     help="Governance-Guard überspringen (nur mit expliziter User-Bestätigung)")
+    parser.add_argument("--lab-db-path",   type=str, default=None,  help="Pfad zu lab_state.db (optional, überschreibt Default)")
+    parser.add_argument("--staging-db",    type=str, default=None,  help="Pfad zu research_staging.db (optional, überschreibt Default)")
     args = parser.parse_args()
 
     if not V72_RESEARCH_ENABLED and not args.dry_run:
         log("[v72] FEHLER: V72_RESEARCH_ENABLED=false — bitte .env setzen oder --dry-run nutzen")
         sys.exit(1)
+
+    # Governance-Guard: Negative-Control-Prüfung vor jedem Run
+    if not args.dry_run:
+        _governance_pre_check(
+            args.strategy, args.asset,
+            skip_check=args.skip_nc_check,
+            db_path=args.lab_db_path,
+        )
+
+    # Pre-Scan-Modus: Trials auf Pre-Scan-Budget begrenzen
+    if args.pre_scan:
+        pre_scan_trials = 20
+        if args.n_trials != 50:  # wurde explizit gesetzt
+            pre_scan_trials = args.n_trials
+        args.n_trials = pre_scan_trials
+        log(f"[v72] PRE-SCAN-Modus: {pre_scan_trials} Trials")
 
     random.seed(RANDOM_SEED)
     try:

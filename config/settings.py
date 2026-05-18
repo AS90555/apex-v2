@@ -281,6 +281,14 @@ ATR_TP_MULTIPLIER     = 3.0
 # ── Telegram Shadow-Prefix ────────────────────────────────────────────────────
 TELEGRAM_V2_PREFIX = "[V2·SHADOW]"
 
+# ── Telegram Spam-Schutz (A.5) ───────────────────────────────────────────────
+TG_DEDUPE_WINDOW_MIN  = 15   # gleiche Nachricht innerhalb N Minuten unterdrücken
+TG_RATE_LIMIT_PER_MIN = 30   # max Nachrichten pro 60 Sekunden
+TG_RATE_LIMIT_BURST   = 10   # Token-Bucket Burst-Kapazität
+TG_CB_THRESHOLD       = 50   # ab dieser Anzahl Nachrichten in CB-Fenster → CB öffnet
+TG_CB_WINDOW_MIN      = 10   # Beobachtungsfenster für CB-Threshold (Minuten)
+TG_CB_RESET_MIN       = 60   # CB schließt nach N Minuten ohne neue Last
+
 # ── v7.2 Research (2026-05-13) ───────────────────────────────────────────────
 RANDOM_SEED           = 42       # globaler Determinismus für Optuna/MC/Bootstrap
 OBJECTIVE_V72_VERSION = "v72.0"  # Bump bei Änderung der Objective-Funktion

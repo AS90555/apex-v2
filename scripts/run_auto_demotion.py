@@ -44,16 +44,8 @@ def _backup_db() -> str:
 
 
 def _send_telegram(text: str) -> None:
-    if not _TG_BOT or not _TG_CHAT:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{_TG_BOT}/sendMessage",
-            json={"chat_id": _TG_CHAT, "text": text, "parse_mode": "MarkdownV2"},
-            timeout=10,
-        )
-    except Exception as e:
-        log(f"[AUTO_DEMOTION] Telegram-Fehler: {e}")
+    from core.telegram_dispatcher import dispatch
+    dispatch(text)
 
 
 def _esc(s: str) -> str:
