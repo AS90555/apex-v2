@@ -25,6 +25,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.db import get_connection, get_state, set_state
+from core.telegram_dispatcher import dispatch
 from core.utils import log
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
@@ -43,19 +44,10 @@ _REGIME_ICON = {
 }
 
 
-# ── Telegram-Push (synchron via requests — kein async nötig) ──────────────────
+# ── Telegram-Push (via Dispatcher für Dedupe/Rate-Limit) ─────────────────────
 
 def _send(text: str) -> None:
-    if not _BOT_TOKEN or not _CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
-            json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-    except Exception as e:
-        log(f"[AUTOPILOT] Telegram-Fehler: {e}")
+    dispatch(text, event_type="autopilot")
 
 
 # ── Deploy-Logik (Single Source of Truth — auch vom Bot genutzt) ──────────────

@@ -132,6 +132,31 @@ def _send_raw(text: str) -> None:
         log(f"[dispatcher] HTTP-Fehler: {e}")
 
 
+def should_dispatch(text: str, event_type: str = "generic") -> bool:
+    """
+    Prüft Dedupe/Rate-Limit/CB ohne zu senden.
+    Gibt True zurück wenn die Nachricht durchgelassen werden soll, False wenn unterdrückt.
+    Verwendet werden bei Nachrichten mit InlineKeyboard (Bot sendet selbst, Dispatcher checkt nur).
+    """
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    msg_hash = _msg_hash(text)
+
+    with _lock:
+        if _check_and_update_cb(now_mono):
+            log(f"[dispatcher] CB offen — unterdrückt ({event_type}): {text[:60]!r}")
+            return False
+        if _is_duplicate(msg_hash, now_wall):
+            return False
+        _dedupe_cache[msg_hash] = now_wall + TG_DEDUPE_WINDOW_MIN * 60.0
+        if not _consume_token():
+            log(f"[dispatcher] Rate-Limit — unterdrückt ({event_type}): {text[:60]!r}")
+            return False
+        _cb_window_timestamps.append(now_mono)
+
+    return True
+
+
 def dispatch(text: str, event_type: str = "generic") -> None:
     """
     Sendet eine Telegram-Nachricht mit Dedupe, Rate-Limit und CB-Schutz.

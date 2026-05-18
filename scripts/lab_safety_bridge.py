@@ -18,7 +18,6 @@ import sys
 import os
 import json
 import sqlite3
-import requests
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
@@ -26,7 +25,9 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+from core.telegram_dispatcher import dispatch as _tg_dispatch
+
+_LEGACY_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "apex_v2.db")
@@ -50,17 +51,7 @@ LIVE_WR_MIN = 40.0
 
 
 def _send(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print(f"[LAB-BRIDGE] (kein Telegram) {text}")
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"[LAB-BRIDGE] Telegram-Fehler: {e}")
+    _tg_dispatch(text, event_type="lab_safety_bridge")
 
 
 def _conn() -> sqlite3.Connection:

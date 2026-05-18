@@ -45,6 +45,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from core.db import get_connection, DB_PATH
+from core.telegram_dispatcher import dispatch, should_dispatch  # noqa: F401
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RISK_USDT
 
 
@@ -778,14 +779,7 @@ LAB_REF = {
     "SOL": {"avg_r": 0.053, "pf": 1.07, "wr": 40.0},  # Fallback 40% wenn keine DB-Daten
 }
 
-HEARTBEAT_MAX_AGE_MIN = {
-    "intake": 10, "features": 10,
-    "strategies": 30, "governance": 30,
-    "executor": 30, "monitor": 30,
-    "drift_check":    1500,   # Daily-Job (Cron 06:00) — 25h Puffer für Cron-Verzögerungen
-    "hmm_retrain":   10080,   # Wöchentlicher Job (So 05:00) — 7 Tage Puffer
-    "regime_monitor":  250,   # 4h-Timer — 10 Min Puffer über 4h (=240 Min)
-}
+from config.settings import HEARTBEAT_THRESHOLDS_MIN as HEARTBEAT_MAX_AGE_MIN
 
 
 def _canary_target(asset: str) -> int:
@@ -2640,7 +2634,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Überblick",       callback_data="dashboard"),
-            InlineKeyboardButton("📂 Offene Signale",  callback_data="signals"),
+            InlineKeyboardButton("📂 Offene Trades",   callback_data="signals"),
         ],
         [
             InlineKeyboardButton("💰 Strategien",      callback_data="manage_strategies"),
@@ -2809,14 +2803,25 @@ async def cmd_lab(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _HELP_TEXT = (
     "📖 *APEX V2 — Befehlsübersicht*\n\n"
+    "*Navigation*\n"
     "`/menu` — Haupt\\-Menü öffnen\n"
+    "`/help` — Diese Übersicht\n\n"
+    "*Monitoring*\n"
     "`/status` — System\\-Status \\(Heartbeats, Server\\)\n"
     "`/pnl` — Dashboard \\(P&L, Canary\\)\n"
-    "`/lab <ASSET> [TAGE]` — On\\-Demand Squeeze\\-Backtest\n"
+    "`/board` — Operator\\-KPI\\-Dashboard \\(6 KPIs in 1 Nachricht\\)\n\n"
+    "*Operator\\-Aktionen*\n"
+    "`/shadow <id>` — Deployment auf Shadow\\-Mode umstellen\n"
+    "`/panic` — Kill\\-Switch HARD setzen \\(mit Bestätigung\\)\n"
+    "`/panic_clear <grund>` — Kill\\-Switch zurücksetzen\n\n"
+    "*Lab*\n"
+    "`/lab <ASSET> [TAGE]` — On\\-Demand Backtest\n"
     "    Beispiel: `/lab ETH 365`\n"
-    "`/fetch <ASSET> <TAGE>` — Historische Kerzen via Binance laden\n"
-    "    Beispiel: `/fetch XRP 180`\n"
-    "`/help` — Diese Übersicht\n\n"
+    "`/lab_decide <id> <full_run|skip|archive>` — Inconclusive\\-Entscheidung\n"
+    "`/resolve <id>` — Alias für `/lab_decide`\n\n"
+    "*System*\n"
+    "`/fetch <ASSET> <TAGE>` — Historische Kerzen laden\n"
+    "    Beispiel: `/fetch XRP 180`\n\n"
     "*Assets:* ETH, BTC, SOL, XRP, AVAX, DOGE, ADA, BNB"
 )
 
@@ -3290,6 +3295,155 @@ def _table_exists(conn, name: str) -> bool:
     ).fetchone())
 
 
+# ── /panic + /panic_clear ─────────────────────────────────────────────────────
+
+async def cmd_panic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/panic — Kill-Switch HARD setzen (mit Inline-Bestätigung)."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    from governance.kill_switch import get_kill_mode
+    if get_kill_mode() not in (None, "none", ""):
+        await update.message.reply_text(
+            f"ℹ️ Kill-Switch ist bereits aktiv (Mode: <code>{get_kill_mode()}</code>).\n"
+            "Nutze /panic_clear um ihn zurückzusetzen.",
+            parse_mode="HTML",
+        )
+        return
+
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        "⚠️ <b>Kill-Switch HARD aktivieren?</b>\n\n"
+        "Alle offenen Positionen werden <b>NICHT automatisch geschlossen</b>.\n"
+        "Neue Signale werden blockiert. Kill-Switch muss manuell via /panic_clear zurückgesetzt werden.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔴 JA — Jetzt sperren", callback_data=f"panic_confirm_{uid}"),
+            InlineKeyboardButton("❌ Abbrechen",           callback_data="panic_abort"),
+        ]]),
+    )
+
+
+async def cmd_panic_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/panic_clear <grund> — Kill-Switch zurücksetzen (Audit-Pflicht)."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    args = ctx.args or []
+    reason = " ".join(args).strip()
+    if not reason:
+        await update.message.reply_text(
+            "❌ Grund erforderlich.\nNutzung: <code>/panic_clear &lt;Grund&gt;</code>\n"
+            "Beispiel: <code>/panic_clear Netz wieder stabil, manuell geprüft</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    from governance.kill_switch import get_kill_mode, clear_kill_mode
+    current = get_kill_mode()
+    if current in (None, "none", ""):
+        await update.message.reply_text("ℹ️ Kein aktiver Kill-Switch vorhanden — nichts zu tun.")
+        return
+
+    uid = update.effective_user.id
+    cleared_by = f"telegram:user={uid}"
+    try:
+        clear_kill_mode(reason=reason, cleared_by=cleared_by)
+        await update.message.reply_text(
+            f"✅ <b>Kill-Switch zurückgesetzt</b>\n\n"
+            f"War: <code>{current}</code>\n"
+            f"Grund: {reason}\n"
+            f"Durch: {cleared_by}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler beim Clear: {e}")
+
+
+# ── /lab_decide + /resolve ─────────────────────────────────────────────────────
+
+async def cmd_lab_decide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lab_decide <queue_id> <full_run|skip|archive> — Inconclusive-Entscheidung."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    args = ctx.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Nutzung: <code>/lab_decide &lt;queue_id&gt; &lt;full_run|skip|archive&gt;</code>\n"
+            "Beispiel: <code>/lab_decide 42 full_run</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    queue_id = int(args[0])
+    decision = args[1].lower()
+    if decision not in ("full_run", "skip", "archive"):
+        await update.message.reply_text(
+            "❌ Ungültige Entscheidung. Erlaubt: <code>full_run</code>, <code>skip</code>, <code>archive</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        from core.lab_state_db import get_lab_state_connection
+        conn = get_lab_state_connection()
+        row = conn.execute(
+            "SELECT id, strategy, asset, status FROM lab_queue WHERE id=?", (queue_id,)
+        ).fetchone()
+
+        if not row:
+            await update.message.reply_text(f"❌ Queue-Eintrag #{queue_id} nicht gefunden.")
+            return
+
+        if row["status"] != "paused_inconclusive":
+            await update.message.reply_text(
+                f"❌ Eintrag #{queue_id} hat Status <code>{row['status']}</code> — "
+                "nur <code>paused_inconclusive</code>-Einträge können entschieden werden.",
+                parse_mode="HTML",
+            )
+            return
+
+        strategy = row["strategy"]
+        asset = row["asset"]
+
+        if decision == "full_run":
+            conn.execute("UPDATE lab_queue SET status='queued' WHERE id=?", (queue_id,))
+            result_text = "queued (wird im nächsten Cycle-Lauf aufgenommen)"
+        elif decision == "skip":
+            conn.execute("UPDATE lab_queue SET status='skipped' WHERE id=?", (queue_id,))
+            result_text = "übersprungen"
+        else:  # archive
+            conn.execute("UPDATE lab_queue SET status='archived' WHERE id=?", (queue_id,))
+            conn.execute(
+                "INSERT INTO negative_controls (strategy, asset, study_hash, closed_at, closed_reason, closed_by) "
+                "VALUES (?, ?, 'operator', datetime('now'), 'operator_decision', ?)",
+                (strategy, asset, f"telegram:{update.effective_user.id}"),
+            )
+            result_text = "als Negative Control archiviert"
+
+        from core.lab_state_db import log_governance_event
+        log_governance_event(
+            conn,
+            event_type="operator_lab_decide",
+            entity_type="lab_queue",
+            entity_id=queue_id,
+            actor=f"telegram:{update.effective_user.id}",
+            reason=f"decision={decision}",
+        )
+        conn.commit()
+
+        await update.message.reply_text(
+            f"✅ Queue #{queue_id} (<code>{strategy}/{asset}</code>) → {result_text}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler: {e}")
+
+
 async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /deploy <ID>
@@ -3623,6 +3777,30 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Glossar-Pop-ups (show_alert=True) ────────────────────────────────────
     if action in _GLOSSAR:
         await query.answer(text=_GLOSSAR[action], show_alert=True)
+        return
+
+    # ── Panic-Bestätigung ─────────────────────────────────────────────────────
+    if action.startswith("panic_confirm_"):
+        uid = update.effective_user.id
+        expected = f"panic_confirm_{uid}"
+        if action != expected:
+            await query.answer(text="⛔ Nicht autorisiert.", show_alert=True)
+            return
+        try:
+            from governance.kill_switch import set_kill_mode
+            set_kill_mode(mode="hard", reason="Telegram /panic", asset=None)
+            await query.edit_message_text(
+                "🔴 <b>Kill-Switch HARD aktiviert</b>\n\n"
+                "Alle neuen Signale sind blockiert.\n"
+                "Nutze /panic_clear &lt;Grund&gt; zum Zurücksetzen.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Fehler beim Setzen des Kill-Switch: {e}")
+        return
+
+    if action == "panic_abort":
+        await query.edit_message_text("✅ Abgebrochen — Kill-Switch nicht gesetzt.")
         return
 
     try:
@@ -4577,11 +4755,12 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
                         f"⏸ Pause {t['asset']}", callback_data=f"trade_pause_confirm_{_disc_id}"
                     ),
                 ])
-            await ctx.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID, text=msg,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=InlineKeyboardMarkup(trade_kb_rows),
-            )
+            if should_dispatch(msg, event_type="trade_notification"):
+                await ctx.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID, text=msg,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup(trade_kb_rows),
+                )
 
 
 async def push_heartbeat_alert(ctx: ContextTypes.DEFAULT_TYPE):
@@ -4624,6 +4803,8 @@ async def push_heartbeat_alert(ctx: ContextTypes.DEFAULT_TYPE):
         + "\n".join(dead_readable)
         + "\n\n_Andere Komponenten laufen normal\\._"
     )
+    if not should_dispatch(msg, event_type="heartbeat_alert"):
+        return
     await ctx.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -4679,9 +4860,12 @@ async def push_daily_status(ctx: ContextTypes.DEFAULT_TYPE):
 
     lines += ["", "*══ MARKT HEUTE ══════════════════*", _db_market_weather_de()]
 
+    msg = "\n".join(lines)
+    if not should_dispatch(msg, event_type="daily_status"):
+        return
     await ctx.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="\n".join(lines),
+        text=msg,
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📊 Dashboard",  callback_data="dashboard"),
@@ -4808,9 +4992,12 @@ async def push_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("✅ *Alerts:* keine")
 
+    digest_msg = "\n".join(lines)
+    if not should_dispatch(digest_msg, event_type="daily_digest"):
+        return
     await ctx.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="\n".join(lines),
+        text=digest_msg,
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📋 Portfolio", callback_data="portfolio_overview"),
@@ -4860,10 +5047,11 @@ async def push_go_live_check(ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🛑 Deployment stoppen", callback_data=f"dep_mode:{sk}:stop"),
                 InlineKeyboardButton("📊 Dashboard",          callback_data="dashboard"),
             ]])
-        await ctx.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=msg,
-            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb,
-        )
+        if should_dispatch(msg, event_type="go_live_check"):
+            await ctx.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, text=msg,
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb,
+            )
 
     # ── 1. Deployments prüfen ────────────────────────────────────────────────
     deps = _db_active_deployments()
@@ -4941,8 +5129,12 @@ def main():
     app.add_handler(CommandHandler("lab_stats", cmd_lab_stats))
     app.add_handler(CommandHandler("deploy",   cmd_deploy))
     app.add_handler(CommandHandler("promote",  cmd_promote))
-    app.add_handler(CommandHandler("shadow",   cmd_shadow))
-    app.add_handler(CommandHandler("board",    cmd_board))
+    app.add_handler(CommandHandler("shadow",      cmd_shadow))
+    app.add_handler(CommandHandler("board",       cmd_board))
+    app.add_handler(CommandHandler("panic",       cmd_panic))
+    app.add_handler(CommandHandler("panic_clear", cmd_panic_clear))
+    app.add_handler(CommandHandler("lab_decide",  cmd_lab_decide))
+    app.add_handler(CommandHandler("resolve",     cmd_lab_decide))
     app.add_handler(CommandHandler("api_test",  cmd_api_test))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CallbackQueryHandler(button_callback))

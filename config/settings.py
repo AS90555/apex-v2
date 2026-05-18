@@ -287,12 +287,15 @@ MAX_DAILY_TRADES = 3  # max. abgeschlossene Trades pro 24h-Fenster (alle Assets,
 # Maximales Alter des letzten Heartbeats pro Komponente (Minuten).
 # Intake/Features sind zeitkritisch (10 min); Governance/Executor toleranter (30 min).
 HEARTBEAT_THRESHOLDS_MIN: dict[str, int] = {
-    "intake":     10,
-    "features":   10,
-    "strategies": 30,
-    "governance": 30,
-    "executor":   30,
-    "monitor":    30,
+    "intake":          10,
+    "features":        10,
+    "strategies":      30,
+    "governance":      30,
+    "executor":        30,
+    "monitor":         30,
+    "drift_check":   1500,   # Daily-Cron (06:00 UTC) — 25h Puffer
+    "hmm_retrain":  10080,   # Wöchentlicher Job — 7-Tage-Puffer
+    "regime_monitor":  250,  # 4h-Timer — 10 Min Puffer über 4h
 }
 
 # ── Telegram Shadow-Prefix ────────────────────────────────────────────────────
