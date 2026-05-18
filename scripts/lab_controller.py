@@ -217,7 +217,7 @@ def mode_build_queue(db_path: str, cycle_id: int | None = None) -> int:
 
 def mode_run_cycle(db_path: str) -> None:
     conn = get_lab_state_connection(db_path)
-    lock_ok = acquire_lock(conn, "weekly_cycle", "lab_controller", ttl_hours=120)
+    lock_ok = acquire_lock(conn, "weekly_cycle", "lab_controller", ttl_hours=8)
     if not lock_ok:
         log("[lab-ctrl] Lock 'weekly_cycle' aktiv — Cycle läuft bereits")
         conn.close()
@@ -666,6 +666,67 @@ def _trigger_circuit_breaker(db_path: str, cycle_id: int, reason: str) -> None:
     _send_telegram(f"🚨 <b>Circuit-Breaker</b>\nCycle #{cycle_id} pausiert\nGrund: {reason}")
 
 
+LAB_STOP_FLAG = Path(__file__).parent.parent / "data" / "lab_stop.flag"
+
+
+def mode_run_continuous(db_path: str, pause_s: int = 300) -> None:
+    """Kontinuierlicher Lab-Betrieb: Cycle → Pause → Cycle → … bis lab_stop.flag existiert.
+
+    Ablauf pro Iteration:
+      1. Stop-Flag prüfen → sauberer Ausstieg wenn data/lab_stop.flag existiert
+      2. Asset-Profiler einmal täglich (nicht bei jedem Cycle)
+      3. run-cycle (baut Queue intern + verarbeitet sie)
+      4. pause_s Sekunden warten, dann weiter
+
+    Stop: `touch data/lab_stop.flag`  →  nach aktuellem Cycle-Abschluss wird gestoppt.
+    """
+    import time as _time
+
+    log("[lab-ctrl] Kontinuierlicher Lab-Betrieb gestartet")
+    _send_telegram("🔬 <b>Lab Continuous-Mode gestartet</b>\nStoppt bei <code>data/lab_stop.flag</code>")
+
+    last_profiler_date: str | None = None
+    iteration = 0
+
+    while True:
+        # Stop-Flag prüfen
+        if LAB_STOP_FLAG.exists():
+            log("[lab-ctrl] Stop-Flag erkannt — kontinuierlicher Betrieb beendet")
+            _send_telegram("🛑 <b>Lab Continuous-Mode gestoppt</b> (lab_stop.flag)")
+            LAB_STOP_FLAG.unlink(missing_ok=True)
+            break
+
+        iteration += 1
+        today = _time.strftime("%Y-%m-%d", _time.gmtime())
+
+        # Asset-Profiler einmal täglich
+        if last_profiler_date != today:
+            log(f"[lab-ctrl] Continuous #{iteration}: Asset-Profiler läuft (täglich)")
+            try:
+                mode_asset_profile_update(db_path)
+                last_profiler_date = today
+            except Exception as e:
+                log(f"[lab-ctrl] WARNUNG Asset-Profiler: {e}")
+
+        # Cycle starten
+        log(f"[lab-ctrl] Continuous #{iteration}: Cycle wird gestartet")
+        try:
+            mode_run_cycle(db_path)
+        except Exception as e:
+            log(f"[lab-ctrl] FEHLER in Cycle #{iteration}: {e}")
+            _send_telegram(f"⚠️ <b>Lab Continuous: Fehler in Cycle #{iteration}</b>\n{e}")
+
+        # Stop-Flag nochmals prüfen (nach Cycle-Ende, vor Pause)
+        if LAB_STOP_FLAG.exists():
+            log("[lab-ctrl] Stop-Flag erkannt nach Cycle — beendet")
+            _send_telegram("🛑 <b>Lab Continuous-Mode gestoppt</b> (lab_stop.flag nach Cycle)")
+            LAB_STOP_FLAG.unlink(missing_ok=True)
+            break
+
+        log(f"[lab-ctrl] Continuous #{iteration}: Pause {pause_s}s vor nächstem Cycle")
+        _time.sleep(pause_s)
+
+
 def _finish_cycle(db_path: str, cycle_id: int, status: str, reason: str = "") -> None:
     conn = get_lab_state_connection(db_path)
     update_cycle_status(conn, cycle_id, status, reason or None)
@@ -818,10 +879,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="APEX Lab-Controller")
     parser.add_argument("--mode", required=True, choices=[
         "asset-profile-update", "build-queue", "run-cycle", "resume-cycle",
+        "run-continuous",
         "health-check", "heartbeat", "status", "generate-report",
         "set-config", "release-lock",
     ])
-    parser.add_argument("--cycle-id", type=int, default=None)
+    parser.add_argument("--cycle-id",  type=int,   default=None)
+    parser.add_argument("--pause",     type=int,   default=300,
+                        help="Pause in Sekunden zwischen Cycles (nur run-continuous, default 300)")
     parser.add_argument("--key", type=str, default=None)
     parser.add_argument("--value", type=str, default=None)
     parser.add_argument("--reason", type=str, default="")
@@ -838,6 +902,8 @@ def main() -> None:
         mode_build_queue(db)
     elif args.mode == "run-cycle":
         mode_run_cycle(db)
+    elif args.mode == "run-continuous":
+        mode_run_continuous(db, pause_s=args.pause)
     elif args.mode == "resume-cycle":
         if not args.cycle_id:
             log("[lab-ctrl] FEHLER: --cycle-id erforderlich für resume-cycle")
