@@ -492,7 +492,10 @@ class Executor:
         if signal_price and signal_price > 0 and fill_price and fill_price > 0:
             slippage_bps = abs(fill_price - signal_price) / signal_price * 10000
 
-        # TP2: separater TPSL-Order
+        # TP2: separater TPSL-Order (P2.2 — atomare Variante nicht möglich)
+        # Bitget place-order (v2) unterstützt nur einen Preset-TP-Slot (presetStopSurplusPrice).
+        # Ein zweiter atomarer TP existiert in der API nicht → TP2 wird als separater
+        # place-tpsl-order platziert. Scheitert er nach Retry: Hard-Kill-Fallback (verbindlich).
         if signal.take_profit_2 and signal.take_profit_2 > 0:
             filled = result.filled_size or size
             tp2_result = client.place_take_profit(

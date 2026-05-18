@@ -1,10 +1,16 @@
 """
-H0 — TP2-Atomarität-Tests.
+P2.2 / H0 — TP2-Hard-Kill-Fallback Tests.
+
+API-Befund (Bitget v2 USDT-FUTURES): place-order unterstützt nur einen Preset-TP-Slot
+(presetStopSurplusPrice). Atomare TP2-Platzierung ist nicht möglich. TP2 wird daher
+als separater place-tpsl-order platziert — scheitert er nach Retry, ist der Hard-Kill-
+Fallback (Position schließen + set_kill_mode("hard")) verbindlich und hier test-bewiesen.
 
 Prüft:
 - TP2-Fehler nach Retry → Position wird geschlossen, Hard-Kill gesetzt, Trade=None
 - TP2-Fehler beim ersten Versuch aber Erfolg beim Retry → Trade normal gespeichert
 - TP2-Erfolg beim ersten Versuch → normaler Pfad (kein Close)
+- take_profit_2=None → kein TPSL-Call, Execution läuft normal durch
 """
 from __future__ import annotations
 
@@ -145,3 +151,27 @@ class TestTP2FailureFallback:
             if c.kwargs.get("reduce_only") is True
         ]
         assert len(close_calls) == 0
+
+    def test_tp2_none_no_tpsl_call(self):
+        """take_profit_2=None → place_take_profit nie aufgerufen, Trade wird normal gespeichert."""
+        from execution.executor import Executor
+
+        sig = _make_signal(sig_id=45)
+        sig.take_profit_2 = None  # kein TP2 in diesem Signal
+        tp2_ok = OrderResult(success=True, avg_price=62000.0)
+        mock_client = _make_client_mock(tp2_results=tp2_ok)
+
+        with (
+            patch("execution.bitget_client.BitgetClient", return_value=mock_client),
+            patch("execution.executor.get_connection", return_value=MagicMock()),
+            patch("governance.kill_switch.set_kill_mode") as mock_kill,
+            patch("execution.executor._is_circuit_broken", return_value=False),
+            patch("execution.executor._calc_sizing", return_value={"size": 0.01, "leverage": 1, "notional": 600.0, "hold_side": "long"}),
+            patch("execution.market_impact_guard.evaluate", return_value=type("MIG", (), {"order_type": "market", "ioc_tolerance_bps": 5.0, "market_impact_check": "disabled", "spread_at_snapshot_bps": 1.0, "liquidity_score": 1.0})()),
+        ):
+            executor = Executor()
+            result = executor._execute_live(sig, dry_run=False)
+
+        assert result is not None, "Kein TP2 → normaler Trade erwartet"
+        mock_client.place_take_profit.assert_not_called()
+        mock_kill.assert_not_called()
