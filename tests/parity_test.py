@@ -21,11 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.db import get_connection
 from backtest.engine import SIGNAL_FNS
-from config.settings import PRICE_DECIMALS
+from config.settings import PRICE_DECIMALS, SIZE_DECIMALS, RISK_USDT, V7_FUNDING_SIZING
 
-TOLERANCE_PCT = 0.01   # 0.01 % — nur Rounding-Differenz erlaubt
-ASSETS        = ["SOL", "BTC", "ETH", "XRP", "ADA", "AVAX", "LINK"]
-SCAN_BARS     = 500    # Maximale Bars pro Asset beim Signal-Scan
+TOLERANCE_PCT      = 0.01   # 0.01 % — nur Rounding-Differenz erlaubt
+TOLERANCE_SIZE_PCT = 1.0    # 1 % — Funding-Sizing kann leicht abweichen
+ASSETS             = ["SOL", "BTC", "ETH", "XRP", "ADA", "AVAX", "LINK"]
+SCAN_BARS          = 500    # Maximale Bars pro Asset beim Signal-Scan
 
 
 def _simulate_live(bt_sig, asset: str) -> dict:
@@ -34,24 +35,33 @@ def _simulate_live(bt_sig, asset: str) -> dict:
     Gibt die 'Live-Werte' zurück, die ein Deployment erzeugen würde.
     """
     dec_price = PRICE_DECIMALS.get(asset, 2)
+    dec_size  = SIZE_DECIMALS.get(asset, 2)
 
     entry_price  = bt_sig.entry_price   # Fix B: direkte Übernahme
     sl_dist_orig = abs(bt_sig.entry_price - bt_sig.stop_loss)
     tp1_dist     = abs(bt_sig.entry_price - bt_sig.take_profit_1)
+    tp2_dist     = abs(bt_sig.entry_price - bt_sig.take_profit_2)
     direction    = bt_sig.direction
 
     if direction == "long":
         stop_loss     = round(entry_price - sl_dist_orig, dec_price)
         take_profit_1 = round(entry_price + tp1_dist,     dec_price)
+        take_profit_2 = round(entry_price + tp2_dist,     dec_price)
     else:
         stop_loss     = round(entry_price + sl_dist_orig, dec_price)
         take_profit_1 = round(entry_price - tp1_dist,     dec_price)
+        take_profit_2 = round(entry_price - tp2_dist,     dec_price)
+
+    sl_dist = abs(entry_price - stop_loss)
+    size = round(RISK_USDT / sl_dist, dec_size) if sl_dist > 0 else 0.0
 
     return {
-        "entry_price":  entry_price,
-        "stop_loss":    stop_loss,
+        "entry_price":   entry_price,
+        "stop_loss":     stop_loss,
         "take_profit_1": take_profit_1,
-        "direction":    direction,
+        "take_profit_2": take_profit_2,
+        "size":          size,
+        "direction":     direction,
     }
 
 
@@ -113,19 +123,23 @@ def run_parity_tests() -> bool:
             failed += 1
             continue
 
-        # Vergleiche numerische Felder
+        # Vergleiche numerische Felder (TP2 + Size neu in P3.3)
         checks = [
-            ("entry_price",   bt_sig.entry_price,   live["entry_price"]),
-            ("stop_loss",     bt_sig.stop_loss,      live["stop_loss"]),
-            ("take_profit_1", bt_sig.take_profit_1,  live["take_profit_1"]),
+            ("entry_price",   bt_sig.entry_price,    live["entry_price"],   TOLERANCE_PCT),
+            ("stop_loss",     bt_sig.stop_loss,       live["stop_loss"],     TOLERANCE_PCT),
+            ("take_profit_1", bt_sig.take_profit_1,   live["take_profit_1"], TOLERANCE_PCT),
+            ("take_profit_2", bt_sig.take_profit_2,   live["take_profit_2"], TOLERANCE_PCT),
         ]
+        # Size: nur wenn V7_FUNDING_SIZING deaktiviert — andernfalls Funding-Anpassung erwartet
+        if not V7_FUNDING_SIZING:
+            checks.append(("size", bt_sig.size, live["size"], TOLERANCE_SIZE_PCT))
 
         ok = True
-        for field, bt_val, live_val in checks:
+        for field, bt_val, live_val, tol in checks:
             diff = _pct_diff(live_val, bt_val)
-            if diff > TOLERANCE_PCT:
+            if diff > tol:
                 msg = (f"{field}: bt={bt_val} live={live_val} diff={diff:.4f}% "
-                       f"(Toleranz={TOLERANCE_PCT}%)")
+                       f"(Toleranz={tol}%)")
                 print(f"  FAIL  {strategy_name:<22} {asset} — {msg}")
                 failures.append((strategy_name, asset, msg))
                 ok = False
@@ -134,9 +148,11 @@ def run_parity_tests() -> bool:
             ep   = bt_sig.entry_price
             sl   = bt_sig.stop_loss
             tp1  = bt_sig.take_profit_1
+            tp2  = bt_sig.take_profit_2
+            sz   = bt_sig.size
             dir_ = bt_sig.direction
             print(f"  PASS  {strategy_name:<22} {asset}  "
-                  f"{dir_} @ {ep}  SL={sl}  TP1={tp1}")
+                  f"{dir_} @ {ep}  SL={sl}  TP1={tp1}  TP2={tp2}  size={sz}")
             passed += 1
         else:
             failed += 1
@@ -145,7 +161,7 @@ def run_parity_tests() -> bool:
 
     print()
     print(f"Ergebnis: {passed} PASS  |  {failed} FAIL  |  {skipped} SKIP")
-    print(f"Toleranz: {TOLERANCE_PCT}%  |  "
+    print(f"Toleranz entry/sl/tp: {TOLERANCE_PCT}%  size: {TOLERANCE_SIZE_PCT}%  |  "
           f"Strategien gesamt: {len(SIGNAL_FNS)}  |  "
           f"Getestet (mit Signal): {passed + failed}")
 
