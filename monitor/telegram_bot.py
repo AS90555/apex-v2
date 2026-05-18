@@ -46,6 +46,11 @@ from telegram.constants import ParseMode
 
 from core.db import get_connection, DB_PATH
 from core.telegram_dispatcher import dispatch, should_dispatch  # noqa: F401
+from config.settings import (
+    MAX_DAILY_TRADES,
+    DAILY_DD_KILL_R,
+    FUNDING_RATE_WARN_THRESHOLD,
+)
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RISK_USDT
 
 
@@ -3268,9 +3273,50 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             wdg = check_master_alive()
             wdg_str = f"✅ OK ({wdg['age_min']}min)" if wdg["alive"] else f"🚨 STALE ({wdg['age_min']}min)"
 
+            # 7. Session-Limit-Stand (abgeschlossene Trades heute)
+            today = now.strftime("%Y-%m-%d")
+            trades_today = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE exit_ts IS NOT NULL AND DATE(exit_ts)=?",
+                (today,),
+            ).fetchone()[0]
+            limit_icon = " ⚠️" if trades_today >= MAX_DAILY_TRADES else ""
+            session_str = f"{trades_today}/{MAX_DAILY_TRADES} heute{limit_icon}"
+
+            # 8. Max-Drawdown heute (kumuliertes pnl_r aller heute abgeschlossenen Trades)
+            today_pnl_r = conn.execute(
+                "SELECT COALESCE(SUM(pnl_r), 0) FROM trades "
+                "WHERE exit_ts IS NOT NULL AND DATE(exit_ts)=? AND pnl_r IS NOT NULL",
+                (today,),
+            ).fetchone()[0]
+            dd_pct = (today_pnl_r / MAX_DAILY_TRADES) if MAX_DAILY_TRADES else 0
+            kill_hint = f" (Kill bei {DAILY_DD_KILL_R:.1f}R)"
+            dd_today_str = f"{today_pnl_r:+.2f}R{kill_hint}"
+
+            # 9. Funding-Rate-Warnung (neueste Rate pro aktivem Asset)
+            funding_parts: list[str] = []
+            if _table_exists(conn, "funding_rates") and _table_exists(conn, "active_deployments"):
+                try:
+                    assets = [r[0] for r in conn.execute(
+                        "SELECT DISTINCT asset FROM active_deployments WHERE active=1"
+                    ).fetchall()]
+                    for asset in assets:
+                        fr_row = conn.execute(
+                            "SELECT funding_rate FROM funding_rates WHERE asset=? "
+                            "ORDER BY funding_time DESC LIMIT 1",
+                            (asset,),
+                        ).fetchone()
+                        if fr_row:
+                            rate = fr_row[0]
+                            icon = " ⚠️" if abs(rate) >= FUNDING_RATE_WARN_THRESHOLD else ""
+                            funding_parts.append(f"{asset} {rate:+.4%}{icon}")
+                except Exception:
+                    pass
+            funding_str = "  ".join(funding_parts) if funding_parts else "n/a"
+
             return {
                 "live_dd": live_dd, "open_pos": open_pos, "cycle": cycle_str,
                 "nc": nc_count, "promo": promo_count, "watchdog": wdg_str,
+                "session": session_str, "dd_today": dd_today_str, "funding": funding_str,
             }
         finally:
             conn.close()
@@ -3284,7 +3330,10 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"3. Letzter Cycle:        <code>{data['cycle']}</code>\n"
         f"4. Aktive NCs:           <code>{data['nc']}</code>\n"
         f"5. Promotion-Kandidaten: <code>{data['promo']}</code>\n"
-        f"6. Watchdog:             {data['watchdog']}"
+        f"6. Watchdog:             {data['watchdog']}\n"
+        f"7. Trades heute:         <code>{data['session']}</code>\n"
+        f"8. DD heute:             <code>{data['dd_today']}</code>\n"
+        f"9. Funding:              <code>{data['funding']}</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -4733,6 +4782,23 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
                 f"🎯 Edge\\-Confidence: `{edge['dsr']:.3f}`"
                 if edge["dsr"] else "🎯 Edge\\-Confidence: `—`"
             )
+            # Funding-Kontext (optional, nur wenn Wert verfügbar)
+            _funding_line = ""
+            try:
+                _fc = get_connection()
+                _fr_row = _fc.execute(
+                    "SELECT funding_rate FROM funding_rates WHERE asset=? "
+                    "ORDER BY funding_time DESC LIMIT 1",
+                    (t["asset"],),
+                ).fetchone()
+                _fc.close()
+                if _fr_row and _fr_row[0] is not None:
+                    _rate = _fr_row[0]
+                    _fi = "⚠️ " if abs(_rate) >= FUNDING_RATE_WARN_THRESHOLD else ""
+                    _funding_line = f"\n{_fi}Funding: `{_rate:+.4%}`"
+            except Exception:
+                pass
+
             msg = (
                 f"{icon} *Trade abgeschlossen*  ·  {mode_lbl}\n\n"
                 f"{_escape_md(t['asset'])} {dir_label}\n"
@@ -4742,7 +4808,8 @@ async def push_new_trades(ctx: ContextTypes.DEFAULT_TYPE):
                 f"📍 Regime: {_escape_md(edge['regime'])} {reg_ico}\n"
                 f"{pf_line}\n"
                 f"⚖️ Size\\-Modifier: `{edge['size_mod']}`\n"
-                f"{dsr_line}\n\n"
+                f"{dsr_line}"
+                f"{_funding_line}\n\n"
                 f"_Heute: {_r_to_usd(d_summary['today_r'])}  ·  "
                 f"{d_summary['total_n']} Trades gesamt_"
             )
