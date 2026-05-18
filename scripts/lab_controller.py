@@ -384,7 +384,62 @@ def _process_queue(db_path: str, cycle_id: int) -> None:
         _set_queue_done(db_path, entry.id, "completed")
 
     _finish_cycle(db_path, cycle_id, "completed")
-    _send_telegram(f"✅ <b>Lab-Cycle #{cycle_id} abgeschlossen</b>")
+    _send_cycle_report(db_path, cycle_id)
+
+
+def _send_cycle_report(db_path: str, cycle_id: int) -> None:
+    """E.4 — Einmaliger aggregierter Cycle-Report am Ende jedes Cycles."""
+    try:
+        conn = get_lab_state_connection(db_path)
+        # Queue-Statistiken
+        q = conn.execute(
+            """SELECT
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS done,
+                SUM(CASE WHEN status='paused_inconclusive' THEN 1 ELSE 0 END) AS inconclusive,
+                SUM(CASE WHEN status IN ('blocked','skipped') THEN 1 ELSE 0 END) AS blocked,
+                COUNT(*) AS total
+               FROM lab_queue WHERE cycle_id=?""",
+            (cycle_id,),
+        ).fetchone()
+        done        = q["done"] or 0
+        inconclusive = q["inconclusive"] or 0
+        blocked     = q["blocked"] or 0
+        total       = q["total"] or 0
+
+        # Negative Controls in diesem Cycle (abgeleitet via lab_queue)
+        nc_count = conn.execute(
+            """SELECT COUNT(*) FROM negative_controls nc
+               WHERE EXISTS (
+                   SELECT 1 FROM lab_queue lq
+                   WHERE lq.cycle_id=? AND lq.strategy=nc.strategy AND lq.asset=nc.asset
+               )""",
+            (cycle_id,),
+        ).fetchone()[0]
+
+        # Bestes Variant des Cycles
+        top = conn.execute(
+            """SELECT sv.strategy_key, sv.asset, fr.composite
+               FROM fitness_records fr
+               JOIN strategy_variants sv ON sv.variant_id = fr.variant_id
+               WHERE fr.cycle_id=?
+               ORDER BY fr.composite DESC LIMIT 1""",
+            (cycle_id,),
+        ).fetchone()
+        conn.close()
+
+        top_str = (
+            f"{top['strategy_key']}/{top['asset']} ({top['composite']:.3f})"
+            if top else "–"
+        )
+        _send_telegram(
+            f"✅ <b>Lab-Cycle #{cycle_id} abgeschlossen</b>\n"
+            f"  Queue: {done}/{total} erledigt | {inconclusive} inconclusive | {blocked} blockiert\n"
+            f"  Negative Controls: {nc_count}\n"
+            f"  Top-Variant: {top_str}"
+        )
+    except Exception as exc:
+        log(f"[lab-ctrl] Cycle-Report fehlgeschlagen: {exc}")
+        _send_telegram(f"✅ <b>Lab-Cycle #{cycle_id} abgeschlossen</b>")
 
 
 def _run_full_research(db_path: str, entry) -> dict | None:

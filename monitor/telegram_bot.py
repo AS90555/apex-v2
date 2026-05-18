@@ -3217,6 +3217,79 @@ async def cmd_shadow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/board — Operator-Dashboard mit 6 KPIs (read-only)."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+
+    def _load_board():
+        conn = get_connection()
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        try:
+            # 1. Live-DD heute
+            dd_row = conn.execute(
+                "SELECT value FROM system_state WHERE key='daily_drawdown' LIMIT 1"
+            ).fetchone()
+            live_dd = round(float(dd_row[0]), 4) if dd_row else 0.0
+
+            # 2. Offene Positionen
+            open_pos = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE exit_ts IS NULL"
+            ).fetchone()[0]
+
+            # 3. Letzter Cycle-Status
+            cycle_row = conn.execute(
+                "SELECT id, status FROM lab_cycles ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            cycle_str = f"#{cycle_row['id']} {cycle_row['status']}" if cycle_row else "–"
+
+            # 4. Aktive Negative Controls
+            nc_count = conn.execute(
+                "SELECT COUNT(*) FROM negative_controls WHERE closed_at IS NULL"
+            ).fetchone()[0] if _table_exists(conn, "negative_controls") else "n/a"
+
+            # 5. Promotion-Kandidaten
+            promo_count = conn.execute(
+                "SELECT COUNT(*) FROM lab_discoveries WHERE status='approved'"
+            ).fetchone()[0] if _table_exists(conn, "lab_discoveries") else "n/a"
+
+            # 6. Watchdog-Status (Heartbeat-Alter)
+            from scripts.master_watchdog import check_master_alive
+            wdg = check_master_alive()
+            wdg_str = f"✅ OK ({wdg['age_min']}min)" if wdg["alive"] else f"🚨 STALE ({wdg['age_min']}min)"
+
+            return {
+                "live_dd": live_dd, "open_pos": open_pos, "cycle": cycle_str,
+                "nc": nc_count, "promo": promo_count, "watchdog": wdg_str,
+            }
+        finally:
+            conn.close()
+
+    data = await asyncio.get_event_loop().run_in_executor(None, _load_board)
+
+    msg = (
+        f"📋 <b>Operator-Board</b>\n\n"
+        f"1. Live-DD heute:        <code>{data['live_dd']:.4f}</code>\n"
+        f"2. Offene Positionen:    <code>{data['open_pos']}</code>\n"
+        f"3. Letzter Cycle:        <code>{data['cycle']}</code>\n"
+        f"4. Aktive NCs:           <code>{data['nc']}</code>\n"
+        f"5. Promotion-Kandidaten: <code>{data['promo']}</code>\n"
+        f"6. Watchdog:             {data['watchdog']}"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+def _table_exists(conn, name: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
 async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /deploy <ID>
@@ -4869,6 +4942,7 @@ def main():
     app.add_handler(CommandHandler("deploy",   cmd_deploy))
     app.add_handler(CommandHandler("promote",  cmd_promote))
     app.add_handler(CommandHandler("shadow",   cmd_shadow))
+    app.add_handler(CommandHandler("board",    cmd_board))
     app.add_handler(CommandHandler("api_test",  cmd_api_test))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CallbackQueryHandler(button_callback))
