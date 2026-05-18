@@ -2952,6 +2952,25 @@ def _status_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def cmd_system_slash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/system — Slash-Command-Alias für den ⚙️ System-Button."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+    text = build_status_text()
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                    reply_markup=_status_keyboard())
+
+
+async def cmd_labor_slash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/labor — Slash-Command-Alias für den 🔬 Labor-Button."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+    text = build_lab_main_text()
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("⛔ Nicht autorisiert.")
@@ -5572,6 +5591,8 @@ def main():
     app.add_handler(CommandHandler("promote",  cmd_promote))
     app.add_handler(CommandHandler("shadow",      cmd_shadow))
     app.add_handler(CommandHandler("board",       cmd_board))
+    app.add_handler(CommandHandler("system",      cmd_system_slash))
+    app.add_handler(CommandHandler("labor",       cmd_labor_slash))
     app.add_handler(CommandHandler("panic",       cmd_panic))
     app.add_handler(CommandHandler("panic_clear", cmd_panic_clear))
     app.add_handler(CommandHandler("lab_decide",  cmd_lab_decide))
