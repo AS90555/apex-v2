@@ -293,6 +293,7 @@ HEARTBEAT_THRESHOLDS_MIN: dict[str, int] = {
     "governance":      30,
     "executor":        30,
     "monitor":         30,
+    "master":          15,   # master_run.py — Watchdog-Schwelle (P1.3)
     "drift_check":   1500,   # Daily-Cron (06:00 UTC) — 25h Puffer
     "hmm_retrain":  10080,   # Wöchentlicher Job — 7-Tage-Puffer
     "regime_monitor":  250,  # 4h-Timer — 10 Min Puffer über 4h

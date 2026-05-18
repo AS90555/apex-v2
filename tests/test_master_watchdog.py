@@ -14,6 +14,14 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.master_watchdog import check_master_alive, STALE_THRESHOLD_MIN
+from config.settings import HEARTBEAT_THRESHOLDS_MIN
+
+
+class TestWatchdogConfig:
+    def test_threshold_from_settings(self):
+        """STALE_THRESHOLD_MIN kommt aus HEARTBEAT_THRESHOLDS_MIN['master']."""
+        assert STALE_THRESHOLD_MIN == HEARTBEAT_THRESHOLDS_MIN["master"]
+        assert STALE_THRESHOLD_MIN > 0
 
 
 class TestMasterWatchdog:

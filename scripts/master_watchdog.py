@@ -19,9 +19,10 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.utils import log
 from core.telegram_dispatcher import dispatch
+from config.settings import HEARTBEAT_THRESHOLDS_MIN
 
-# Nach dieser Stille-Dauer gilt master_run als ausgefallen
-STALE_THRESHOLD_MIN = 15
+# Schwelle aus zentralem Settings-Dict — änderbar ohne Code-Edit
+STALE_THRESHOLD_MIN: int = HEARTBEAT_THRESHOLDS_MIN["master"]
 
 # Datei-Heartbeat-Verzeichnis (core/process_lock.py schreibt hier hin)
 _HB_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "heartbeats")
