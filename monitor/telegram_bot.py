@@ -3540,14 +3540,19 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             wdg = check_master_alive()
             wdg_str = f"✅ OK ({wdg['age_min']}min)" if wdg["alive"] else f"🚨 STALE ({wdg['age_min']}min)"
 
-            # 7. Session-Limit-Stand (abgeschlossene Trades heute)
+            # 7. Session-Limit-Stand — zählt wie DailyTradeLimitCheck: entry_ts, nicht exit_ts
             today = now.strftime("%Y-%m-%d")
-            trades_today = conn.execute(
-                "SELECT COUNT(*) FROM trades WHERE exit_ts IS NOT NULL AND DATE(exit_ts)=?",
+            rows_by_mode = conn.execute(
+                """SELECT mode, COUNT(*) FROM trades
+                   WHERE exit_ts IS NOT NULL AND date(entry_ts)=?
+                   GROUP BY mode""",
                 (today,),
-            ).fetchone()[0]
+            ).fetchall()
+            trades_today = sum(r[1] for r in rows_by_mode)
+            mode_parts = [f"{r[1]} {r[0]}" for r in rows_by_mode if r[0] and r[1] > 0]
+            mode_suffix = f"  ({', '.join(mode_parts)})" if len(mode_parts) > 1 else ""
             limit_icon = " ⚠️" if trades_today >= MAX_DAILY_TRADES else ""
-            session_str = f"{trades_today}/{MAX_DAILY_TRADES} heute{limit_icon}"
+            session_str = f"{trades_today}/{MAX_DAILY_TRADES} heute{limit_icon}{mode_suffix}"
 
             # 8. Max-Drawdown heute (kumuliertes pnl_r aller heute abgeschlossenen Trades)
             today_pnl_r = conn.execute(

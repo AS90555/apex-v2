@@ -45,19 +45,31 @@ def _make_conn(
     include_funding: bool = False,
     funding_rate: float = 0.0001,
     trades_today: int = 1,
+    mode: str = "dry_run",
 ) -> sqlite3.Connection:
-    """trading.db-Ersatz: system_state, trades, lab_discoveries, optional funding."""
+    """
+    trading.db-Ersatz: system_state, trades, lab_discoveries, optional funding.
+
+    trades-Schema enthält entry_ts + mode — spiegelt echtes Schema wider.
+    trades_today = Anzahl Trades mit entry_ts=today (geschlossen).
+    """
     today = "2026-05-18"
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
 
-    trade_rows = ""
-    trade_rows += "INSERT INTO trades VALUES (1, NULL, NULL);\n"
+    # id=1: offene Position (exit_ts NULL)
+    trade_rows = f"INSERT INTO trades VALUES (1, '{today}T09:00:00', NULL, NULL, '{mode}');\n"
+    # id=2..N+1: heute eingetreten UND heute geschlossen
     for i in range(trades_today):
         trade_rows += (
-            f"INSERT INTO trades VALUES ({i+2}, '{today}T10:00:00', -0.5);\n"
+            f"INSERT INTO trades VALUES ({i+2}, '{today}T10:00:00', "
+            f"'{today}T14:00:00', -0.5, '{mode}');\n"
         )
-    trade_rows += "INSERT INTO trades VALUES (99, '2026-05-17T10:00:00', 0.3);\n"
+    # id=99: gestern eingetreten, heute geschlossen → darf NICHT zählen
+    trade_rows += (
+        f"INSERT INTO trades VALUES (99, '2026-05-17T10:00:00', "
+        f"'{today}T11:00:00', 0.3, '{mode}');\n"
+    )
 
     funding_tables = ""
     if include_funding:
@@ -74,7 +86,10 @@ def _make_conn(
 
     conn.executescript(f"""
         CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE trades (id INTEGER PRIMARY KEY, exit_ts TEXT, pnl_r REAL);
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY,
+            entry_ts TEXT, exit_ts TEXT, pnl_r REAL, mode TEXT
+        );
         CREATE TABLE lab_discoveries (id INTEGER PRIMARY KEY, status TEXT);
         INSERT INTO system_state VALUES ('daily_drawdown', '-0.0123');
         {trade_rows}
@@ -203,6 +218,68 @@ class TestBoardSessionLimit:
         conn = _make_conn(trades_today=0)
         msg = _run_board(conn)
         assert "0/3 heute" in msg
+
+    def test_entry_ts_not_exit_ts(self):
+        """
+        P3.3-Absicherung: Nur Trades mit entry_ts=heute zählen.
+        id=99 hat entry_ts=gestern, exit_ts=heute → darf NICHT zählen.
+        Wäre exit_ts der Filter, käme 2 statt 1 heraus.
+        """
+        conn = _make_conn(trades_today=1)  # 1 Trade heute eingetreten
+        msg = _run_board(conn)
+        # id=99 (gestern eingetreten, heute geschlossen) darf die Zählung nicht erhöhen
+        assert "1/3 heute" in msg, (
+            "Nur Trades mit entry_ts=heute sollen zählen — "
+            "exit_ts=heute (gestrig eingetreten) darf nicht mitzählen"
+        )
+
+    def test_yesterday_entered_today_closed_not_counted(self):
+        """
+        Trade von gestern (entry_ts=17.05) der heute (exit_ts=18.05) geschlossen wurde
+        darf im Board NICHT als 'heute'-Trade erscheinen.
+        Altes exit_ts-Verhalten hätte diesen gezählt.
+        """
+        today = "2026-05-18"
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(f"""
+            CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY,
+                entry_ts TEXT, exit_ts TEXT, pnl_r REAL, mode TEXT
+            );
+            CREATE TABLE lab_discoveries (id INTEGER PRIMARY KEY, status TEXT);
+            INSERT INTO system_state VALUES ('daily_drawdown', '0.0');
+            -- Nur dieser eine Trade: gestern eingetreten, HEUTE geschlossen
+            INSERT INTO trades VALUES (1, '2026-05-17T22:00:00', '{today}T02:00:00', 0.5, 'dry_run');
+        """)
+        conn.commit()
+        msg = _run_board(conn)
+        assert "0/3 heute" in msg, (
+            "Trade mit entry_ts=gestern darf nicht als heutiger Trade zählen"
+        )
+
+    def test_mode_suffix_shown_when_multiple_modes(self):
+        """Wenn trades in mehreren Modes existieren, erscheint Mode-Aufschlüsselung."""
+        today = "2026-05-18"
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(f"""
+            CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY,
+                entry_ts TEXT, exit_ts TEXT, pnl_r REAL, mode TEXT
+            );
+            CREATE TABLE lab_discoveries (id INTEGER PRIMARY KEY, status TEXT);
+            INSERT INTO system_state VALUES ('daily_drawdown', '0.0');
+            INSERT INTO trades VALUES (1, '{today}T10:00:00', '{today}T14:00:00', 0.5, 'dry_run');
+            INSERT INTO trades VALUES (2, '{today}T11:00:00', '{today}T15:00:00', 0.3, 'live');
+        """)
+        conn.commit()
+        msg = _run_board(conn)
+        assert "2/3 heute" in msg
+        # Mode-Suffix soll erscheinen wenn live + dry_run gemischt
+        assert "dry_run" in msg or "live" in msg
 
 
 class TestBoardDDToday:
