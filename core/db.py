@@ -253,6 +253,11 @@ def get_staging_connection() -> sqlite3.Connection:
         ("source_discovery_id", "INTEGER"),
         ("study_hash",          "TEXT"),
         ("objective_version",   "TEXT"),
+        ("sync_status",         "TEXT DEFAULT 'pending'"),
+        ("sync_attempted_at",   "TEXT"),
+        ("sync_reject_reason",  "TEXT"),
+        ("n_oos",               "INTEGER"),
+        ("borderline_flag",     "INTEGER DEFAULT 0"),
     ]:
         if _col not in _st_cols:
             conn.execute(f"ALTER TABLE lab_discoveries ADD COLUMN {_col} {_typedef}")
@@ -474,6 +479,29 @@ def run_migrations():
         conn.execute("ALTER TABLE lab_discoveries ADD COLUMN study_hash TEXT")
     if "objective_version" not in ld_cols_v72:
         conn.execute("ALTER TABLE lab_discoveries ADD COLUMN objective_version TEXT")
+
+    # ── V7.2 Lab-Infrastruktur-Migrationen ───────────────────────────────────
+    ld_cols_lab = {row[1] for row in conn.execute("PRAGMA table_info(lab_discoveries)").fetchall()}
+    if "n_oos" not in ld_cols_lab:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN n_oos INTEGER")
+    if "borderline_flag" not in ld_cols_lab:
+        conn.execute("ALTER TABLE lab_discoveries ADD COLUMN borderline_flag INTEGER DEFAULT 0")
+
+    # ── C.3 Kill-Switch-Audit-Log ────────────────────────────────────────────
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS kill_switch_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            action      TEXT    NOT NULL,
+            mode_from   TEXT,
+            mode_to     TEXT    NOT NULL,
+            reason      TEXT    NOT NULL,
+            cleared_by  TEXT,
+            asset       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ks_events_ts
+            ON kill_switch_events(ts DESC);
+    """)
 
     conn.commit()
     conn.close()
