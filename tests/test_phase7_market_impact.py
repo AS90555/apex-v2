@@ -63,12 +63,14 @@ def test_guard_disabled_always_market():
 
 def test_small_order_market():
     """Kleine Order relativ zu L1-Tiefe → Market Order."""
+    from datetime import datetime, timezone
+    _now = datetime.now(timezone.utc).isoformat()
     with patch("execution.market_impact_guard.V6_MARKET_IMPACT_GUARD", True):
         mock_liq = {
             "liquidity_score": 0.9,
             "avg_spread_bps": 2.0,
             "avg_depth_level1_usd": 100_000.0,
-            "measured_at": "2026-05-13T12:00:00+00:00",
+            "measured_at": _now,
         }
         with patch("execution.market_impact_guard._get_liquidity_metrics", return_value=mock_liq):
             with patch("execution.market_impact_guard._get_regime", return_value="TREND"):
@@ -104,12 +106,14 @@ def test_large_order_ioc():
 
 def test_degraded_liquidity_stress_multiplier():
     """Score < LIQUIDITY_DEGRADATION_THRESHOLD → Toleranz verdoppelt."""
+    from datetime import datetime, timezone
+    _now = datetime.now(timezone.utc).isoformat()
     with patch("execution.market_impact_guard.V6_MARKET_IMPACT_GUARD", True):
         mock_liq = {
             "liquidity_score": LIQUIDITY_DEGRADATION_THRESHOLD - 0.1,  # unterhalb
             "avg_spread_bps": 20.0,
             "avg_depth_level1_usd": 500_000.0,  # riesig → Market
-            "measured_at": "2026-05-13T12:00:00+00:00",
+            "measured_at": _now,
         }
         with patch("execution.market_impact_guard._get_liquidity_metrics", return_value=mock_liq):
             with patch("execution.market_impact_guard._get_regime", return_value="TREND"):

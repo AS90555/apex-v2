@@ -120,7 +120,8 @@ def test_no_dry_run_writes_staging(isolated_live_db, isolated_staging_db, monkey
     with patch.object(_mod, "V72_RESEARCH_ENABLED", True), \
          patch.object(_mod, "get_staging_connection", return_value=staging_conn), \
          patch.object(_mod, "objective_v72", side_effect=_patch_objective()), \
-         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")):
+         patch.object(_mod, "_write_report", return_value=str(tmp_path / "summary.md")), \
+         patch.object(_mod, "_governance_pre_check", return_value=None):
         study = _mod.main()
 
     # main() schliesst staging_conn — neue Verbindung zum Lesen
