@@ -56,6 +56,24 @@ def _is_circuit_broken(asset: str) -> bool:
     return get_state(f"kill_mode_{asset}", "ok") != "ok"
 
 
+# ── clOrdId-Recovery ──────────────────────────────────────────────────────────
+
+# Netzwerkfehler-Marker: Fehlertypen bei denen die Order möglicherweise trotzdem
+# angekommen ist. Fachliche Exchange-Rejections (margin, invalid param) sind
+# KEINE Netzwerkfehler und lösen keine Recovery aus.
+_NETWORK_ERROR_MARKERS = (
+    "connectionerror", "timeout", "read timed out", "connect timed out",
+    "remotedisconnected", "chunkedencodingerror", "http 502", "http 503",
+    "http 504", "http 524", "rate limit",
+)
+
+
+def _is_network_error(error_str: str) -> bool:
+    """True wenn der Fehler ein Transport-/Netzwerkproblem ist (kein fachliches Reject)."""
+    low = error_str.lower()
+    return any(marker in low for marker in _NETWORK_ERROR_MARKERS)
+
+
 # ── Audit-Log ─────────────────────────────────────────────────────────────────
 
 def _write_audit_log(signal_id: int, cl_ord_id: str,
@@ -421,11 +439,46 @@ class Executor:
         )
 
         if not result.success:
-            log(f"[EXECUTOR] place_market_order fehlgeschlagen: {result.error}")
-            _write_audit_log(signal.id, cl_ord_id, "sent", "error",
-                             payload={"error": result.error})
-            _increment_circuit_breaker(None, signal.asset)
-            return None
+            # P2.1 — clOrdId-Recovery: nur bei Netzwerk-/Transportfehlern prüfen,
+            # ob Order trotz Exception bei Bitget angekommen ist.
+            if _is_network_error(result.error or ""):
+                log(f"[EXECUTOR] Netzwerkfehler erkannt — Recovery-Query für {cl_ord_id}")
+                recovered = client.get_order_by_client_id(signal.asset, cl_ord_id)
+                if recovered.success:
+                    # Order existiert bei Bitget — als gefüllt behandeln
+                    log(f"[EXECUTOR] clOrdId-Recovery erfolgreich: {cl_ord_id} "
+                        f"order_id={recovered.order_id}")
+                    _write_audit_log(signal.id, cl_ord_id, "sent", "recovered",
+                                     payload={"order_id": recovered.order_id,
+                                              "original_error": result.error})
+                    result = recovered
+                elif not recovered.error or not recovered.error.startswith("query_failed:"):
+                    # Query erfolgreich, Order nicht gefunden → einmaliger Retry mit -R1
+                    cl_ord_id_r1 = cl_ord_id + "-R1"
+                    log(f"[EXECUTOR] Order nicht gefunden → Retry mit {cl_ord_id_r1}")
+                    _write_audit_log(signal.id, cl_ord_id, "sent", "retry_r1",
+                                     payload={"reason": result.error, "retry_id": cl_ord_id_r1})
+                    result = client.place_market_order(
+                        coin=signal.asset,
+                        is_buy=(signal.direction == "long"),
+                        size=size,
+                        stop_loss=signal.stop_loss,
+                        take_profit=signal.take_profit_1,
+                        client_order_id=cl_ord_id_r1,
+                    )
+                    if result.success:
+                        cl_ord_id = cl_ord_id_r1
+                else:
+                    # Recovery-Query selbst fehlgeschlagen → Originalfehler beibehalten
+                    log(f"[EXECUTOR] Recovery-Query fehlgeschlagen ({recovered.error}) "
+                        f"— Originalfehler behalten")
+
+            if not result.success:
+                log(f"[EXECUTOR] place_market_order fehlgeschlagen: {result.error}")
+                _write_audit_log(signal.id, cl_ord_id, "sent", "error",
+                                 payload={"error": result.error})
+                _increment_circuit_breaker(None, signal.asset)
+                return None
 
         _write_audit_log(signal.id, cl_ord_id, "sent", "acked",
                          payload={"order_id": result.order_id})

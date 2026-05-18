@@ -284,6 +284,36 @@ class BitgetClient:
         except Exception as e:
             return OrderResult(success=False, error=str(e))
 
+    def get_order_by_client_id(self, coin: str, client_order_id: str) -> OrderResult:
+        """
+        Readonly-Query: prüft ob eine Order mit dieser clientOid bei Bitget existiert.
+
+        Gibt OrderResult(success=True) zurück wenn Order gefunden, sonst success=False.
+        Bei eigenem Netzwerkfehler: success=False, error="query_failed:<reason>".
+        Wird nur im Recovery-Pfad aufgerufen — nie im Happy-Path.
+        """
+        if self.dry_run:
+            return OrderResult(success=False, error="dry_run")
+        try:
+            data = self._get(
+                "/api/v2/mix/order/detail",
+                params={"symbol": self._symbol(coin), "productType": PRODUCT_TYPE,
+                        "clientOid": client_order_id},
+                auth=True,
+            )
+            if not data:
+                return OrderResult(success=False, error="not_found")
+            order = data if isinstance(data, dict) else (data[0] if data else None)
+            if not order:
+                return OrderResult(success=False, error="not_found")
+            order_id  = order.get("orderId", client_order_id)
+            avg_price = float(order.get("priceAvg") or order.get("price") or 0)
+            fill_size = float(order.get("baseVolume") or order.get("size") or 0)
+            return OrderResult(success=True, order_id=order_id,
+                               filled_size=fill_size, avg_price=avg_price)
+        except Exception as e:
+            return OrderResult(success=False, error=f"query_failed:{e}")
+
     def place_stop_loss(self, coin: str, trigger_price: float, size: float,
                         hold_side: str = "long") -> OrderResult:
         if self.dry_run:
