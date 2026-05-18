@@ -441,17 +441,41 @@ class Executor:
 
         # TP2: separater TPSL-Order
         if signal.take_profit_2 and signal.take_profit_2 > 0:
-            tp2_cl_ord = f"APEX-V2-SIG-{signal.id}-TP2"
+            filled = result.filled_size or size
             tp2_result = client.place_take_profit(
                 coin=signal.asset,
                 trigger_price=signal.take_profit_2,
-                size=result.filled_size or size,
+                size=filled,
                 hold_side=hold_side,
             )
+            if not tp2_result.success:
+                # Einmaliger Retry nach 2s (transiente API-Fehler)
+                time.sleep(2.0)
+                tp2_result = client.place_take_profit(
+                    coin=signal.asset,
+                    trigger_price=signal.take_profit_2,
+                    size=filled,
+                    hold_side=hold_side,
+                )
             if tp2_result.success:
                 log(f"[EXECUTOR] TP2 platziert: {signal.asset} @ {signal.take_profit_2}")
             else:
-                log(f"[EXECUTOR] TP2 fehlgeschlagen (ignoriert): {tp2_result.error}")
+                # TP2 nach Retry nicht setzbar — Position schließen + Hard-Kill auf Asset
+                log(f"[EXECUTOR] KRITISCH: TP2 fehlgeschlagen nach Retry "
+                    f"({signal.asset}): {tp2_result.error} — schließe Position")
+                is_close_buy = (signal.direction == "short")
+                client.place_market_order(
+                    coin=signal.asset,
+                    is_buy=is_close_buy,
+                    size=filled,
+                    reduce_only=True,
+                )
+                from governance.kill_switch import set_kill_mode
+                set_kill_mode("hard", reason=f"TP2-Platzierung fehlgeschlagen: {tp2_result.error}",
+                              asset=signal.asset)
+                _write_audit_log(signal.id, cl_ord_id, "acked", "error",
+                                 payload={"tp2_error": tp2_result.error, "action": "position_closed"})
+                return None
 
         t = Trade(
             signal_id=signal.id,
