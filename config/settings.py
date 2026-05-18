@@ -283,6 +283,18 @@ ATR_TP_MULTIPLIER     = 3.0
 # ── Session-Limit (C.2) ──────────────────────────────────────────────────────
 MAX_DAILY_TRADES = 3  # max. abgeschlossene Trades pro 24h-Fenster (alle Assets, alle Strategien)
 
+# ── Heartbeat-Schwellen (D.2) ─────────────────────────────────────────────────
+# Maximales Alter des letzten Heartbeats pro Komponente (Minuten).
+# Intake/Features sind zeitkritisch (10 min); Governance/Executor toleranter (30 min).
+HEARTBEAT_THRESHOLDS_MIN: dict[str, int] = {
+    "intake":     10,
+    "features":   10,
+    "strategies": 30,
+    "governance": 30,
+    "executor":   30,
+    "monitor":    30,
+}
+
 # ── Telegram Shadow-Prefix ────────────────────────────────────────────────────
 TELEGRAM_V2_PREFIX = "[V2·SHADOW]"
 

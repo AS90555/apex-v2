@@ -4,18 +4,12 @@ Gibt eine Liste von Alarmen zurück; leer = alles OK.
 """
 
 from datetime import datetime, timezone
+from config.settings import HEARTBEAT_THRESHOLDS_MIN
 from core.db import get_connection
 from core.utils import log
 
-# Maximales Alter des letzten Heartbeats pro Komponente (Minuten)
-THRESHOLDS_MIN = {
-    "intake":     10,
-    "features":   10,
-    "strategies": 30,
-    "governance": 30,
-    "executor":   30,
-    "monitor":    30,
-}
+# D.2: Schwellen zentral in config/settings.py — HEARTBEAT_THRESHOLDS_MIN
+THRESHOLDS_MIN = HEARTBEAT_THRESHOLDS_MIN
 
 
 def check_all_heartbeats() -> list[dict]:
