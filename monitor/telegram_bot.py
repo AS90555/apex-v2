@@ -3419,8 +3419,9 @@ async def cmd_lab_decide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:  # archive
             conn.execute("UPDATE lab_queue SET status='archived' WHERE id=?", (queue_id,))
             conn.execute(
-                "INSERT INTO negative_controls (strategy, asset, study_hash, closed_at, closed_reason, closed_by) "
-                "VALUES (?, ?, 'operator', datetime('now'), 'operator_decision', ?)",
+                "INSERT INTO negative_controls "
+                "(strategy, asset, study_hash, no_go_reason, closed_at, closed_reason, closed_by, created_at) "
+                "VALUES (?, ?, 'operator', 'operator_decision', datetime('now'), 'operator_decision', ?, datetime('now'))",
                 (strategy, asset, f"telegram:{update.effective_user.id}"),
             )
             result_text = "als Negative Control archiviert"
@@ -3442,6 +3443,11 @@ async def cmd_lab_decide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Fehler: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

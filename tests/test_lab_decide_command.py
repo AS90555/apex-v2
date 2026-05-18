@@ -41,17 +41,24 @@ def _make_ctx(*args) -> MagicMock:
     return ctx
 
 
+_URI = "file:lab_decide_test?mode=memory&cache=shared"
+
+
 def _make_conn(queue_status: str = "paused_inconclusive") -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = sqlite3.connect(_URI, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(f"""
+        DROP TABLE IF EXISTS governance_audit_log;
+        DROP TABLE IF EXISTS negative_controls;
+        DROP TABLE IF EXISTS lab_queue;
         CREATE TABLE lab_queue (
             id INTEGER PRIMARY KEY, strategy TEXT, asset TEXT, status TEXT
         );
         CREATE TABLE negative_controls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy TEXT, asset TEXT, study_hash TEXT,
-            closed_at TEXT, closed_reason TEXT, closed_by TEXT
+            strategy TEXT NOT NULL, asset TEXT NOT NULL, study_hash TEXT NOT NULL,
+            no_go_reason TEXT NOT NULL, closed_at TEXT, closed_reason TEXT,
+            closed_by TEXT, created_at TEXT
         );
         CREATE TABLE governance_audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +69,12 @@ def _make_conn(queue_status: str = "paused_inconclusive") -> sqlite3.Connection:
     """)
     conn.commit()
     return conn
+
+
+def _open_shared() -> sqlite3.Connection:
+    c = sqlite3.connect(_URI, uri=True, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 
 class TestCmdLabDecide:
@@ -108,38 +121,39 @@ class TestCmdLabDecide:
 
     def test_full_run_sets_queued(self):
         update = _make_update()
-        conn = _make_conn()
+        anchor = _make_conn()  # hält shared-memory-DB am Leben
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
-            with patch("core.lab_state_db.get_lab_state_connection", return_value=conn):
+            with patch("core.lab_state_db.get_lab_state_connection", side_effect=_open_shared):
                 _run(cmd_lab_decide(update, _make_ctx("42", "full_run")))
-        row = conn.execute("SELECT status FROM lab_queue WHERE id=42").fetchone()
+        row = anchor.execute("SELECT status FROM lab_queue WHERE id=42").fetchone()
         assert row["status"] == "queued"
 
     def test_skip_sets_skipped(self):
         update = _make_update()
-        conn = _make_conn()
+        anchor = _make_conn()  # noqa: F841
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
-            with patch("core.lab_state_db.get_lab_state_connection", return_value=conn):
+            with patch("core.lab_state_db.get_lab_state_connection", side_effect=_open_shared):
                 _run(cmd_lab_decide(update, _make_ctx("42", "skip")))
-        row = conn.execute("SELECT status FROM lab_queue WHERE id=42").fetchone()
+        row = anchor.execute("SELECT status FROM lab_queue WHERE id=42").fetchone()
         assert row["status"] == "skipped"
 
     def test_archive_creates_negative_control(self):
         update = _make_update()
-        conn = _make_conn()
+        anchor = _make_conn()  # noqa: F841
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
-            with patch("core.lab_state_db.get_lab_state_connection", return_value=conn):
+            with patch("core.lab_state_db.get_lab_state_connection", side_effect=_open_shared):
                 _run(cmd_lab_decide(update, _make_ctx("42", "archive")))
-        nc = conn.execute("SELECT * FROM negative_controls WHERE strategy='donchian'").fetchone()
+        nc = anchor.execute("SELECT * FROM negative_controls WHERE strategy='donchian'").fetchone()
         assert nc is not None
-        assert nc["closed_reason"] == "operator_decision"
+        assert nc["no_go_reason"] == "operator_decision"
+        assert nc["created_at"] is not None
 
     def test_governance_event_logged(self):
         update = _make_update()
-        conn = _make_conn()
+        anchor = _make_conn()  # noqa: F841
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
-            with patch("core.lab_state_db.get_lab_state_connection", return_value=conn):
+            with patch("core.lab_state_db.get_lab_state_connection", side_effect=_open_shared):
                 _run(cmd_lab_decide(update, _make_ctx("42", "full_run")))
-        row = conn.execute("SELECT * FROM governance_audit_log").fetchone()
+        row = anchor.execute("SELECT * FROM governance_audit_log").fetchone()
         assert row is not None
         assert row["event_type"] == "operator_lab_decide"
