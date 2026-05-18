@@ -88,10 +88,20 @@ def promote_if_eligible(
         try:
             kind, value = result_q.get(timeout=REEVAL_TIMEOUT_SEC)
         except queue.Empty:
-            # Thread läuft als Daemon weiter und stirbt mit dem Prozess
+            # Thread läuft als Daemon weiter und stirbt mit dem Prozess — kein _save_discovery
             attempt.error = "reeval_timeout"
             log(f"[promotion-gate] TIMEOUT: Re-Eval für {variant_id[:8]} "
                 f"{strategy}/{asset} nach {REEVAL_TIMEOUT_SEC}s abgebrochen")
+            try:
+                from core.telegram_dispatcher import dispatch
+                dispatch(
+                    f"⚠️ <b>Re-Eval TIMEOUT</b>\n"
+                    f"Strategie: <code>{strategy}/{asset}</code>\n"
+                    f"Variant: <code>{variant_id[:8]}</code>\n"
+                    f"Abgebrochen nach {REEVAL_TIMEOUT_SEC}s — kein Discovery-Eintrag"
+                )
+            except Exception as _tg_exc:
+                log(f"[promotion-gate] Telegram-Alert fehlgeschlagen: {_tg_exc}")
             return attempt
 
         if kind == "err":
