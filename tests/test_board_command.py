@@ -46,19 +46,17 @@ def _make_conn(
     funding_rate: float = 0.0001,
     trades_today: int = 1,
 ) -> sqlite3.Connection:
+    """trading.db-Ersatz: system_state, trades, lab_discoveries, optional funding."""
     today = "2026-05-18"
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
 
     trade_rows = ""
-    # offener Trade (kein exit_ts)
     trade_rows += "INSERT INTO trades VALUES (1, NULL, NULL);\n"
-    # heute abgeschlossene Trades
     for i in range(trades_today):
         trade_rows += (
             f"INSERT INTO trades VALUES ({i+2}, '{today}T10:00:00', -0.5);\n"
         )
-    # gestern abgeschlossener Trade (zählt nicht für heute)
     trade_rows += "INSERT INTO trades VALUES (99, '2026-05-17T10:00:00', 0.3);\n"
 
     funding_tables = ""
@@ -77,18 +75,26 @@ def _make_conn(
     conn.executescript(f"""
         CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE trades (id INTEGER PRIMARY KEY, exit_ts TEXT, pnl_r REAL);
-        CREATE TABLE lab_cycles (id INTEGER PRIMARY KEY, status TEXT);
-        CREATE TABLE negative_controls (
-            id INTEGER PRIMARY KEY, closed_at TEXT
-        );
         CREATE TABLE lab_discoveries (id INTEGER PRIMARY KEY, status TEXT);
         INSERT INTO system_state VALUES ('daily_drawdown', '-0.0123');
         {trade_rows}
+        INSERT INTO lab_discoveries VALUES (1, 'approved');
+        {funding_tables}
+    """)
+    conn.commit()
+    return conn
+
+
+def _make_lab_conn() -> sqlite3.Connection:
+    """lab_state.db-Ersatz: lab_cycles, negative_controls."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE lab_cycles (id INTEGER PRIMARY KEY, status TEXT);
+        CREATE TABLE negative_controls (id INTEGER PRIMARY KEY, closed_at TEXT);
         INSERT INTO lab_cycles VALUES (5, 'completed');
         INSERT INTO negative_controls VALUES (1, NULL);
         INSERT INTO negative_controls VALUES (2, '2026-05-17T00:00:00');
-        INSERT INTO lab_discoveries VALUES (1, 'approved');
-        {funding_tables}
     """)
     conn.commit()
     return conn
@@ -111,9 +117,10 @@ class TestCmdBoard:
         update = _make_update()
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
             with patch("monitor.telegram_bot.get_connection", return_value=conn):
-                with patch("scripts.master_watchdog.check_master_alive",
-                           return_value=_ALIVE_STATUS):
-                    _run(cmd_board(update, _make_ctx()))
+                with patch("core.lab_state_db.get_lab_state_connection", return_value=_make_lab_conn()):
+                    with patch("scripts.master_watchdog.check_master_alive",
+                               return_value=_ALIVE_STATUS):
+                        _run(cmd_board(update, _make_ctx()))
         msg = update.message.reply_text.call_args[0][0]
         # Original 6
         assert "Live-DD" in msg
@@ -132,9 +139,10 @@ class TestCmdBoard:
         update = _make_update()
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
             with patch("monitor.telegram_bot.get_connection", return_value=conn):
-                with patch("scripts.master_watchdog.check_master_alive",
-                           return_value=_ALIVE_STATUS):
-                    _run(cmd_board(update, _make_ctx()))
+                with patch("core.lab_state_db.get_lab_state_connection", return_value=_make_lab_conn()):
+                    with patch("scripts.master_watchdog.check_master_alive",
+                               return_value=_ALIVE_STATUS):
+                        _run(cmd_board(update, _make_ctx()))
         msg = update.message.reply_text.call_args[0][0]
         assert "-0.0123" in msg   # daily_drawdown
         assert "#5" in msg         # cycle id
@@ -145,9 +153,10 @@ class TestCmdBoard:
         update = _make_update()
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
             with patch("monitor.telegram_bot.get_connection", return_value=conn):
-                with patch("scripts.master_watchdog.check_master_alive",
-                           return_value=_ALIVE_STATUS):
-                    _run(cmd_board(update, _make_ctx()))
+                with patch("core.lab_state_db.get_lab_state_connection", return_value=_make_lab_conn()):
+                    with patch("scripts.master_watchdog.check_master_alive",
+                               return_value=_ALIVE_STATUS):
+                        _run(cmd_board(update, _make_ctx()))
         msg = update.message.reply_text.call_args[0][0]
         assert "OK" in msg
 
@@ -156,21 +165,24 @@ class TestCmdBoard:
         update = _make_update()
         with patch("monitor.telegram_bot._is_authorized", return_value=True):
             with patch("monitor.telegram_bot.get_connection", return_value=conn):
-                with patch("scripts.master_watchdog.check_master_alive",
-                           return_value=_STALE_STATUS):
-                    _run(cmd_board(update, _make_ctx()))
+                with patch("core.lab_state_db.get_lab_state_connection", return_value=_make_lab_conn()):
+                    with patch("scripts.master_watchdog.check_master_alive",
+                               return_value=_STALE_STATUS):
+                        _run(cmd_board(update, _make_ctx()))
         msg = update.message.reply_text.call_args[0][0]
         assert "STALE" in msg
 
 
-def _run_board(conn, watchdog_status=None):
+def _run_board(conn, watchdog_status=None, lab_conn=None):
     """Hilfsfunktion: /board ausführen und Antwortnachricht zurückgeben."""
     update = _make_update()
     ws = watchdog_status or _ALIVE_STATUS
+    lc = lab_conn if lab_conn is not None else _make_lab_conn()
     with patch("monitor.telegram_bot._is_authorized", return_value=True):
         with patch("monitor.telegram_bot.get_connection", return_value=conn):
-            with patch("scripts.master_watchdog.check_master_alive", return_value=ws):
-                _run(cmd_board(update, _make_ctx()))
+            with patch("core.lab_state_db.get_lab_state_connection", return_value=lc):
+                with patch("scripts.master_watchdog.check_master_alive", return_value=ws):
+                    _run(cmd_board(update, _make_ctx()))
     return update.message.reply_text.call_args[0][0]
 
 

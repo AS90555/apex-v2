@@ -3069,13 +3069,13 @@ _HELP_TEXT = (
     "*Monitoring*\n"
     "`/status` — System\\-Status \\(Heartbeats, Server\\)\n"
     "`/pnl` — Dashboard \\(P&L, Canary\\)\n"
-    "`/board` — Operator\\-KPI\\-Dashboard \\(6 KPIs in 1 Nachricht\\)\n\n"
+    "`/board` — Operator\\-KPI\\-Dashboard \\(9 KPIs in 1 Nachricht\\)\n\n"
     "*Operator\\-Aktionen*\n"
     "`/shadow <id>` — Deployment auf Shadow\\-Mode umstellen\n"
     "`/panic` — Kill\\-Switch HARD setzen \\(mit Bestätigung\\)\n"
     "`/panic_clear <grund>` — Kill\\-Switch zurücksetzen\n\n"
     "*Lab*\n"
-    "`/lab <ASSET> [TAGE]` — On\\-Demand Backtest\n"
+    "`/lab <ASSET> [TAGE]` — On\\-Demand Backtest \\(Legacy\\-Lab\\)\n"
     "    Beispiel: `/lab ETH 365`\n"
     "`/lab_decide <id> <full_run|skip|archive>` — Inconclusive\\-Entscheidung\n"
     "`/resolve <id>` — Alias für `/lab_decide`\n\n"
@@ -3483,7 +3483,7 @@ async def cmd_shadow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/board — Operator-Dashboard mit 6 KPIs (read-only)."""
+    """/board — Operator-Dashboard mit 9 KPIs (read-only)."""
     if not _is_authorized(update):
         await update.message.reply_text("⛔ Nicht autorisiert.")
         return
@@ -3492,9 +3492,10 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone, timedelta
 
     def _load_board():
-        conn = get_connection()
-        now = datetime.now(timezone.utc)
+        conn  = get_connection()                  # trading.db
+        now   = datetime.now(timezone.utc)
         today = now.strftime("%Y-%m-%d")
+        lc    = None                              # lab_state.db (KPI 3+4)
         try:
             # 1. Live-DD heute
             dd_row = conn.execute(
@@ -3507,18 +3508,29 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "SELECT COUNT(*) FROM trades WHERE exit_ts IS NULL"
             ).fetchone()[0]
 
-            # 3. Letzter Cycle-Status
-            cycle_row = conn.execute(
-                "SELECT id, status FROM lab_cycles ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            cycle_str = f"#{cycle_row['id']} {cycle_row['status']}" if cycle_row else "–"
+            # 3. Letzter Cycle-Status (lab_state.db)
+            try:
+                from core.lab_state_db import get_lab_state_connection
+                lc = get_lab_state_connection()
+                cycle_row = lc.execute(
+                    "SELECT id, status FROM lab_cycles ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                cycle_str = f"#{cycle_row['id']} {cycle_row['status']}" if cycle_row else "–"
+            except Exception:
+                cycle_str = "n/a"
 
-            # 4. Aktive Negative Controls
-            nc_count = conn.execute(
-                "SELECT COUNT(*) FROM negative_controls WHERE closed_at IS NULL"
-            ).fetchone()[0] if _table_exists(conn, "negative_controls") else "n/a"
+            # 4. Aktive Negative Controls (lab_state.db)
+            try:
+                if lc is None:
+                    from core.lab_state_db import get_lab_state_connection
+                    lc = get_lab_state_connection()
+                nc_count = lc.execute(
+                    "SELECT COUNT(*) FROM negative_controls WHERE closed_at IS NULL"
+                ).fetchone()[0]
+            except Exception:
+                nc_count = "n/a"
 
-            # 5. Promotion-Kandidaten
+            # 5. Promotion-Kandidaten (trading.db — lab_discoveries liegt dort)
             promo_count = conn.execute(
                 "SELECT COUNT(*) FROM lab_discoveries WHERE status='approved'"
             ).fetchone()[0] if _table_exists(conn, "lab_discoveries") else "n/a"
@@ -3575,6 +3587,11 @@ async def cmd_board(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             }
         finally:
             conn.close()
+            if lc is not None:
+                try:
+                    lc.close()
+                except Exception:
+                    pass
 
     data = await asyncio.get_event_loop().run_in_executor(None, _load_board)
 

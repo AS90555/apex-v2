@@ -96,7 +96,7 @@ def test_funding_rate_low_passes():
     signal = _make_signal(direction="long")
 
     conn_mock = MagicMock()
-    conn_mock.execute.return_value.fetchone.return_value = {"funding_rate": 0.0001}
+    conn_mock.execute.return_value.fetchone.return_value = {"funding_rate": 0.0001, "funding_time": None}
 
     with patch("governance.checks.get_connection", return_value=conn_mock):
         passed, reason = check.evaluate(signal)
@@ -112,7 +112,8 @@ def test_funding_rate_warn_passes_with_note():
 
     conn_mock = MagicMock()
     conn_mock.execute.return_value.fetchone.return_value = {
-        "funding_rate": FUNDING_RATE_WARN_THRESHOLD + 0.0001
+        "funding_rate": FUNDING_RATE_WARN_THRESHOLD + 0.0001,
+        "funding_time": None,
     }
 
     with patch("governance.checks.get_connection", return_value=conn_mock):
@@ -130,7 +131,8 @@ def test_funding_rate_block_long():
 
     conn_mock = MagicMock()
     conn_mock.execute.return_value.fetchone.return_value = {
-        "funding_rate": FUNDING_RATE_BLOCK_THRESHOLD + 0.001
+        "funding_rate": FUNDING_RATE_BLOCK_THRESHOLD + 0.001,
+        "funding_time": None,
     }
 
     with patch("governance.checks.get_connection", return_value=conn_mock):
@@ -148,7 +150,8 @@ def test_funding_rate_high_positive_favors_short():
 
     conn_mock = MagicMock()
     conn_mock.execute.return_value.fetchone.return_value = {
-        "funding_rate": FUNDING_RATE_BLOCK_THRESHOLD + 0.001
+        "funding_rate": FUNDING_RATE_BLOCK_THRESHOLD + 0.001,
+        "funding_time": None,
     }
 
     with patch("governance.checks.get_connection", return_value=conn_mock):
