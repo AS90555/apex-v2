@@ -261,18 +261,23 @@ def _exit_label(reason: str) -> str:
 
 
 _COMPONENT_DE = {
-    "intake":     "Marktdaten",
-    "intake_ws":  "Marktdaten WS",
-    "features":   "Analyse",
-    "strategies": "Strategien",
-    "governance": "Steuerung",
-    "executor":   "Ausführung",
-    "monitor":    "Überwachung",
+    "intake":          "Marktdaten",
+    "intake_ws":       "Marktdaten WS",
+    "features":        "Analyse",
+    "strategies":      "Strategien",
+    "governance":      "Steuerung",
+    "executor":        "Ausführung",
+    "monitor":         "Überwachung",
+    "auto_demotion":   "Auto-Demotion",
+    "auto_promotion":  "Auto-Promotion",
+    "drift_check":     "Drift-Check",
+    "hmm_retrain":     "HMM-Retrain",
+    "regime_monitor":  "Regime-Monitor",
 }
 
 
 def _component_label(comp: str) -> str:
-    return _COMPONENT_DE.get(comp, comp)
+    return _COMPONENT_DE.get(comp, comp.replace("_", "-"))
 
 
 def _score_bar(score: float, max_score: float = 33.0, width: int = 8) -> str:
