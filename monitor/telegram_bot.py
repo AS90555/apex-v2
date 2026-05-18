@@ -1900,6 +1900,9 @@ def _lab_main_keyboard() -> InlineKeyboardMarkup:
             f"🚀 Bestes Setup deployen", callback_data=f"deploy_dry_{disc_id}"
         )])
     rows.append([
+        InlineKeyboardButton("🧪 V72-Labor",     callback_data="v72_lab"),
+    ])
+    rows.append([
         InlineKeyboardButton("🔄 Aktualisieren", callback_data="lab_main"),
         InlineKeyboardButton("◀️ Menü",          callback_data="back_menu"),
     ])
@@ -2487,6 +2490,258 @@ def build_lab_funde_text() -> str:
             lines.append("─────────────────")
 
     return _p("\n".join(lines))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V72-Lab-Views (T1.C) — lesen ausschließlich aus lab_state.db
+# Legacy-Views oben bleiben unverändert.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _v72_conn():
+    """Öffnet lab_state.db read-only für Bot-Views."""
+    from core.lab_state_db import get_lab_state_connection
+    return get_lab_state_connection()
+
+
+def _v72_age(iso: str | None) -> str:
+    """ISO-Timestamp → kompakter Altersstring ('vor 2h', '3T', …)."""
+    if not iso:
+        return "–"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        diff = (datetime.now(timezone.utc) - dt).total_seconds()
+        if diff < 3600:
+            return f"vor {int(diff/60)}min"
+        if diff < 86400:
+            return f"vor {int(diff/3600)}h"
+        return f"vor {int(diff/86400)}T"
+    except Exception:
+        return "–"
+
+
+def build_v72_cycle_text() -> str:
+    """Aktueller und letzte 4 Cycles + Queue-Breakdown des neuesten Cycle."""
+    try:
+        conn = _v72_conn()
+        cycles = conn.execute(
+            "SELECT id, status, cycle_start, cycle_end, total_pairs_queued, total_trials_run "
+            "FROM lab_cycles ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+        if not cycles:
+            conn.close()
+            return "🧪 *V72-Cycles*\n\nNoch kein Cycle gestartet\\."
+
+        lines = ["🧪 *V72\\-Cycles*\n"]
+        latest = cycles[0]
+        cid = latest["id"]
+
+        # Queue-Breakdown für den neuesten Cycle
+        q_rows = conn.execute(
+            "SELECT status, COUNT(*) as n FROM lab_queue WHERE cycle_id=? GROUP BY status",
+            (cid,),
+        ).fetchall()
+        q_map: dict[str, int] = {r["status"]: r["n"] for r in q_rows}
+        q_total = sum(q_map.values())
+        q_done  = q_map.get("completed", 0) + q_map.get("evaluated", 0)
+        q_pause = q_map.get("paused_inconclusive", 0)
+        q_skip  = q_map.get("skipped", 0) + q_map.get("archived", 0)
+        q_run   = q_map.get("running", 0) + q_map.get("pre_scanning", 0)
+        q_pend  = q_map.get("pending", 0) + q_map.get("queued", 0)
+
+        status_icon = {"running": "⏳", "completed": "✅", "paused": "⏸"}.get(
+            latest["status"], "❓"
+        )
+        age_start = _v72_age(latest["cycle_start"])
+        age_end   = _v72_age(latest["cycle_end"]) if latest["cycle_end"] else "läuft"
+
+        lines += [
+            f"*Aktuell:* Cycle \\#{cid}  {status_icon} `{latest['status']}`",
+            f"Start: {age_start}  ·  Ende: {age_end}",
+            f"Pairs: `{latest['total_pairs_queued']}`  ·  Trials: `{latest['total_trials_run']}`",
+            "",
+            f"*Queue:* {q_done}/{q_total} fertig",
+        ]
+        if q_run:
+            lines.append(f"  ▶ `{q_run}` läuft gerade")
+        if q_pend:
+            lines.append(f"  ⏳ `{q_pend}` ausstehend")
+        if q_pause:
+            lines.append(f"  ⚠️ `{q_pause}` inconclusive → /lab\\_decide")
+        if q_skip:
+            lines.append(f"  ⏭ `{q_skip}` übersprungen/archiviert")
+
+        # Letzte 4 ältere Cycles kompakt
+        if len(cycles) > 1:
+            lines.append("\n*Letzte Cycles:*")
+            for c in cycles[1:]:
+                icon = "✅" if c["status"] == "completed" else "❓"
+                lines.append(f"  {icon} \\#{c['id']}  `{c['status']}`  {_v72_age(c['cycle_end'])}")
+
+        conn.close()
+        return _p("\n".join(lines))
+    except Exception as e:
+        return f"🧪 *V72\\-Cycles*\n\n❌ Fehler: {_escape_md(str(e))}"
+
+
+def build_v72_variants_text() -> str:
+    """Variant-Status-Übersicht + Top-5 nach Fitness."""
+    try:
+        conn = _v72_conn()
+
+        # Status-Verteilung
+        status_rows = conn.execute(
+            "SELECT status, COUNT(*) as n FROM strategy_variants GROUP BY status ORDER BY n DESC"
+        ).fetchall()
+        if not status_rows:
+            conn.close()
+            return "🔬 *V72\\-Variants*\n\nNoch keine Variants vorhanden\\."
+
+        total = sum(r["n"] for r in status_rows)
+        lines = [f"🔬 *V72\\-Variants*  \\({total} gesamt\\)\n"]
+        status_labels = {
+            "proposed": "⬜ proposed", "queued": "🔵 queued",
+            "pre_scanning": "🔍 pre\\_scanning", "running": "▶ running",
+            "evaluated": "✅ evaluated", "archived": "📦 archived", "blocked": "🚫 blocked",
+        }
+        for r in status_rows:
+            label = status_labels.get(r["status"], r["status"])
+            lines.append(f"  {label}: `{r['n']}`")
+
+        # Top-5 Variants nach Fitness
+        top = conn.execute(
+            """SELECT sv.variant_id, sv.strategy, sv.asset, sv.generation,
+                      fr.fitness, fr.composite, fr.cycle_id
+               FROM fitness_records fr
+               JOIN strategy_variants sv ON fr.variant_id = sv.variant_id
+               ORDER BY fr.fitness DESC LIMIT 5"""
+        ).fetchall()
+
+        if top:
+            lines.append("\n*Top\\-5 Variants \\(Fitness\\):*")
+            for i, v in enumerate(top, 1):
+                fit  = f"{v['fitness']:.3f}" if v["fitness"] is not None else "–"
+                comp = f"{v['composite']:.3f}" if v["composite"] is not None else "–"
+                lines.append(
+                    f"  *{i}\\.* `{v['strategy']}/{v['asset']}`  "
+                    f"Gen {v['generation']}  fit=`{fit}`  comp=`{comp}`"
+                )
+        else:
+            lines.append("\n_Noch keine Fitness\\-Einträge\\._")
+
+        conn.close()
+        return _p("\n".join(lines))
+    except Exception as e:
+        return f"🔬 *V72\\-Variants*\n\n❌ Fehler: {_escape_md(str(e))}"
+
+
+def build_v72_regime_text() -> str:
+    """Neuestes Regime pro Asset aus regime_history."""
+    _REGIME_ICON = {"TREND": "📈", "MIXED": "🟡", "HIGH_VOL": "🔴", "LOW_VOL": "🔵"}
+    try:
+        conn = _v72_conn()
+
+        # Alle Assets mit Regime-History
+        rows = conn.execute(
+            """SELECT rh.asset, rh.regime, rh.computed_at, rh.hurst_exponent,
+                      rh.change_detected
+               FROM regime_history rh
+               INNER JOIN (
+                   SELECT asset, MAX(computed_at) as latest
+                   FROM regime_history GROUP BY asset
+               ) mx ON rh.asset = mx.asset AND rh.computed_at = mx.latest
+               ORDER BY rh.asset"""
+        ).fetchall()
+
+        if not rows:
+            conn.close()
+            return "📊 *V72\\-Regime*\n\nNoch keine Regime\\-History vorhanden\\."
+
+        lines = ["📊 *V72\\-Regime \\(aktuell\\)*\n"]
+        for r in rows:
+            icon   = _REGIME_ICON.get(r["regime"], "⚪")
+            age    = _v72_age(r["computed_at"])
+            hurst  = f"H={r['hurst_exponent']:.2f}" if r["hurst_exponent"] is not None else ""
+            change = " 🔔" if r["change_detected"] else ""
+            lines.append(
+                f"  {icon} `{r['asset']}`  *{_escape_md(r['regime'])}*"
+                f"  {age}  {_escape_md(hurst)}{change}"
+            )
+
+        conn.close()
+        return _p("\n".join(lines))
+    except Exception as e:
+        return f"📊 *V72\\-Regime*\n\n❌ Fehler: {_escape_md(str(e))}"
+
+
+def build_v72_nc_text() -> str:
+    """Negative Controls: aktive Anzahl + Aufschlüsselung nach Grund."""
+    try:
+        conn = _v72_conn()
+
+        total      = conn.execute("SELECT COUNT(*) FROM negative_controls").fetchone()[0]
+        active     = conn.execute(
+            "SELECT COUNT(*) FROM negative_controls WHERE closed_at IS NULL"
+        ).fetchone()[0]
+        by_reason  = conn.execute(
+            "SELECT no_go_reason, COUNT(*) as n FROM negative_controls "
+            "GROUP BY no_go_reason ORDER BY n DESC"
+        ).fetchall()
+        recent     = conn.execute(
+            "SELECT strategy, asset, no_go_reason, created_at "
+            "FROM negative_controls ORDER BY created_at DESC LIMIT 5"
+        ).fetchall()
+
+        if total == 0:
+            conn.close()
+            return "🚫 *V72\\-Negative Controls*\n\nNoch keine NCs vorhanden\\."
+
+        lines = [f"🚫 *V72\\-Negative Controls*  \\({total} gesamt, {active} aktiv\\)\n"]
+
+        lines.append("*Nach Grund:*")
+        _NC_LABELS = {
+            "signal_absent":         "kein Signal",
+            "frequency_incompatible": "Frequenz inkompatibel",
+            "structural":            "strukturell",
+            "operator_decision":     "Operator",
+        }
+        for r in by_reason:
+            label = _NC_LABELS.get(r["no_go_reason"], r["no_go_reason"])
+            lines.append(f"  `{r['n']}×` {_escape_md(label)}")
+
+        if recent:
+            lines.append("\n*Neueste 5:*")
+            for r in recent:
+                age = _v72_age(r["created_at"])
+                lines.append(
+                    f"  `{r['strategy']}/{r['asset']}`  "
+                    f"{_escape_md(_NC_LABELS.get(r['no_go_reason'], r['no_go_reason']))}  {age}"
+                )
+
+        conn.close()
+        return _p("\n".join(lines))
+    except Exception as e:
+        return f"🚫 *V72\\-Negative Controls*\n\n❌ Fehler: {_escape_md(str(e))}"
+
+
+def _v72_lab_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Cycles",     callback_data="v72_cycles"),
+            InlineKeyboardButton("🧬 Variants",   callback_data="v72_variants"),
+        ],
+        [
+            InlineKeyboardButton("📊 Regime",     callback_data="v72_regime"),
+            InlineKeyboardButton("🚫 Neg. Ctrls", callback_data="v72_nc"),
+        ],
+        [
+            InlineKeyboardButton("▶ Cycle starten", callback_data="v72_cycle_run"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Aktualisieren", callback_data="v72_lab"),
+            InlineKeyboardButton("◀️ Labor",          callback_data="lab_main"),
+        ],
+    ])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4004,6 +4259,97 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("◀️ Menü",       callback_data="back_menu"),
             ]]),
         )
+
+    # ── V72-Lab-Views (T1.C) ────────────────────────────────────────────────────
+    elif action == "v72_lab":
+        await query.edit_message_text(
+            "🧪 *V72\\-Labor*\n\n_Wähle eine Ansicht:_",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_v72_lab_keyboard(),
+        )
+
+    elif action == "v72_cycles":
+        await query.edit_message_text(
+            build_v72_cycle_text(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="v72_cycles"),
+                InlineKeyboardButton("◀️ V72-Labor",     callback_data="v72_lab"),
+            ]]),
+        )
+
+    elif action == "v72_variants":
+        await query.edit_message_text(
+            build_v72_variants_text(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="v72_variants"),
+                InlineKeyboardButton("◀️ V72-Labor",     callback_data="v72_lab"),
+            ]]),
+        )
+
+    elif action == "v72_regime":
+        await query.edit_message_text(
+            build_v72_regime_text(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="v72_regime"),
+                InlineKeyboardButton("◀️ V72-Labor",     callback_data="v72_lab"),
+            ]]),
+        )
+
+    elif action == "v72_nc":
+        await query.edit_message_text(
+            build_v72_nc_text(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Aktualisieren", callback_data="v72_nc"),
+                InlineKeyboardButton("◀️ V72-Labor",     callback_data="v72_lab"),
+            ]]),
+        )
+
+    elif action == "v72_cycle_run":
+        try:
+            from core.lab_state_db import get_lab_state_connection
+            _lc = get_lab_state_connection()
+            _running = _lc.execute(
+                "SELECT id FROM lab_cycles WHERE status='running' LIMIT 1"
+            ).fetchone()
+            _lc.close()
+            if _running:
+                await query.edit_message_text(
+                    f"⏳ *Cycle läuft bereits* \\(\\#{_running['id']}\\)\n\n"
+                    "_Bitte warten bis der aktuelle Cycle abgeschlossen ist\\._",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Status", callback_data="v72_cycles"),
+                        InlineKeyboardButton("◀️ V72-Labor", callback_data="v72_lab"),
+                    ]]),
+                )
+            else:
+                import subprocess as _v72_sp
+                _v72_sp.Popen(
+                    ["python3", "scripts/lab_controller.py",
+                     "--mode", "run-cycle", "--db-path", "data/lab_state.db"],
+                    cwd="/root/apex-v2",
+                    stdout=open("/root/apex-v2/logs/v72_lab.log", "a"),
+                    stderr=_v72_sp.STDOUT,
+                )
+                await query.edit_message_text(
+                    "▶ *V72\\-Cycle gestartet*\n\n"
+                    "_Läuft im Hintergrund\\. Logs: `logs/v72_lab.log`_\n"
+                    "_Status jederzeit über Cycles\\-View prüfen\\._",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Cycles", callback_data="v72_cycles"),
+                        InlineKeyboardButton("◀️ V72-Labor", callback_data="v72_lab"),
+                    ]]),
+                )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Fehler beim Starten: {_escape_md(str(e))}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
 
     elif action == "audit_now":
         import subprocess as _sp2
