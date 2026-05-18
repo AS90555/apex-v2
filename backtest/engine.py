@@ -1244,6 +1244,154 @@ def _supertrend_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[B
     return None
 
 
+def _atr_channel_breakout_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    ATR-Channel-Breakout auf 1h:
+      Dynamischer Channel = EMA(N) ± ATR_BAND * ATR(14)
+      Long:  Close > EMA + ATR_BAND * ATR  UND  ATR-Expansion  UND  Vol > VOL_FACTOR * VolSMA
+      Short: Spiegelbildlich
+    Volatilitätsnormiert — Einstiegsschwelle skaliert mit ATR statt fixem Preisniveau.
+    Edge: Filtert enge Ranging-Phasen automatisch heraus (ATR-Expansion zwingend).
+    """
+    ema_period  = int(cfg.get("EMA_PERIOD",   30))
+    atr_band    = cfg.get("ATR_BAND",      2.0)
+    atr_min     = cfg.get("ATR_MIN_MULT",  1.0)
+    vol_factor  = cfg.get("VOL_FACTOR",    1.3)
+    sl_mult     = cfg.get("SL_ATR_MULT",   1.0)
+    tp_r        = cfg.get("TP_R",          2.0)
+
+    limit = max(ema_period, 50) + 20
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < ema_period + 15:
+        return None
+
+    cur     = candles[-1]
+    ts      = cur["time"]
+    closes  = [c["close"] for c in candles]
+
+    atr     = atr_wilder(candles, 14)
+    atr_avg = atr_wilder(candles[:-14], 14) if len(candles) > 28 else atr
+    vol_avg = vol_sma(candles, 20)
+
+    if atr <= 0 or vol_avg <= 0:
+        return None
+
+    ema_val = ema(closes, ema_period)
+    if ema_val is None or ema_val <= 0:
+        return None
+
+    channel_upper = ema_val + atr_band * atr
+    channel_lower = ema_val - atr_band * atr
+    atr_ok = atr >= atr_min * atr_avg if atr_avg > 0 else True
+    vol_ok = cur["volume"] >= vol_factor * vol_avg
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+
+    if cur["close"] > channel_upper and atr_ok and vol_ok:
+        sl_dist = atr * sl_mult
+        sl = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="atr_channel_breakout", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if cur["close"] < channel_lower and atr_ok and vol_ok:
+        sl_dist = atr * sl_mult
+        sl  = cur["close"] + sl_dist
+        tp2 = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="atr_channel_breakout", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
+def _funding_momentum_signal(conn, asset: str, as_of_ts: int, cfg: dict) -> Optional[BtSignal]:
+    """
+    Funding-Rate-Momentum auf 1h (Perps-spezifischer Edge):
+      Long:  Funding < -FUNDING_THRESH  UND  Close > EMA(EMA_PERIOD)  (Shorts zahlen → Short-Squeeze)
+      Short: Funding > +FUNDING_THRESH  UND  Close < EMA(EMA_PERIOD)  (Longs zahlen → Long-Unwind)
+    Edge: Extremes negatives Funding bei steigendem Preis signalisiert Short-Squeeze-Potenzial.
+    Funding-Daten aus funding_rates-Tabelle (Point-in-Time, kein Look-ahead).
+    """
+    ema_period     = int(cfg.get("EMA_PERIOD",      50))
+    funding_thresh = cfg.get("FUNDING_THRESH",  0.0003)
+    sl_mult        = cfg.get("SL_ATR_MULT",        1.0)
+    tp_r           = cfg.get("TP_R",               2.0)
+
+    limit = ema_period + 20
+    candles = _candles(conn, asset, "1h", as_of_ts, limit)
+    if len(candles) < ema_period + 5:
+        return None
+
+    cur    = candles[-1]
+    ts     = cur["time"]
+    closes = [c["close"] for c in candles]
+
+    # Funding Point-in-Time: aktuellstes Funding vor as_of_ts
+    try:
+        row = conn.execute(
+            """SELECT funding_rate FROM funding_rates
+               WHERE asset=? AND CAST(funding_time AS INTEGER) <= ?
+               ORDER BY CAST(funding_time AS INTEGER) DESC LIMIT 1""",
+            (asset, as_of_ts),
+        ).fetchone()
+        funding_rate = row[0] if row else None
+    except Exception:
+        funding_rate = None
+
+    if funding_rate is None:
+        return None
+
+    atr = atr_wilder(candles, 14)
+    if atr <= 0:
+        return None
+
+    ema_val = ema(closes, ema_period)
+    if ema_val is None or ema_val <= 0:
+        return None
+
+    risk_usd = cfg.get("CAPITAL", 68.0) * cfg.get("MAX_RISK_PCT", 0.02)
+    sl_dist  = atr * sl_mult
+
+    if funding_rate < -funding_thresh and cur["close"] > ema_val:
+        sl = cur["close"] - sl_dist
+        if sl <= 0 or sl_dist <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="funding_momentum", asset=asset, direction="long",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] + sl_dist, 6),
+            take_profit_2=round(cur["close"] + sl_dist * tp_r, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    if funding_rate > funding_thresh and cur["close"] < ema_val:
+        sl  = cur["close"] + sl_dist
+        tp2 = cur["close"] - sl_dist * tp_r
+        if sl_dist <= 0 or tp2 <= 0:
+            return None
+        return BtSignal(
+            ts=ts, strategy="funding_momentum", asset=asset, direction="short",
+            entry_price=round(cur["close"], 6), stop_loss=round(sl, 6),
+            take_profit_1=round(cur["close"] - sl_dist, 6),
+            take_profit_2=round(tp2, 6),
+            size=round(risk_usd / sl_dist, 4), risk_usd=round(risk_usd, 4),
+        )
+
+    return None
+
+
 SIGNAL_FNS = {
     "vaa":                _vaa_signal,
     "kdt":            _kdt_signal,
@@ -1255,44 +1403,50 @@ SIGNAL_FNS = {
     "ema_pullback":       _ema_pullback_signal,
     "donchian_breakout":  _donchian_breakout_signal,
     "inside_bar_breakout": _inside_bar_signal,
-    "dual_donchian":      _dual_donchian_signal,
-    "bb_kc_squeeze":      _bb_kc_squeeze_signal,
-    "supertrend":         _supertrend_signal,
-    "orb":                orb_engine_adapter,
+    "dual_donchian":           _dual_donchian_signal,
+    "bb_kc_squeeze":           _bb_kc_squeeze_signal,
+    "supertrend":              _supertrend_signal,
+    "orb":                     orb_engine_adapter,
+    "atr_channel_breakout":    _atr_channel_breakout_signal,
+    "funding_momentum":        _funding_momentum_signal,
 }
 
 STRATEGY_INTERVAL = {
-    "vaa":                "1h",
-    "kdt":                "1h",
-    "weekend_momo":       "1d",
-    "asian_fade":         "1h",
-    "squeeze":            "1h",
-    "mean_reversion":     "1h",
-    "vwap_bounce":        "1h",
-    "ema_pullback":       "1h",
-    "donchian_breakout":  "1h",
-    "inside_bar_breakout": "1h",
-    "dual_donchian":      "1h",
-    "bb_kc_squeeze":      "1h",
-    "supertrend":         "1h",
-    "orb":                "1h",
+    "vaa":                     "1h",
+    "kdt":                     "1h",
+    "weekend_momo":            "1d",
+    "asian_fade":              "1h",
+    "squeeze":                 "1h",
+    "mean_reversion":          "1h",
+    "vwap_bounce":             "1h",
+    "ema_pullback":            "1h",
+    "donchian_breakout":       "1h",
+    "inside_bar_breakout":     "1h",
+    "dual_donchian":           "1h",
+    "bb_kc_squeeze":           "1h",
+    "supertrend":              "1h",
+    "orb":                     "1h",
+    "atr_channel_breakout":    "1h",
+    "funding_momentum":        "1h",
 }
 
 EXIT_INTERVAL = {
-    "vaa":                "1h",
-    "kdt":                "1h",
-    "weekend_momo":       "4h",
-    "asian_fade":         "1h",
-    "squeeze":            "1h",
-    "mean_reversion":     "1h",
-    "vwap_bounce":        "1h",
-    "ema_pullback":       "1h",
-    "donchian_breakout":  "1h",
-    "inside_bar_breakout": "1h",
-    "dual_donchian":      "1h",
-    "bb_kc_squeeze":      "1h",
-    "supertrend":         "1h",
-    "orb":                "1h",
+    "vaa":                     "1h",
+    "kdt":                     "1h",
+    "weekend_momo":            "4h",
+    "asian_fade":              "1h",
+    "squeeze":                 "1h",
+    "mean_reversion":          "1h",
+    "vwap_bounce":             "1h",
+    "ema_pullback":            "1h",
+    "donchian_breakout":       "1h",
+    "inside_bar_breakout":     "1h",
+    "dual_donchian":           "1h",
+    "bb_kc_squeeze":           "1h",
+    "supertrend":              "1h",
+    "orb":                     "1h",
+    "atr_channel_breakout":    "1h",
+    "funding_momentum":        "1h",
 }
 
 

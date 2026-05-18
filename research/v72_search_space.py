@@ -14,10 +14,20 @@ import json
 
 import optuna
 
-RANGES_V72_VERSION = "1.0"
+RANGES_V72_VERSION = "1.3"
 
 # Format: {strategy: {param: (low, high, is_int)}}
 # Quelle: auto_lab_daemon.py OPTUNA_SPACES (Stand 2026-05-13)
+#
+# v1.1 (2026-05-14): dual_donchian-Range eng um Trial-19-Nachbarschaft aus Round 2
+# (id=350: Composite=0.850, DSR=1.0, Stability=0.683, MaxDD=3.17R, PBO=0.387)
+# Ziel: PBO-Senkung von 0.387 auf ≤0.30 bei Erhalt der anderen Gates.
+#
+# v1.2 (2026-05-14): Mittelweg zwischen v1.0 (weit) und v1.1 (eng).
+# v1.1 erreichte 6/20 4-Gate-Pass aber n_oos < 100 (Trade-Count zu klein, 18–25).
+# VOL_FACTOR und ATR_MIN_MULT untere Grenzen gesenkt → mehr Signale → n_oos ≥ 100.
+# Andere dual_donchian-Params bleiben wie v1.1 (TPE-Konvergenz funktionierte dort).
+# Alle anderen Strategien unverändert, aber neuer study_hash wegen Version-Bump.
 RANGES_V72: dict[str, dict[str, tuple]] = {
     "kdt": {
         "SL_ATR_MULT": (0.5, 2.0, False),
@@ -78,12 +88,18 @@ RANGES_V72: dict[str, dict[str, tuple]] = {
         "TP_R":           (1.5, 4.0, False),
     },
     "dual_donchian": {
-        "ENTRY_PERIOD": (15,  60, True),
-        "EXIT_PERIOD":  (5,   20, True),
-        "VOL_FACTOR":   (1.2, 3.0, False),
-        "ATR_MIN_MULT": (0.8, 2.0, False),
-        "SL_ATR_MULT":  (0.5, 1.5, False),
-        "TP_R":         (1.2, 3.0, False),
+        # v1.2 (2026-05-14): Mittelweg-Range, um n_oos ≥ 100 zu erreichen.
+        # Hintergrund: v1.1 (VOL_FACTOR 2.5–3.0, ATR_MIN_MULT 1.1–1.5) erzeugte 6/20
+        # 4-Gate-Pass-Trials, aber n_oos blieb bei 18–25 (Gate ≥100 verfehlt).
+        # TPE konvergierte an obere Grenzen → Filter zu streng.
+        # Lösung: VOL_FACTOR und ATR_MIN_MULT untere Grenzen senken.
+        # Trial-19 v1.0-Anker bleibt mittig: VOL_FACTOR=2.82, ATR_MIN_MULT=1.31.
+        "ENTRY_PERIOD": (22,  28, True),
+        "EXIT_PERIOD":  (10,  16, True),
+        "VOL_FACTOR":   (2.0, 2.9, False),
+        "ATR_MIN_MULT": (1.0, 1.6, False),
+        "SL_ATR_MULT":  (1.2, 1.7, False),
+        "TP_R":         (1.8, 2.8, False),
     },
     "bb_kc_squeeze": {
         "BB_PERIOD":  (10,  30, True),
@@ -115,6 +131,25 @@ RANGES_V72: dict[str, dict[str, tuple]] = {
         "BODY_MULT":  (0.3, 0.8, False),
         "ATR_EXPAND": (0.8, 2.5, False),
         "TP_R":       (1.5, 6.0, False),
+    },
+    # v1.3 (2026-05-18): Zwei neue Strategien hinzugefügt
+    "atr_channel_breakout": {
+        # EMA-Basis-Channel: Breakout wenn Close > EMA ± ATR_BAND*ATR
+        # Kleiner Parameterraum → niedriges PBO-Risiko
+        "EMA_PERIOD":   (20,  60, True),
+        "ATR_BAND":     (1.5, 3.5, False),
+        "ATR_MIN_MULT": (0.8, 1.8, False),
+        "VOL_FACTOR":   (1.0, 2.5, False),
+        "SL_ATR_MULT":  (0.5, 1.5, False),
+        "TP_R":         (1.5, 3.5, False),
+    },
+    "funding_momentum": {
+        # Long wenn Funding < -Thresh UND Close > EMA → Short-Squeeze-Edge
+        # FUNDING_THRESH in Dezimal (0.0003 = 0.03% pro 8h)
+        "EMA_PERIOD":      (30,  100, True),
+        "FUNDING_THRESH":  (0.0001, 0.0010, False),
+        "SL_ATR_MULT":     (0.5,   2.0,   False),
+        "TP_R":            (1.5,   4.0,   False),
     },
 }
 

@@ -1,0 +1,105 @@
+# Lab Strategy-Regime-Kompatibilitäts-Matrix
+#
+# regime_compatible: Welche Asset-Regime sind für diese Strategie geeignet?
+# min_hurst:         Untergrenze Hurst-Exponent (Trendstärke-Anforderung)
+# max_hurst:         Obergrenze (für Mean-Reversion-Strategien)
+# note:              Begründung / Beobachtung aus bisherigen Runs
+
+strategies:
+  dual_donchian:
+    regime_compatible: [HIGH_TREND, MIXED]
+    min_hurst: 0.52
+    max_hurst: null
+    note: "DSR=1.0 auf LINK bewiesen. SOL/XRP/ADA/AVAX neu im Test (2026-05-18). ETH/BTC bleiben NC."
+
+  donchian_breakout:
+    regime_compatible: [HIGH_TREND, MIXED]
+    min_hurst: 0.52
+    max_hurst: null
+    note: "Etwas toleranter als dual_donchian, funktioniert auch in gemischten Regimes."
+
+  squeeze:
+    regime_compatible: [SIDEWAYS, MIXED]
+    min_hurst: null
+    max_hurst: 0.55
+    note: "Mean-Reversion-Charakter. Trendmärkte produzieren zu viele False-Breakouts."
+
+  bb_kc_squeeze:
+    regime_compatible: [SIDEWAYS, MIXED]
+    min_hurst: null
+    max_hurst: 0.55
+    note: "Wie squeeze — Bollinger/KC-Squeeze bevorzugt flache Phasen."
+
+  atr_channel_breakout:
+    regime_compatible: [HIGH_TREND, MIXED]
+    min_hurst: 0.50
+    max_hurst: null
+    note: "Volatilitätsnormierter Breakout. ATR-Expansion als Pflicht-Filter. Priorität: SOL, XRP, ADA, AVAX, BTC."
+
+  funding_momentum:
+    regime_compatible: [HIGH_TREND, MIXED, SIDEWAYS]
+    min_hurst: null
+    max_hurst: null
+    note: "Perps-spezifischer Edge: Extremes Funding + EMA-Richtung. Priorität: BTC, ETH (zuverlässigste Funding-Daten)."
+
+  vaa:
+    regime_compatible: [HIGH_TREND, MIXED, SIDEWAYS]
+    min_hurst: null
+    max_hurst: null
+    note: "Volumen-adaptive Strategie — Regime-unabhängig, aber vaa/LINK ist signal_absent NO-GO."
+
+  weekend_momo:
+    regime_compatible: [HIGH_TREND, MIXED]
+    min_hurst: 0.50
+    max_hurst: null
+    note: "Weekend-Momentum — sinnvoll in trendenden oder gemischten Märkten."
+
+  asian_fade:
+    regime_compatible: [SIDEWAYS, MIXED]
+    min_hurst: null
+    max_hurst: 0.56
+    note: "Session-Fade funktioniert besser in Ranging-Phasen."
+
+  vwap_bounce:
+    regime_compatible: [SIDEWAYS, MIXED]
+    min_hurst: null
+    max_hurst: 0.56
+    note: "VWAP-Mean-Reversion — wie asian_fade."
+
+  kdt:
+    regime_compatible: [HIGH_TREND, MIXED, SIDEWAYS]
+    min_hurst: null
+    max_hurst: null
+    note: "Key-Day-Trader — Regime-unabhängig evaluiert."
+
+# Tier-1-Universum für die erste Lab-Phase
+# Priorisierung: Score-Faktor für Queue-Build
+asset_universe:
+  BTC:
+    tier: 1
+    priority_factor: 1.0
+    note: "Benchmark — höchste Liquidität, verlässlichste Daten"
+  ETH:
+    tier: 1
+    priority_factor: 0.95
+    note: "Zweit-Benchmark; structural NO-GO für dual_donchian schon dokumentiert"
+  SOL:
+    tier: 1
+    priority_factor: 0.90
+    note: "Hohe Volatilität, gute Trendeigenschaften erwartet"
+  XRP:
+    tier: 1
+    priority_factor: 0.85
+    note: "Regulatorisch sensibel, aber liquide"
+  LINK:
+    tier: 1
+    priority_factor: 0.60
+    note: "Mehrfach-NO-GOs — strukturelle Probleme mit dual_donchian + squeeze. Nur für Strategien ohne NC."
+  ADA:
+    tier: 2
+    priority_factor: 0.75
+    note: "Tier-2 — niedrigere Priorität"
+  AVAX:
+    tier: 2
+    priority_factor: 0.75
+    note: "Tier-2 — weekend_momo Kandidat"

@@ -1,6 +1,8 @@
 {
-  "RANGES_V72_VERSION": "1.2",
-  "ranges_v72_hash": "c4bb1592d46fb9a80a11ae3597a3de0bb25da9e8ca9ccdbcfea7273ee7cb6828",
+  "RANGES_V72_VERSION": "1.3",
+  "ranges_v72_hash": "0c543e0c3c2518a20ada6920e066b6e7d91276e672d9c2d334d2dca0031b8900",
   "OBJECTIVE_V72_VERSION": "v72.0",
-  "lab_search_cfg_hash": "8dc5026a66d7690f89c8e6f1437be0ce81df8e1d621a24e68c87c4c466cd1ba4"
+  "lab_search_cfg_hash": "8dc5026a66d7690f89c8e6f1437be0ce81df8e1d621a24e68c87c4c466cd1ba4",
+  "file_hash": "630c0843fbfbe777a05ed46689389903b344d455a30278a199070ed488917a84",
+  "ranges_version": "1.3"
 }
