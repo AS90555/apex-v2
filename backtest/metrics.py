@@ -199,9 +199,20 @@ def stability_score(
     sharpe_fn=None,
 ) -> float:
     """
-    Parameter-Stabilitäts-Score: 1 - (std(Sharpes über Variationen) / mean(|Sharpes|)).
-    Höher = stabiler. Erwartet vorberechnete Sharpe-Werte pro Variation.
-    sharpe_fn: Funktion die (pnl_rs) → sharpe liefert; default: metrics.sharpe
+    Parameter-Stabilitäts-Score: misst wie robust die Performance über Param-Variationen ist.
+
+    Formel: score = max(0, 1 - std(sharpes) / mean(|sharpes|))
+      - std(sharpes): Standardabweichung der Sharpe-Ratios über alle Param-Variationen
+      - mean(|sharpes|): Mittelwert der absoluten Sharpe-Werte (Normalisierung)
+      - Score = 1.0 → komplett stabil (alle Variationen gleich gut)
+      - Score = 0.0 → komplett instabil (Streuung ≥ Mittelwert)
+
+    Randfälle:
+      - Keine Variationen → 1.0 (keine Instabilität messbar)
+      - mean_abs == 0 (alle Sharpes = 0) → 0.0 (kein Informationsgehalt)
+
+    Gate: STABILITY_MIN = 0.50 (in config/settings.py)
+    sharpe_fn: Funktion die (pnl_rs: list[float]) → float; default: metrics.sharpe
     """
     if sharpe_fn is None:
         sharpe_fn = sharpe
