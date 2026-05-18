@@ -36,6 +36,7 @@ from governance.checks import (
     CrossAssetRegimeCheck,
     StaleCandleCheck,
     FundingRateCheck,
+    DailyTradeLimitCheck,
 )
 from governance.portfolio_risk import PortfolioExposureCheck
 
@@ -124,6 +125,7 @@ def main():
         SignalExpiryCheck(),
         DrawdownKillCheck(),
         DailyDrawdownCheck(),
+        DailyTradeLimitCheck(),   # C.2: globales Tages-Limit — früh prüfen, günstig
         StaleCandleCheck(),       # v6: Stale-Market-Data-Guard (vor HMM, da Daten-Qualität)
         HMMRegimeCheck(),
         RegimeCheck(),

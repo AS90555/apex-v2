@@ -29,6 +29,7 @@ from config.settings import (
     STALE_CANDLE_TOLERANCE_SECONDS,
     FUNDING_RATE_WARN_THRESHOLD,
     FUNDING_RATE_BLOCK_THRESHOLD,
+    MAX_DAILY_TRADES,
 )
 from governance.gate import BaseGovernanceCheck
 
@@ -402,3 +403,39 @@ class FundingRateCheck(BaseGovernanceCheck):
                 f"(warn_threshold={FUNDING_RATE_WARN_THRESHOLD:.4f})"
             )
         return True, f"funding_rate=ok({rate:.5f})"
+
+
+class DailyTradeLimitCheck(BaseGovernanceCheck):
+    """
+    C.2 — Globales Daily-Trade-Limit über alle Assets und Strategien.
+
+    Zählt abgeschlossene Trades (exit_ts IS NOT NULL) des heutigen Tages
+    im aktuellen Mode. Bei Erreichen von MAX_DAILY_TRADES wird jedes weitere
+    Signal blockiert — unabhängig von Asset oder Strategie.
+
+    Schützt gegen: Bug-bedingte Signal-Flut, Reconciler-Fehler, Loop-Trades.
+    """
+
+    @property
+    def name(self) -> str:
+        return "daily_trade_limit"
+
+    def evaluate(self, signal: Signal) -> Tuple[bool, str]:
+        conn = get_connection()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*) FROM trades
+                   WHERE date(entry_ts) = ? AND exit_ts IS NOT NULL AND mode = ?""",
+                (today, signal.mode),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        count = row[0] if row else 0
+        if count >= MAX_DAILY_TRADES:
+            return False, (
+                f"daily_trade_limit: {count}/{MAX_DAILY_TRADES} Trades heute "
+                f"({today}, mode={signal.mode}) — Limit erreicht"
+            )
+        return True, f"daily_trades_today={count}/{MAX_DAILY_TRADES}"

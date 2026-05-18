@@ -278,6 +278,9 @@ MOMENTUM_THRESHOLD    = 0.03
 ATR_SL_MULTIPLIER     = 1.5
 ATR_TP_MULTIPLIER     = 3.0
 
+# ── Session-Limit (C.2) ──────────────────────────────────────────────────────
+MAX_DAILY_TRADES = 3  # max. abgeschlossene Trades pro 24h-Fenster (alle Assets, alle Strategien)
+
 # ── Telegram Shadow-Prefix ────────────────────────────────────────────────────
 TELEGRAM_V2_PREFIX = "[V2·SHADOW]"
 
