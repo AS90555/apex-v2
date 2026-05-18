@@ -160,7 +160,7 @@ def mode_build_queue(db_path: str, cycle_id: int | None = None) -> int:
                     continue
                 nc_result = check_negative_control(variant.strategy, variant.asset, db_path=db_path)
                 if nc_result.blocked and not nc_result.reopen_available:
-                    update_variant_status(conn, vid, "blocked", "negative_control")
+                    update_variant_status(conn, vid, "archived", "negative_control")
                     continue
                 entry_id = write_queue_entry(
                     conn, cycle_id, variant.strategy, variant.asset,
