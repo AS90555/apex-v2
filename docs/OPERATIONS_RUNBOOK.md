@@ -1,6 +1,6 @@
 # APEX V2 — Betriebs-Runbook
 
-Stand: 2026-05-18 | Gültig für: Produktionsbetrieb nach P1–P3-Abschluss
+Stand: 2026-05-18 (geprüft) | Gültig für: Produktionsbetrieb nach P1–P3-Abschluss
 
 ---
 
@@ -8,14 +8,22 @@ Stand: 2026-05-18 | Gültig für: Produktionsbetrieb nach P1–P3-Abschluss
 
 ### Laufende Prozesse
 
-| Prozess | Cron | Beschreibung |
+| Prozess | Cron (UTC) | Beschreibung |
 |---|---|---|
 | `scripts/master_run.py` | `*/5 * * * *` | Live-Pipeline: Signale → Governance → Execution |
 | `scripts/master_watchdog.py` | `*/5 * * * *` | Stille-Erkennung > 15 min → Telegram-Alert |
-| `scripts/lab_controller.py` | `30 2 * * *` | Research-Lab-Cycle |
-| `scripts/lab_regime_daily_check.py` | `0 3 * * *` | Regime-Erkennung pro Asset |
+| `scripts/dead_mans_switch.sh` | `*/5 * * * *` ¹ | Notfall-Abschaltung bei längerem Daemon-Stillstand |
+| `scripts/run_reconciliation.py` | `* * * * *` ¹ | Ghost/Phantom/Size-Mismatch-Check, 1× pro Minute |
 | `scripts/db_backup.py` | `50 1 * * *` | DB-Backup, Retention 7 daily + 4 weekly |
-| `scripts/dead_mans_switch.sh` | `*/5 * * * *` | Notfall-Abschaltung bei längerem Daemon-Stillstand |
+| `scripts/lab_regime_daily_check.py` | `0 6 * * *` | Regime-Erkennung pro Asset (täglich) |
+| `scripts/lab_controller.py asset-profile-update` | `0 2 * * 1` | Asset-Profiler (Mo) |
+| `scripts/lab_controller.py build-queue` | `0 3 * * 1` | Lab-Queue befüllen (Mo) |
+| `scripts/lab_controller.py run-cycle` | `0 4 * * 1` | Research-Lab-Cycle (Mo) |
+| `scripts/lab_controller.py generate-report` | `0 20 * * 5` | Weekly-Report (Fr) |
+| `scripts/lab_controller.py health-check` | `10 6 * * *` | Daily Health-Check |
+| `tests/test_v72_gates_immutable.py` | `5 6 * * *` | Gate-Immutabilitäts-Watchdog |
+
+¹ Nicht in `setup_lab_cron.sh` enthalten — muss separat eingerichtet werden (eigene Crontab-Zeile).
 
 ### Schutzschichten (P1–P3)
 
@@ -52,7 +60,7 @@ Stand: 2026-05-18 | Gültig für: Produktionsbetrieb nach P1–P3-Abschluss
 | **4. Aktive NCs** | Starker Anstieg | Neue Signal-Quellen haben strukturelle Probleme → kein Handlungsbedarf, nur Beobachtung |
 | **5. Promotion-Kandidaten** | `n/a` | `research_staging.db` nicht erreichbar → DB-Backup prüfen |
 | **6. Watchdog** | `STALE` | `master_run.py` läuft nicht → sofort prüfen (Abschnitt 3) |
-| **7. Trades heute** | `3/3 heute ⚠️` | Limit erreicht, neue Signale werden blockiert — normal wenn viel Bewegung |
+| **7. Trades heute** | `3/3 heute ⚠️` | Limit erreicht, neue Signale werden blockiert — normal wenn viel Bewegung. Zählt per `entry_ts` (=Gate-Logik), optional mit Mode-Suffix `(N live, M dry_run)` |
 | **8. DD heute** | Negativer R-Wert nahe Kill-Schwelle | Kill-Switch-Entscheidung vorbereiten |
 | **9. Funding** | `⚠️` neben Asset | Funding > 0.05% / 8h — informativ; bei extremen Werten Position-Review |
 
