@@ -1,8 +1,11 @@
 """
-P1.4 — Chaos-Smoke-Suite: C-2 (SQLite-Lock) + C-3 (Telegram-Down).
+P1.4 — Chaos-Smoke-Suite: C-1 (Bitget-Timeout) + C-2 (SQLite-Lock) + C-3 (Telegram-Down).
 
-C-1 (Bitget-Timeout / clOrdId-Recovery) ist explizit ausgelassen — abhängig
-von P2.1 (execution/executor.py), welche User-Freigabe erfordert.
+C-1: Bitget-API-Timeout während place_market_order
+    - Netzwerk-Timeout → Recovery via get_order_by_client_id
+    - Order gefunden → als gefüllt behandelt, kein Duplikat
+    - Order nicht gefunden → R1-Retry mit neuem Suffix
+    - Recovery-Query selbst schlägt fehl → Originalfehler, kein Blind-Retry
 
 C-2: SQLite WAL-Concurrency
     - Short Lock: zweiter Writer wartet und succeeds dank PRAGMA busy_timeout
@@ -317,10 +320,137 @@ class TestC3TelegramDown:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# C-1: Deferred (Bitget-Timeout / clOrdId-Recovery)
+# C-1: Bitget-Timeout / clOrdId-Recovery (P2.1 abgeschlossen)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.skip(reason="C-1 deferred: abhängig von P2.1 (execution/executor.py clOrdId-Recovery) — erfordert explizite User-Freigabe für execution/-Änderungen")
 class TestC1BitgetTimeout:
-    def test_placeholder(self):
-        pass
+    """
+    Chaos C-1: API-Timeout während place_market_order.
+
+    Verifiziert dass die Recovery-Logik in execution/executor.py korrekt greift:
+    - Netzwerk-Timeout → Recovery-Query via get_order_by_client_id
+    - Order gefunden → als gefüllt behandelt, kein Duplikat-Submit
+    - Order nicht gefunden → R1-Retry (einmal, kein Blind-Retry)
+    - Recovery-Query selbst schlägt fehl → Originalfehler, kein Retry
+    """
+
+    def _make_signal(self, asset: str = "BTC") -> MagicMock:
+        sig = MagicMock()
+        sig.id = 42
+        sig.asset = asset
+        sig.direction = "long"
+        sig.entry_price   = 60000.0
+        sig.stop_loss     = 58000.0
+        sig.take_profit_1 = 62000.0
+        sig.take_profit_2 = None
+        sig.mode = "dry_run"
+        sig.strategy = "donchian_breakout"
+        return sig
+
+    def _make_client_mock(self):
+        client = MagicMock()
+        client.is_ready = True
+        client.dry_run  = False
+        client.get_price.return_value = 60000.0
+        client.set_leverage.return_value = True
+        client.place_take_profit.return_value = MagicMock(success=True, order_id="TP-1")
+        return client
+
+    def _run_execute_live(self, signal, client_mock):
+        import execution.executor as ex_mod
+        executor = ex_mod.Executor.__new__(ex_mod.Executor)
+        with patch("execution.bitget_client.BitgetClient", return_value=client_mock), \
+             patch("execution.executor.get_connection",
+                   return_value=MagicMock(execute=MagicMock(
+                       return_value=MagicMock(fetchone=MagicMock(return_value=None))))), \
+             patch("execution.executor._write_audit_log"), \
+             patch("execution.executor._increment_circuit_breaker"), \
+             patch("execution.executor._is_circuit_broken", return_value=False), \
+             patch("execution.executor._calc_sizing",
+                   return_value={"size": 0.01, "leverage": 5, "notional": 600.0}), \
+             patch("execution.market_impact_guard.evaluate",
+                   return_value=MagicMock(
+                       order_type="market", ioc_tolerance_bps=10.0,
+                       market_impact_check="ok", spread_at_snapshot_bps=2.0,
+                       liquidity_score=0.9)):
+            return ex_mod.Executor._execute_live(executor, signal, dry_run=False)
+
+    def test_timeout_recovery_finds_order_no_duplicate(self):
+        """C-1a: Timeout + Recovery findet Order → kein zweites place_market_order."""
+        from execution.bitget_client import OrderResult
+
+        client = self._make_client_mock()
+        call_count = {"n": 0}
+
+        def _place(*a, **kw):
+            call_count["n"] += 1
+            return OrderResult(success=False, error="ConnectionError: timed out")
+
+        client.place_market_order.side_effect = _place
+        client.get_order_by_client_id.return_value = OrderResult(
+            success=True, order_id="RECOVERED-001", filled_size=0.01, avg_price=60050.0
+        )
+
+        self._run_execute_live(self._make_signal(), client)
+
+        assert call_count["n"] == 1, "place_market_order darf nach Recovery nicht nochmals aufgerufen werden"
+        client.get_order_by_client_id.assert_called_once()
+
+    def test_timeout_order_not_found_r1_retry(self):
+        """C-1b: Timeout + not_found → R1-Retry (genau ein Folge-Aufruf)."""
+        from execution.bitget_client import OrderResult
+
+        client = self._make_client_mock()
+        call_count = {"n": 0}
+
+        def _place(*a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return OrderResult(success=False, error="Read timed out")
+            return OrderResult(success=True, order_id="R1-OK", filled_size=0.01, avg_price=60000.0)
+
+        client.place_market_order.side_effect = _place
+        client.get_order_by_client_id.return_value = OrderResult(success=False, error="not_found")
+
+        self._run_execute_live(self._make_signal(), client)
+
+        assert call_count["n"] == 2, \
+            f"Exakt 1 Retry nach not_found erwartet, tatsächliche Aufrufe: {call_count['n']}"
+        second_kwargs = client.place_market_order.call_args_list[1][1]
+        second_cl_ord_id = second_kwargs.get("client_order_id", "")
+        assert second_cl_ord_id.endswith("-R1"), \
+            f"R1-Suffix erwartet, erhalten: {second_cl_ord_id!r}"
+
+    def test_exchange_reject_no_recovery(self):
+        """C-1c: Fachliches Exchange-Reject → kein Recovery-Query."""
+        from execution.bitget_client import OrderResult
+
+        client = self._make_client_mock()
+        client.place_market_order.return_value = OrderResult(
+            success=False, error="Bitget [40786]: insufficient margin"
+        )
+
+        self._run_execute_live(self._make_signal(), client)
+
+        client.get_order_by_client_id.assert_not_called()
+
+    def test_recovery_query_fails_keeps_original_error(self):
+        """C-1d: Recovery-Query schlägt fehl → Originalfehler, kein Blind-Retry."""
+        from execution.bitget_client import OrderResult
+
+        client = self._make_client_mock()
+        call_count = {"n": 0}
+
+        def _place(*a, **kw):
+            call_count["n"] += 1
+            return OrderResult(success=False, error="ConnectionError: timed out")
+
+        client.place_market_order.side_effect = _place
+        client.get_order_by_client_id.return_value = OrderResult(
+            success=False, error="query_failed:HTTP 503"
+        )
+
+        self._run_execute_live(self._make_signal(), client)
+
+        assert call_count["n"] == 1, \
+            "Bei query_failed darf kein Retry stattfinden"
