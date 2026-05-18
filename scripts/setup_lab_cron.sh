@@ -37,6 +37,9 @@ CRON_JOBS=$(cat <<EOF
 # APEX-LAB: Daily Health Check (täglich 06:10)
 10 6 * * * cd ${APEX_DIR} && ${PYTHON} ${CTRL} --mode health-check >> ${LOG_DIR}/lab_health.log 2>&1  # APEX-LAB
 
+# APEX-LAB: Master-Watchdog (alle 5 Minuten — D.1 produktiv)
+*/5 * * * * cd ${APEX_DIR} && ${PYTHON} scripts/master_watchdog.py >> ${LOG_DIR}/master_watchdog.log 2>&1  # APEX-LAB
+
 # APEX-LAB: Gate-Immutabilitäts-Watchdog (täglich 06:05)
 5 6 * * * cd ${APEX_DIR} && ${PYTHON} -m pytest tests/test_v72_gates_immutable.py -q >> ${LOG_DIR}/lab_gates_watchdog.log 2>&1  # APEX-LAB
 

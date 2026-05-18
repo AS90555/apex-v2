@@ -1,11 +1,12 @@
 """
-A.3 — Watchdog-Hülle für master_run.py.
+A.3 / D.1 — Watchdog für master_run.py (produktiv seit D.1).
 
 Prüft ob master_run.py noch aktiv ist, indem es den frischesten Heartbeat
-aus der DB prüft. Falls alle Komponenten still sind, wird ein Alarm ausgelöst.
+aus der DB bzw. dem Heartbeat-Verzeichnis prüft. Bei Stille > STALE_THRESHOLD_MIN
+wird ein Telegram-Alert über den Dispatcher gesendet.
 
-In A.3: nur Detection und Logging.
-In D.1: Telegram-Alert wird aktiviert.
+Der Dispatcher (core/telegram_dispatcher.py) verhindert Alert-Spam automatisch
+via Dedupe-Fenster (TG_DEDUPE_WINDOW_MIN, Standard 15 Min).
 
 Aufruf (Cron alle 5 Min): python3 scripts/master_watchdog.py
 """
@@ -17,6 +18,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.utils import log
+from core.telegram_dispatcher import dispatch
 
 # Nach dieser Stille-Dauer gilt master_run als ausgefallen
 STALE_THRESHOLD_MIN = 15
@@ -97,9 +99,15 @@ def main() -> int:
     log(f"[watchdog] ALARM: master_run still seit {status['age_min']}min "
         f"(Schwelle: {STALE_THRESHOLD_MIN}min, Quelle: {status['source']})")
 
-    # Telegram-Alarm (D.1 — noch nicht aktiv in A.3)
-    # from core.telegram_dispatcher import send  # wird in D.1 aktiviert
-    # send("watchdog", f"master_run nicht aktiv seit {status['age_min']:.0f}min")
+    # D.1 — Telegram-Alert (Dedupe im Dispatcher verhindert Spam bei Dauer-Ausfall)
+    try:
+        dispatch(
+            f"🚨 <b>APEX Watchdog ALARM</b>\n"
+            f"master_run nicht aktiv seit <b>{status['age_min']:.0f}min</b>\n"
+            f"Schwelle: {STALE_THRESHOLD_MIN}min | Quelle: {status['source']}"
+        )
+    except Exception as exc:
+        log(f"[watchdog] Telegram-Alert fehlgeschlagen: {exc}")
 
     return 1
 
