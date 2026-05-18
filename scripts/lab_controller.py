@@ -158,6 +158,8 @@ def mode_build_queue(db_path: str, cycle_id: int | None = None) -> int:
                 variant = get_variant(conn, vid)
                 if variant is None:
                     continue
+                if variant.status not in ("proposed",):
+                    continue  # Bereits verarbeitet (archived, queued, evaluated, …)
                 nc_result = check_negative_control(variant.strategy, variant.asset, db_path=db_path)
                 if nc_result.blocked and not nc_result.reopen_available:
                     update_variant_status(conn, vid, "archived", "negative_control")
