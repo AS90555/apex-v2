@@ -3147,6 +3147,76 @@ async def cmd_promote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
 
 
+async def cmd_shadow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/shadow <deployment_id> — Setzt Deployment auf shadow-Mode (read-only Beobachtung)."""
+    if not _is_authorized(update):
+        await update.message.reply_text("⛔ Nicht autorisiert.")
+        return
+
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Nutzung: `/shadow 8`\n"
+            "Die ID findest du im `/status`\\-Screen unter Deployments\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    dep_id = int(args[0])
+    import asyncio
+    from datetime import datetime, timezone
+
+    def _do_shadow():
+        conn = get_connection()
+        try:
+            dep = conn.execute(
+                "SELECT id, strategy_key, asset, mode, active FROM active_deployments WHERE id=?",
+                (dep_id,),
+            ).fetchone()
+            if not dep:
+                return {"error": f"Deployment \\#{dep_id} nicht gefunden\\."}
+            dep = dict(dep)
+            if dep["mode"] == "shadow":
+                return {"error": f"Deployment \\#{dep_id} ist bereits im Shadow\\-Mode\\."}
+            if not dep["active"]:
+                return {"error": f"Deployment \\#{dep_id} ist nicht aktiv\\."}
+
+            prev_mode = dep["mode"]
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE active_deployments SET mode='shadow' WHERE id=?",
+                (dep_id,),
+            )
+            conn.execute(
+                """INSERT INTO kill_switch_events (ts, action, mode_from, mode_to, reason, cleared_by, asset)
+                   VALUES (?, 'shadow_set', ?, 'shadow', 'Telegram /shadow command', ?, ?)""",
+                (now, prev_mode, str(update.effective_user.id if update.effective_user else "bot"),
+                 dep["asset"]),
+            )
+            conn.commit()
+            return {"ok": True, "dep": dep, "prev_mode": prev_mode}
+        finally:
+            conn.close()
+
+    data = await asyncio.get_event_loop().run_in_executor(None, _do_shadow)
+
+    if "error" in data:
+        await update.message.reply_text(data["error"], parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    dep       = data["dep"]
+    prev_mode = _escape_md(data["prev_mode"])
+    sk        = _escape_md(dep["strategy_key"])
+    asset     = _escape_md(dep["asset"])
+    await update.message.reply_text(
+        f"🌑 *Shadow\\-Mode gesetzt*\n\n"
+        f"Deployment \\#{dep_id}: `{sk}` / `{asset}`\n"
+        f"Mode: `{prev_mode}` → `shadow`\n\n"
+        f"Das Deployment beobachtet nun nur noch \\— keine Orders werden gesendet\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
 async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /deploy <ID>
@@ -4798,6 +4868,7 @@ def main():
     app.add_handler(CommandHandler("lab_stats", cmd_lab_stats))
     app.add_handler(CommandHandler("deploy",   cmd_deploy))
     app.add_handler(CommandHandler("promote",  cmd_promote))
+    app.add_handler(CommandHandler("shadow",   cmd_shadow))
     app.add_handler(CommandHandler("api_test",  cmd_api_test))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CallbackQueryHandler(button_callback))
