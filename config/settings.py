@@ -155,6 +155,7 @@ SLIPPAGE_ALERT_THRESHOLD_BPS  = 8      # Median-Slippage > 8bps → shadow + Ale
 DEAD_MANS_TIMEOUT_SECONDS     = 300    # Heartbeat-Alter > 5min → DMS-Aktivierung
 DEAD_MANS_RETRY_WAIT_SECONDS  = 120    # Wartezeit vor zweitem DMS-Check
 RECONCILE_SIZE_TOLERANCE      = 0.001  # Toleranz für Positions-Größenvergleich
+RECONCILER_AUTO_HEAL_GHOST    = False  # P2.3: Ghost-Heal default OFF — nur manuell aktivieren
 
 # ── Bitget Handelsparameter ──────────────────────────────────────────────────
 LEVERAGE     = 5

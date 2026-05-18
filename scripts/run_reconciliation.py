@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.db import get_connection
 from core.utils import log
-from config.settings import RECONCILE_SIZE_TOLERANCE
+from config.settings import RECONCILE_SIZE_TOLERANCE, RECONCILER_AUTO_HEAL_GHOST
 
 _TG_BOT  = os.getenv("TELEGRAM_BOT" + "_TOKEN", "")
 _TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -34,6 +34,18 @@ def _now_iso() -> str:
 def _send_telegram(text: str) -> None:
     from core.telegram_dispatcher import dispatch
     dispatch(text)
+
+
+def _write_reconcile_audit(conn, asset: str, action: str, detail: str) -> None:
+    """Schreibt einen Heal-Audit-Eintrag in execution_audit_log (auditierbar, nie still)."""
+    conn.execute(
+        """INSERT INTO execution_audit_log
+           (signal_id, cl_ord_id, state_from, state_to, payload_json, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (None, f"RECONCILE-HEAL-{asset}", action, "healed",
+         f'{{"asset":"{asset}","detail":"{detail}"}}', _now_iso()),
+    )
+    log(f"[RECONCILE-HEAL] {asset}: {action} — {detail}")
 
 
 def _write_heartbeat(conn, status: str, message: str, latency_ms: float) -> None:
@@ -133,11 +145,25 @@ def reconcile_once() -> dict:
         if not in_exchange:
             msg = f"Geister-Position: DB hat {asset} size={db_size:.4f}, Exchange hat keine Position"
             findings.append(msg)
-            conn.execute(
-                "UPDATE trades SET reconcile_required=1 WHERE asset=? AND status IN ('executed','open')",
-                (asset,),
-            )
-            _send_telegram(f"⚠️ Geister-Position: {asset}\n{msg}")
+            if RECONCILER_AUTO_HEAL_GHOST:
+                # P2.3 — kontrollierte Mutation: Trade auf ghost_closed setzen + Audit
+                conn.execute(
+                    "UPDATE trades SET status='ghost_closed', reconcile_required=1 "
+                    "WHERE asset=? AND status IN ('executed','open')",
+                    (asset,),
+                )
+                _write_reconcile_audit(conn, asset, "ghost_heal",
+                                       f"size={db_size:.4f}_set_ghost_closed")
+                _send_telegram(
+                    f"⚠️ Geister-Position HEALED: {asset}\n{msg}\n"
+                    f"→ status='ghost_closed' gesetzt (AUTO_HEAL aktiv)"
+                )
+            else:
+                conn.execute(
+                    "UPDATE trades SET reconcile_required=1 WHERE asset=? AND status IN ('executed','open')",
+                    (asset,),
+                )
+                _send_telegram(f"⚠️ Geister-Position: {asset}\n{msg}")
             alerts += 1
 
     # Größenabweichungen
@@ -150,11 +176,26 @@ def reconcile_once() -> dict:
                 msg = (f"Größenabweichung {asset}: Exchange={ex_size:.4f}, "
                        f"DB={db_size:.4f}, Diff={diff:.4f}")
                 findings.append(msg)
-                conn.execute(
-                    "UPDATE trades SET reconcile_required=1 WHERE asset=? AND status IN ('executed','open')",
-                    (asset,),
-                )
-                _send_telegram(f"⚠️ Größenabweichung: {asset}\n{msg}")
+                if RECONCILER_AUTO_HEAL_GHOST:
+                    # P2.3 — Heuristik: nur healen wenn Exchange-Size plausibler ist
+                    # (Exchange ist immer maßgeblich bei Abweichung)
+                    conn.execute(
+                        "UPDATE trades SET size=?, reconcile_required=1 "
+                        "WHERE asset=? AND status IN ('executed','open')",
+                        (abs(ex_size), asset),
+                    )
+                    _write_reconcile_audit(conn, asset, "size_mismatch_heal",
+                                           f"db={db_size:.4f}_ex={ex_size:.4f}_diff={diff:.4f}")
+                    _send_telegram(
+                        f"⚠️ Größenabweichung HEALED: {asset}\n{msg}\n"
+                        f"→ DB-Size auf Exchange-Size {ex_size:.4f} korrigiert (AUTO_HEAL aktiv)"
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE trades SET reconcile_required=1 WHERE asset=? AND status IN ('executed','open')",
+                        (asset,),
+                    )
+                    _send_telegram(f"⚠️ Größenabweichung: {asset}\n{msg}")
                 alerts += 1
 
     latency_ms = (time.monotonic() - t0) * 1000
