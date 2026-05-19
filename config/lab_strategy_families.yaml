@@ -1,0 +1,43 @@
+version: "1.0"
+families:
+  donchian:
+    display_name: "Donchian-Channel-Familie"
+    members: ["donchian_breakout", "dual_donchian", "atr_channel_breakout"]
+    primary_regime: "HIGH_TREND"
+    description: "Breakout aus Donchian-Channel, Trend-Following"
+
+  squeeze:
+    display_name: "Volatility-Squeeze-Familie"
+    members: ["squeeze", "bb_kc_squeeze"]
+    primary_regime: "SIDEWAYS"
+    description: "Volatilitäts-Kompression, Breakout nach BB/KC-Squeeze"
+
+  mean_reversion:
+    display_name: "Mean-Reversion-Familie"
+    members: ["mean_reversion", "vwap_bounce", "asian_fade"]
+    primary_regime: "SIDEWAYS"
+    description: "Mean-Reversion an Bändern/Sessions"
+
+  momentum:
+    display_name: "Momentum-Familie"
+    members: ["weekend_momo", "supertrend", "funding_momentum"]
+    primary_regime: "HIGH_TREND"
+    description: "Trend-Momentum-Strategien"
+
+  pattern:
+    display_name: "Pattern-Familie"
+    members: ["inside_bar_breakout", "orb"]
+    primary_regime: "MIXED"
+    description: "Range/Box-Pattern-Breakouts"
+
+  volume_action:
+    display_name: "Volume-Action-Familie"
+    members: ["vaa", "ema_pullback"]
+    primary_regime: "MIXED"
+    description: "Volumen-und-Aktion-Setups"
+
+  takeprofit_only:
+    display_name: "TP-Only-Familie"
+    members: ["kdt"]
+    primary_regime: "MIXED"
+    description: "Minimal-Strategien — primär TP/SL-Tuning"

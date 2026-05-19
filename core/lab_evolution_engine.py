@@ -288,7 +288,7 @@ def propose_variants(
     # Aktive Strategien aus lab_queue
     try:
         rows2 = conn.execute(
-            "SELECT DISTINCT strategy FROM lab_queue WHERE status='completed' LIMIT 20"
+            "SELECT DISTINCT strategy FROM lab_queue WHERE status='done' LIMIT 20"
         ).fetchall()
         strategies = [r["strategy"] for r in rows2]
     except Exception:
