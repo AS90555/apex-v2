@@ -14,7 +14,7 @@ import json
 
 import optuna
 
-RANGES_V72_VERSION = "1.3"
+RANGES_V72_VERSION = "1.4"
 
 # Format: {strategy: {param: (low, high, is_int)}}
 # Quelle: auto_lab_daemon.py OPTUNA_SPACES (Stand 2026-05-13)
@@ -88,15 +88,16 @@ RANGES_V72: dict[str, dict[str, tuple]] = {
         "TP_R":           (1.5, 4.0, False),
     },
     "dual_donchian": {
-        # v1.2 (2026-05-14): Mittelweg-Range, um n_oos ≥ 100 zu erreichen.
-        # Hintergrund: v1.1 (VOL_FACTOR 2.5–3.0, ATR_MIN_MULT 1.1–1.5) erzeugte 6/20
-        # 4-Gate-Pass-Trials, aber n_oos blieb bei 18–25 (Gate ≥100 verfehlt).
-        # TPE konvergierte an obere Grenzen → Filter zu streng.
-        # Lösung: VOL_FACTOR und ATR_MIN_MULT untere Grenzen senken.
-        # Trial-19 v1.0-Anker bleibt mittig: VOL_FACTOR=2.82, ATR_MIN_MULT=1.31.
-        "ENTRY_PERIOD": (22,  28, True),
-        "EXIT_PERIOD":  (10,  16, True),
-        "VOL_FACTOR":   (2.0, 2.9, False),
+        # v1.4 (2026-05-19): n_oos-Problem analysiert — Haupttreiber ist ENTRY_PERIOD + VOL_FACTOR.
+        # 32 Trials auf LINK: n_oos bleibt bei 19–128 mit Median ~27.
+        # n_oos≥100 tritt nur bei VOL_FACTOR<2.3 oder ENTRY_PERIOD in flüssigem Bereich auf.
+        # Änderungen: ENTRY_PERIOD 22–28 → 10–28 (kürzerer Channel = mehr Breakouts),
+        #             VOL_FACTOR 2.0–2.9 → 1.5–2.9 (niedrigerer Floor = weniger Filter-Strenge),
+        #             EXIT_PERIOD 10–16 → 5–16 (schnellere Exits = mehr Re-Entries).
+        # DSR/PBO/Stability-Gates bleiben unverändert — nur Frequenz-Erhöhung angestrebt.
+        "ENTRY_PERIOD": (10,  28, True),
+        "EXIT_PERIOD":  (5,   16, True),
+        "VOL_FACTOR":   (1.5, 2.9, False),
         "ATR_MIN_MULT": (1.0, 1.6, False),
         "SL_ATR_MULT":  (1.2, 1.7, False),
         "TP_R":         (1.8, 2.8, False),
